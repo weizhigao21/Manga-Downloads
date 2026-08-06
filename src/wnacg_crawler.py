@@ -346,11 +346,11 @@ def _fetch_picture_link(link: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str |
     return None
 
 
-def parse_picture_page(html_text: str, start: int = 1, end: int | None = None) -> list[dict]:
+def parse_picture_page(reading_url: str, start: int = 1, end: int | None = None) -> list[dict]:
     """解析某个漫画的阅读页，返回所有图片链接。
 
     Args:
-        html_text: 阅读页 URL（含 page-N-aid-X 信息）。
+        reading_url: 阅读页 URL（含 page-N-aid-X 信息）。
         start/end: 页区间（1-based），用于分批解析（如先解析第 1-4 页）。
                    默认解析全部页。
 
@@ -358,11 +358,11 @@ def parse_picture_page(html_text: str, start: int = 1, end: int | None = None) -
         - link: 图片直链
         - number: 页码/名称
     """
-    match = re.search(r"page-(\d+)-aid-(\d+)", html_text)
+    match = re.search(r"page-(\d+)-aid-(\d+)", reading_url)
     if match:
         page_count, aid = int(match.group(1)), match.group(2)
     else:
-        aid_match = re.search(r"aid-(\d+)", html_text)
+        aid_match = re.search(r"aid-(\d+)", reading_url)
         aid = aid_match.group(1) if aid_match else ""
         page_count = 1
 

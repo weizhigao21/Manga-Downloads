@@ -118,10 +118,6 @@ class SettingsDialog(QDialog):
         )
         config_layout.addRow("下载方式:", self.mode_combo)
 
-        self.generate_link_edit = QLineEdit(self._project_config.generate_link)
-        self.generate_link_edit.setPlaceholderText("https://example.com/api/generate-link")
-        config_layout.addRow("生成链接 API:", self.generate_link_edit)
-
         config_hint = QLabel("修改后点击保存会写入 Config/Config.json，供爬虫与下载功能使用。")
         config_hint.setStyleSheet(f"color: {PALETTE['text_secondary']}; font-size: 12px;")
         config_layout.addRow(config_hint)
@@ -167,7 +163,6 @@ class SettingsDialog(QDialog):
         self._project_config.download_mode = (
             "zip" if self.mode_combo.currentIndex() == 1 else "image"
         )
-        self._project_config.generate_link = self.generate_link_edit.text()
         self._project_config.save()
 
         self.accept()

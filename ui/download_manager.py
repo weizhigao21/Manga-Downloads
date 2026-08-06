@@ -1,7 +1,6 @@
 """下载任务管理器：统一管理所有漫画下载任务，展示 ID、进度与状态。"""
 import logging
 import re
-import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -18,13 +17,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.downloader import download_comic
 from ui.models import ComicItem
 from ui.settings import ProjectConfig
 from ui.styles import PALETTE
-
-# 允许从 src 目录导入下载逻辑
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from downloader import download_comic
 
 
 class DownloadTask:

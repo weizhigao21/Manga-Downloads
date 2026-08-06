@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.utils import safe_filename
 from ui.styles import PALETTE
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -44,8 +45,7 @@ def _match_download_folder(base: Path, title: str, label: str) -> bool:
     并同时检查文件名清洗前后的写法。
     """
     for raw in (title, f"[{label}] {title}".strip() if label else title):
-        safe = re.sub(r'[\\/:*?"<>|｜／＼]', "_", raw).replace("&", "_").replace("＆", "_")
-        safe = re.sub(r"_+", "_", safe).strip(" _")
+        safe = safe_filename(raw)
         if (base / raw).is_dir() or (base / safe).is_dir():
             return True
     return False
@@ -64,10 +64,26 @@ def is_comic_downloaded(record: dict) -> bool:
     return _match_download_folder(base, title, record.get("category_label") or "")
 
 
+_comics_records: list[dict] | None = None
+
+
+def _invalidate_records_cache():
+    """数据库记录变化时使缓存失效（save_comics / mark_downloaded / clear_comics 调用）。"""
+    global _comics_records
+    _comics_records = None
+
+
+def _cached_records() -> list[dict]:
+    """读取全部漫画记录并缓存，避免渲染每张卡片时重复全表查询。"""
+    global _comics_records
+    if _comics_records is None:
+        _comics_records = DatabaseManager.instance().load_comics()
+    return _comics_records
+
+
 def is_downloaded(detail_url: str, title: str) -> bool:
     """按详情链接与标题判断作品是否已下载（数据库标记或下载目录文件夹）。"""
-    db = DatabaseManager.instance()
-    for record in db.load_comics():
+    for record in _cached_records():
         if record.get("detail_url") == detail_url:
             return is_comic_downloaded(record)
     return is_comic_downloaded({"downloaded": 0, "title": title})
@@ -146,6 +162,7 @@ class DatabaseManager:
                     for c in comics
                 ],
             )
+        _invalidate_records_cache()
 
     def mark_downloaded(self, detail_url: str):
         """将指定作品标记为已下载。"""
@@ -154,6 +171,7 @@ class DatabaseManager:
                 "UPDATE comics SET downloaded = 1, updated_at = datetime('now', 'localtime') WHERE detail_url = ?",
                 (detail_url,),
             )
+        _invalidate_records_cache()
 
     def load_comics(self, category: str | None = None, limit: int | None = None) -> list[dict]:
         """读取漫画记录，按作品 ID（aid）倒序（最新上传优先）。
@@ -200,6 +218,7 @@ class DatabaseManager:
         """清空漫画记录。"""
         with self._connect() as conn:
             conn.execute("DELETE FROM comics")
+        _invalidate_records_cache()
 
     def clear_covers(self):
         """清除封面缓存文件。"""

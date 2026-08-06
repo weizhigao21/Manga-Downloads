@@ -15,18 +15,35 @@ from pathlib import Path
 
 from lxml import html
 
-from wnacg_crawler import (
-    DOWNLOAD_MAX_RETRIES,
-    DOWNLOAD_WORKERS,
-    G_URL,
-    HEADERS,
-    _fetch_with_retry,
-    _throttle,
-    download_pictures,
-    fetch,
-    load_config,
-    parse_picture_page,
-)
+# 兼容两种加载方式：作为包导入（python run_ui.py）或独立运行（python src/wnacg_crawler.py）
+try:
+    from src.utils import safe_filename
+    from src.wnacg_crawler import (
+        DOWNLOAD_MAX_RETRIES,
+        DOWNLOAD_WORKERS,
+        G_URL,
+        HEADERS,
+        _fetch_with_retry,
+        _throttle,
+        download_pictures,
+        fetch,
+        load_config,
+        parse_picture_page,
+    )
+except ImportError:
+    from utils import safe_filename
+    from wnacg_crawler import (
+        DOWNLOAD_MAX_RETRIES,
+        DOWNLOAD_WORKERS,
+        G_URL,
+        HEADERS,
+        _fetch_with_retry,
+        _throttle,
+        download_pictures,
+        fetch,
+        load_config,
+        parse_picture_page,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -130,26 +147,12 @@ def _fetch_cookies(url: str) -> str:
     return "; ".join(f"{c.name}={c.value}" for c in resp.cookies)
 
 
-def _safe_filename(name: str) -> str:
-    """将名称转换为可用的目录名。
-
-    处理 Windows 非法字符与易混淆字符：
-    - 半角/全角斜杠与竖线（\\ / ／ ＼ | ｜）：替换为下划线，避免被当作路径分隔符
-    - 半角/全角 &（& ＆）：替换为下划线
-    - : * ? " < > 等非法字符：替换为下划线
-    """
-    name = re.sub(r'[\\/:*?"<>|｜／＼]', "_", name)
-    name = name.replace("&", "_").replace("＆", "_")
-    name = re.sub(r"_+", "_", name).strip(" _")
-    return name or "untitled"
-
-
 def _download_folder_name(comic: dict, use_label: bool = True) -> str:
     """生成下载文件夹名：`[右上角分类标签] 标题`；use_label=False 或无线标签时仅用标题。"""
     label = (comic.get("category_label") or "").strip()
     title = (comic.get("title") or "").strip()
     name = f"[{label}] {title}" if use_label and label else title
-    return _safe_filename(name)
+    return safe_filename(name)
 
 
 def _find_7z() -> str | None:
@@ -275,7 +278,7 @@ def _download_package(
     url = info["url"]
     zip_name = info["file_name"] or f"{comic.get('title', 'comic')}.zip"
 
-    tmp = save_dir.parent / f"{_safe_filename(zip_name)}.part"
+    tmp = save_dir.parent / f"{safe_filename(zip_name)}.part"
     save_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
         # 1. 下载 zip（curl_cffi 模拟 Chrome 指纹，避免被 Cloudflare 拦截）

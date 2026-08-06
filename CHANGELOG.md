@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-08-07
+
+### 修复
+
+- 刷新、翻页与搜索加载完成后列表未回到顶部：`ComicsGrid.render` 重建数据时自动将滚动条置顶
+- 关闭窗口可能卡死：后台抓取线程处于网络超时等待时，`closeEvent` 由无限等待改为限时 3 秒等待
+
+### 重构
+
+- 规范化导入：`src` 提升为 Python 包（新增 `__init__.py`），UI 层移除 `sys.path.insert` 硬编码路径，改为包导入；`downloader.py` 保留独立运行兼容
+- 消除重复逻辑：文件名清洗抽取为公共工具 `src/utils.py::safe_filename`，`downloader.py` 与 `database.py` 统一复用
+- 移除死配置：设置项"生成链接 API"从未被下载逻辑使用（实际由下载页 CONFIG 动态提取），已删除对应 UI 控件与配置字段
+- 参数语义修正：`parse_picture_page` 误导性参数 `html_text`（实为阅读页 URL）重命名为 `reading_url`；`main_window.py` 重复的局部 `import re` 上移至模块顶部
+- 封面渲染性能：缩放结果缓存至 `QPixmapCache`，重建卡片直接复用，避免反复缩放；本地已有封面时不创建网络管理器，仅真正请求网络封面时按需初始化
+
 ## [1.1.0] - 2026-08-06
 
 ### 修复

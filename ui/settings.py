@@ -16,7 +16,6 @@ DEFAULT_SETTINGS = {
 
 DEFAULT_PROJECT_CONFIG = {
     "Page_number": 20,
-    "generate-link": "https://d1.wcdn.date/api/generate-link",
     "Download": "./Download",
     "list_url": "https://www.wnacg.com/albums.html",
     "Download_workers": 3,
@@ -157,14 +156,6 @@ class ProjectConfig:
     @page_number.setter
     def page_number(self, value: int):
         self._config["Page_number"] = int(value)
-
-    @property
-    def generate_link(self) -> str:
-        return str(self._config.get("generate-link", ""))
-
-    @generate_link.setter
-    def generate_link(self, value: str):
-        self._config["generate-link"] = str(value)
 
     @property
     def download_dir(self) -> str:

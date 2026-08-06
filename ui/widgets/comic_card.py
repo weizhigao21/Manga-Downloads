@@ -1,11 +1,10 @@
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QPixmapCache
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QFrame,
-    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -27,8 +26,8 @@ class ComicCard(QFrame):
     def __init__(self, comic: ComicItem, parent=None):
         super().__init__(parent)
         self.comic = comic
-        self._network = QNetworkAccessManager(self)
-        self._network.finished.connect(self._on_cover_reply)
+        # 本地已有封面时不创建网络管理器（避免每张卡片都初始化网络栈）
+        self._network: QNetworkAccessManager | None = None
         self._manager = DownloadManager.instance()
         self._setup_ui()
         self._load_cover()
@@ -215,12 +214,6 @@ class ComicCard(QFrame):
             """
         )
 
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(16)
-        shadow.setColor(PALETTE["shadow"])
-        shadow.setOffset(0, 4)
-        self.setGraphicsEffect(shadow)
-
     def _load_cover(self):
         """优先加载本地封面，其次网络封面，失败时显示占位图。"""
         pixmap = QPixmap()
@@ -234,6 +227,9 @@ class ComicCard(QFrame):
             return
 
         if self.comic.cover_url:
+            if self._network is None:
+                self._network = QNetworkAccessManager(self)
+                self._network.finished.connect(self._on_cover_reply)
             request = QNetworkRequest(self.comic.cover_url)
             self._network.get(request)
             return
@@ -269,18 +265,28 @@ class ComicCard(QFrame):
             pass
 
     def _set_cover(self, pixmap: QPixmap):
-        scaled = pixmap.scaled(
-            self.COVER_WIDTH,
-            self.COVER_HEIGHT,
-            Qt.KeepAspectRatioByExpanding,
-            Qt.SmoothTransformation,
-        )
+        """缩放并显示封面；缩放结果缓存在 QPixmapCache 中，重建卡片时直接复用。"""
+        source = self.comic.cover_path or self.comic.cover_url
+        key = f"comic_cover:{self.COVER_WIDTH}x{self.COVER_HEIGHT}:{source}"
+        scaled = QPixmapCache.find(key)
+        if scaled is None or scaled.isNull():
+            scaled = pixmap.scaled(
+                self.COVER_WIDTH,
+                self.COVER_HEIGHT,
+                Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation,
+            )
+            QPixmapCache.insert(key, scaled)
         self.cover_label.setPixmap(scaled)
 
     def _set_placeholder(self):
-        pixmap = QPixmap(self.COVER_WIDTH, self.COVER_HEIGHT)
-        pixmap.fill(PALETTE["border"])
-        self._set_cover(pixmap)
+        key = f"comic_cover:{self.COVER_WIDTH}x{self.COVER_HEIGHT}:"
+        pixmap = QPixmapCache.find(key)
+        if pixmap is None or pixmap.isNull():
+            pixmap = QPixmap(self.COVER_WIDTH, self.COVER_HEIGHT)
+            pixmap.fill(PALETTE["border"])
+            QPixmapCache.insert(key, pixmap)
+        self.cover_label.setPixmap(pixmap)
 
     def _on_download_clicked(self):
         """点击下载按钮：交由下载管理器创建后台任务。"""

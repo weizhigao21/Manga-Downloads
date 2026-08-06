@@ -2,14 +2,9 @@
 
 从 main_window 拆出，独立成模块：支持列表抓取与关键词搜索两种模式。
 """
-import sys
-from pathlib import Path
-
 from PySide6.QtCore import QThread, Signal
 
-# 允许从 src 目录导入爬虫
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from wnacg_crawler import fetch_page, search_comics
+from src.wnacg_crawler import fetch_page, search_comics
 
 
 class FetchWorker(QThread):

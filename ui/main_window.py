@@ -3,6 +3,8 @@
 负责顶部工具栏（搜索/分类/按钮）、内容区与翻页栏的组装，
 以及列表浏览与关键词搜索两种模式的切换调度。
 """
+import re
+
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QComboBox,
@@ -152,8 +154,6 @@ class MainWindow(QMainWindow):
 
     def _current_category_filter(self) -> str | None:
         """从当前列表 URL 提取分类（cate-N），无分类（全部更新）时返回 None。"""
-        import re
-
         match = re.search(r"cate-(\d+)\.html", self._project_config.list_url)
         return f"cate-{match.group(1)}" if match else None
 
@@ -284,8 +284,6 @@ class MainWindow(QMainWindow):
 
     def _select_current_category(self):
         """根据当前 list_url 匹配分类下拉的初始选项。"""
-        import re
-
         current = self._project_config.list_url
         match = re.search(r"cate-(\d+)\.html", current)
         if match:
@@ -399,23 +397,22 @@ class MainWindow(QMainWindow):
     # ---- 窗口事件 ----
 
     def showEvent(self, event):
-        """窗口显示时按真实宽度重新渲染。
+        """窗口显示时按真实宽度重排（不重建卡片）。
 
         首次数据加载发生在窗口显示前，viewport 宽度尚小，
-        列数会被算成 1 导致卡片单列排列；显示后再渲染恢复多列。
+        列数会被算成 1 导致卡片单列排列；显示后再重排恢复多列。
         """
         super().showEvent(event)
-        if self._comics:
-            self.comics_grid.render(self._comics)
+        self.comics_grid.reflow()
 
     def resizeEvent(self, event):
-        """窗口大小变化时重新布局卡片列数。"""
+        """窗口大小变化时重排卡片列数（仅移动卡片，不重建）。"""
         super().resizeEvent(event)
-        if self._comics:
-            self.comics_grid.render(self._comics)
+        self.comics_grid.reflow()
 
     def closeEvent(self, event):
         """关闭窗口时等待后台抓取线程结束，避免销毁仍在运行的线程。"""
         if self._worker and self._worker.isRunning():
-            self._worker.wait()
+            # 限时等待，避免线程处于网络超时等待时阻塞窗口关闭
+            self._worker.wait(3000)
         super().closeEvent(event)
