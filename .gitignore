@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行期生成（配置、缓存、封面、数据库、下载内容）
+Config/covers/
+Config/*.db
+Config/*.json
+Download/
+
+# 临时/开发脚本
+_count_lines.py
+_test_search.py
+正则表达式.py
+btn_check.png
