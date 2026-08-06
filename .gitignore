@@ -16,3 +16,6 @@ _count_lines.py
 _test_search.py
 正则表达式.py
 btn_check.png
+
+# 代码索引（本地生成，可随时重建）
+.codegraph/

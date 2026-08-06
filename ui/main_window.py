@@ -3,10 +3,11 @@
 负责顶部工具栏（搜索/分类/按钮）、内容区与翻页栏的组装，
 以及列表浏览与关键词搜索两种模式的切换调度。
 """
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -99,39 +100,75 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._on_settings)
         toolbar_layout.addWidget(settings_btn)
 
-        # 加载进度条
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setMaximumWidth(120)
-        self.progress_bar.setMaximumHeight(6)
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(False)
-        toolbar_layout.addWidget(self.progress_bar)
-
-        self.status_label = QLabel("就绪")
-        self.status_label.setObjectName("statusLabel")
-        toolbar_layout.addWidget(self.status_label)
-
         root_layout.addWidget(toolbar)
 
-        # 内容区（漫画网格）与底部翻页栏
+        # 内容区（漫画网格）
         self.comics_grid = ComicsGrid()
         root_layout.addWidget(self.comics_grid)
 
+        # 底部栏：统一底色（QFrame#pageBar 背景+顶边框）
+        bottom_bar = QFrame()
+        bottom_bar.setObjectName("pageBar")
+        bottom_layout = QGridLayout(bottom_bar)
+        bottom_layout.setContentsMargins(24, 0, 24, 0)
+        bottom_layout.setSpacing(0)
+
+        # 翻页栏铺满整行，按钮组以整个窗口中心为基准居中
         self.page_bar = PageBar()
         self.page_bar.page_requested.connect(self._on_page_requested)
-        root_layout.addWidget(self.page_bar)
+        bottom_layout.setColumnStretch(0, 1)
+        bottom_layout.addWidget(self.page_bar, 0, 0)
+
+        # 左下角覆盖层：状态信息 + 进度条（透明，叠在翻页栏上层）
+        left_host = QWidget()
+        left_host.setStyleSheet("background-color: transparent;")
+        left_layout = QHBoxLayout(left_host)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(16)
+
+        self.status_label = QLabel("就绪")
+        self.status_label.setObjectName("statusLabel")
+        left_layout.addWidget(self.status_label)
+
+        # 加载进度条：放入固定宽度容器，显隐切换不会引起布局跳动
+        progress_host = QWidget()
+        progress_host.setFixedWidth(130)
+        progress_layout = QVBoxLayout(progress_host)
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setAlignment(Qt.AlignVCenter)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        progress_layout.addWidget(self.progress_bar)
+        left_layout.addWidget(progress_host)
+
+        bottom_layout.addWidget(left_host, 0, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        root_layout.addWidget(bottom_bar)
 
     # ---- 数据加载 ----
+
+    def _current_category_filter(self) -> str | None:
+        """从当前列表 URL 提取分类（cate-N），无分类（全部更新）时返回 None。"""
+        import re
+
+        match = re.search(r"cate-(\d+)\.html", self._project_config.list_url)
+        return f"cate-{match.group(1)}" if match else None
 
     def _load_initial_data(self):
         """启动时加载数据：优先数据库，其次 JSON 缓存，否则示例数据。
 
         数据库与缓存均为本地数据，无需网络请求；若开启自动抓取则在后台刷新。
+        只加载当前分类的作品，并按作品 ID 倒序（与网站最新顺序一致）。
         """
         from ui.database import DatabaseManager
 
-        records = DatabaseManager.instance().load_comics()
+        records = DatabaseManager.instance().load_comics(
+            category=self._current_category_filter(),
+            limit=self._project_config.page_number,
+        )
         if records:
             self.set_comics_from_raw(records)
             self.status_label.setText(f"已从数据库加载，共 {len(records)} 部漫画")
@@ -360,6 +397,16 @@ class MainWindow(QMainWindow):
             self.status_label.setText("设置已保存")
 
     # ---- 窗口事件 ----
+
+    def showEvent(self, event):
+        """窗口显示时按真实宽度重新渲染。
+
+        首次数据加载发生在窗口显示前，viewport 宽度尚小，
+        列数会被算成 1 导致卡片单列排列；显示后再渲染恢复多列。
+        """
+        super().showEvent(event)
+        if self._comics:
+            self.comics_grid.render(self._comics)
 
     def resizeEvent(self, event):
         """窗口大小变化时重新布局卡片列数。"""

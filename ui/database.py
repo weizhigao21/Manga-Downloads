@@ -155,12 +155,27 @@ class DatabaseManager:
                 (detail_url,),
             )
 
-    def load_comics(self) -> list[dict]:
-        """读取全部漫画记录。"""
+    def load_comics(self, category: str | None = None, limit: int | None = None) -> list[dict]:
+        """读取漫画记录，按作品 ID（aid）倒序（最新上传优先）。
+
+        Args:
+            category: 仅返回该分类（如 "cate-22"）的记录；None 返回全部。
+            limit: 最多返回条数；None 返回全部。
+        """
+        sql = "SELECT * FROM comics"
+        params: list[str] = []
+        if category:
+            sql += " WHERE category = ?"
+            params.append(category)
+        sql += (
+            " ORDER BY CAST(substr(detail_url, instr(detail_url, 'aid-') + 4)"
+            " AS INTEGER) DESC"
+        )
+        if limit:
+            sql += " LIMIT ?"
+            params.append(str(limit))
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM comics ORDER BY updated_at DESC"
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
     def count(self) -> int:
