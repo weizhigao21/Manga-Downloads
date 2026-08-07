@@ -19,14 +19,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.utils import safe_filename
+from src.utils import data_root, safe_filename
 from ui.styles import PALETTE
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = data_root()
 DB_PATH = ROOT_DIR / "Config" / "comics.db"
 COVERS_DIR = ROOT_DIR / "Config" / "covers"
 
 AID_RE = re.compile(r"aid-(\d+)")
+
+
+def _extract_aid(detail_url: str) -> int | None:
+    """从详情链接提取作品 ID（aid），无法提取时返回 None。"""
+    match = AID_RE.search(detail_url or "")
+    return int(match.group(1)) if match else None
 
 
 def cover_cache_path(detail_url: str) -> Path | None:
@@ -111,6 +117,7 @@ class DatabaseManager:
                 """
                 CREATE TABLE IF NOT EXISTS comics (
                     detail_url TEXT PRIMARY KEY,
+                    aid INTEGER,
                     title TEXT NOT NULL,
                     date TEXT DEFAULT '',
                     image_count INTEGER DEFAULT 0,
@@ -122,12 +129,23 @@ class DatabaseManager:
                 )
                 """
             )
-            # 兼容旧库：补充 downloaded 列
+            # 兼容旧库：补充 downloaded / aid 列，并对 aid 做一次性回填
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(comics)")}
             if "downloaded" not in cols:
                 conn.execute(
                     "ALTER TABLE comics ADD COLUMN downloaded INTEGER DEFAULT 0"
                 )
+            if "aid" not in cols:
+                conn.execute("ALTER TABLE comics ADD COLUMN aid INTEGER")
+            conn.execute(
+                """
+                UPDATE comics SET aid = CAST(
+                    substr(detail_url, instr(detail_url, 'aid-') + 4) AS INTEGER)
+                WHERE aid IS NULL
+                """
+            )
+            # 排序用 aid 索引，避免每次查询都做字符串切片 CAST
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_comics_aid ON comics(aid)")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(DB_PATH)
@@ -143,14 +161,15 @@ class DatabaseManager:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO comics
-                    (detail_url, title, date, image_count, cover_url,
+                    (detail_url, aid, title, date, image_count, cover_url,
                      category, category_label, downloaded)
-                VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(
                     (SELECT downloaded FROM comics WHERE detail_url = ?), 0))
                 """,
                 [
                     (
                         c.get("detail_url", ""),
+                        _extract_aid(c.get("detail_url", "")),
                         c.get("title", ""),
                         c.get("date", ""),
                         int(c.get("image_count") or 0),
@@ -185,10 +204,8 @@ class DatabaseManager:
         if category:
             sql += " WHERE category = ?"
             params.append(category)
-        sql += (
-            " ORDER BY CAST(substr(detail_url, instr(detail_url, 'aid-') + 4)"
-            " AS INTEGER) DESC"
-        )
+        # aid 为 NULL（极端情况）的旧记录排最后，其余按 aid 倒序
+        sql += " ORDER BY aid IS NULL, aid DESC"
         if limit:
             sql += " LIMIT ?"
             params.append(str(limit))

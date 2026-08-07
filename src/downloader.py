@@ -6,44 +6,33 @@
 - 下载文件夹命名（含右上角分类标签）
 """
 import logging
+import random
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import zipfile
 from pathlib import Path
 
 from lxml import html
 
-# 兼容两种加载方式：作为包导入（python run_ui.py）或独立运行（python src/wnacg_crawler.py）
-try:
-    from src.utils import safe_filename
-    from src.wnacg_crawler import (
-        DOWNLOAD_MAX_RETRIES,
-        DOWNLOAD_WORKERS,
-        G_URL,
-        HEADERS,
-        _fetch_with_retry,
-        _throttle,
-        download_pictures,
-        fetch,
-        load_config,
-        parse_picture_page,
-    )
-except ImportError:
-    from utils import safe_filename
-    from wnacg_crawler import (
-        DOWNLOAD_MAX_RETRIES,
-        DOWNLOAD_WORKERS,
-        G_URL,
-        HEADERS,
-        _fetch_with_retry,
-        _throttle,
-        download_pictures,
-        fetch,
-        load_config,
-        parse_picture_page,
-    )
+# 独立运行时（sys.path[0] 为 src/ 目录）需将项目根加入路径，统一按 src.* 包导入。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.utils import safe_filename
+from src.wnacg_crawler import (
+    DOWNLOAD_MAX_RETRIES,
+    DOWNLOAD_WORKERS,
+    G_URL,
+    HEADERS,
+    _throttle,
+    download_pictures,
+    fetch,
+    load_config,
+    parse_picture_page,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +68,7 @@ def fetch_download_package_info(detail_url: str) -> dict:
 
     # 1. 获取下载页，提取 CONFIG 配置
     page_url = f"{G_URL}/download-index-aid-{aid}.html"
-    page_html = _fetch_with_retry(page_url)
+    page_html, page_cookies = _fetch_page_with_cookies(page_url)
     config_match = CONFIG_RE.search(page_html)
     if not config_match:
         raise RuntimeError(
@@ -95,17 +84,20 @@ def fetch_download_package_info(detail_url: str) -> dict:
     logger.info("整包下载配置: aid=%s, 文件名=%s", aid, file_name)
 
     # 2. 调用 generate-link API 换取带签名的下载直链
-    url = _generate_link(worker_api, file_key, file_name, page_url)
+    url = _generate_link(worker_api, file_key, file_name, page_cookies)
 
     logger.info("整包下载直链已生成: aid=%s", aid)
     return {"url": url, "file_name": file_name, "aid": aid}
 
 
-def _generate_link(worker_api: str, file_key: str, file_name: str, page_url: str) -> str:
+def _generate_link(worker_api: str, file_key: str, file_name: str, cookies: str) -> str:
     """用 curl_cffi（模拟 Chrome TLS/HTTP2 指纹）调用 generate-link API。
 
     携带下载页响应中的 Cookie，并通过 impersonate 模拟 Chrome 指纹，
     绕过 Cloudflare 的 TLS/HTTP2 指纹校验（requests 会被 403 拦截）。
+
+    Args:
+        cookies: 下载页请求得到的 Cookie 字符串（与 HTML 同一次请求取得）。
     """
     try:
         from curl_cffi import requests as cffi_requests
@@ -114,14 +106,12 @@ def _generate_link(worker_api: str, file_key: str, file_name: str, page_url: str
             "未安装 curl_cffi，请执行: pip install curl_cffi"
         )
 
-    _throttle()
-    download_page_cookies = _fetch_cookies(page_url)
     headers = {
         **HEADERS,
         "Accept": "*/*",
         "Origin": G_URL,
         "Referer": f"{G_URL}/",
-        "Cookie": download_page_cookies,
+        "Cookie": cookies,
     }
     resp = cffi_requests.post(
         worker_api,
@@ -137,14 +127,34 @@ def _generate_link(worker_api: str, file_key: str, file_name: str, page_url: str
     return data["url"]
 
 
-def _fetch_cookies(url: str) -> str:
-    """请求页面并返回响应中的 Cookie 字符串（保持与浏览器一致的会话状态）。"""
-    _throttle()
-    import requests
+def _fetch_page_with_cookies(url: str, retries: int = DOWNLOAD_MAX_RETRIES) -> tuple[str, str]:
+    """请求页面并返回 (HTML, Cookie 字符串)，带退避重试。
 
-    resp = requests.get(url, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
-    return "; ".join(f"{c.name}={c.value}" for c in resp.cookies)
+    下载页的 HTML 与 Cookie 在一次请求中同时取得，避免对同一页面重复
+    请求触发限流；对 429/403/5xx 指数退避重试（与 _fetch_with_retry 一致）。
+    """
+    for attempt in range(retries):
+        try:
+            _throttle()
+            import requests
+
+            resp = requests.get(url, headers=HEADERS, timeout=60)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            cookies = "; ".join(f"{c.name}={c.value}" for c in resp.cookies)
+            return resp.text, cookies
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status in (429, 403, 500, 502, 503):
+                wait = 3.0 * (2**attempt) + random.uniform(0, 1)
+                logger.warning(
+                    "页面请求被限流(HTTP %d)，第 %d/%d 次重试，等待 %.1fs: %s",
+                    status, attempt + 1, retries, wait, url,
+                )
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError(f"页面请求重试 {retries} 次仍失败: {url}")
 
 
 def _download_folder_name(comic: dict, use_label: bool = True) -> str:
@@ -331,6 +341,27 @@ def _download_package(
             pass
 
 
+def _extract_reading_page_url(detail_doc) -> str | None:
+    """从详情页提取阅读页 URL（含 page-N-aid-M，N 为总页数）。
+
+    优先收集所有指向阅读页的链接（photos-index-page-*），取最后一个
+    （列表按页码升序排列，最后一个是末页，其 page-N 即为总页数）；
+    找不到时回退到历史版本绝对路径。
+    """
+    links = detail_doc.xpath(
+        '//a[contains(@href, "photos-index-page")]/@href'
+    )
+    if not links:
+        links = detail_doc.xpath(
+            '//div[contains(@class, "pic_box")]//a[contains(@href, "aid-")]/@href'
+        )
+    if not links:
+        links = detail_doc.xpath(
+            '//*[@id="bodywrap"]/div[2]/div/div/div[1]/a[last()]/@href'
+        )
+    return links[-1] if links else None
+
+
 def download_comic(
     comic: dict,
     base_dir: Path | None = None,
@@ -365,15 +396,13 @@ def download_comic(
         return
 
     detail_html = fetch(G_URL + comic["detail_url"])
-    page_nodes = html.fromstring(detail_html).xpath(
-        '//*[@id="bodywrap"]/div[2]/div/div/div[1]/a[last()]/@href'
-    )
-    if not page_nodes:
+    reading_url = _extract_reading_page_url(html.fromstring(detail_html))
+    if not reading_url:
         logger.warning("未找到阅读页链接: %s", comic["title"])
         return
 
     # 从阅读页 URL 提取总页数
-    match = re.search(r"page-(\d+)-aid-(\d+)", page_nodes[0])
+    match = re.search(r"page-(\d+)-aid-(\d+)", reading_url)
     page_count = int(match.group(1)) if match else 1
     workers = int(config.get("Download_workers", DOWNLOAD_WORKERS))
     retries = int(config.get("Download_retries", DOWNLOAD_MAX_RETRIES))
@@ -389,7 +418,7 @@ def download_comic(
         if stage_callback:
             stage_callback(f"解析图片 {batch_start}-{batch_end} 页")
         batch = parse_picture_page(
-            page_nodes[0], start=batch_start, end=batch_end
+            reading_url, start=batch_start, end=batch_end
         )
         if not batch:
             logger.warning("第 %d-%d 页未解析到图片，跳过", batch_start, batch_end)

@@ -5,6 +5,27 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.1] - 2026-08-07
+
+### 新增
+
+- 图片下载断点续传：目标文件已存在且非空时跳过，下载失败重试不会整部重来
+- pytest 测试套件（`tests/`）：覆盖 `parse_comics`、`_page_url`、图片直链提取、阅读页链接提取、`safe_filename` 与下载跳过逻辑，共 31 个用例，不依赖网络
+
+### 修复
+
+- 爬虫 XPath 加固：图片直链提取由单一绝对路径改为多候选相对 XPath（`pic_box`/`photo` 容器优先，历史结构兜底）；阅读页链接改为收集所有 `photos-index-page` 链接取末页，页面改版时更不易失效
+- 整包下载重复请求：下载页 HTML 与 Cookie 合并为一次请求（原实现请求两次），降低触发限流风险
+
+### 重构
+
+- 统一包导入：移除 `src` 模块中 `try/except ImportError` 兼容分支，改为 `sys.path` 修正 + 统一 `from src.*` 导入，独立运行与包导入两种方式均可用
+- 数据库排序优化：`comics` 表新增 `aid` 列与索引，排序由字符串切片 CAST 改为 `aid` 倒序；旧库自动迁移并回填 `aid`
+
+### 其他
+
+- 清理项目根目录开发残留脚本（`_count_lines.py` / `_test_search.py` / `正则表达式.py`）至 `tools/_archive/`
+
 ## [1.2.0] - 2026-08-07
 
 ### 修复

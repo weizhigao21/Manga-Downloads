@@ -18,8 +18,15 @@ from pathlib import Path
 import requests
 from lxml import html
 
+# 独立运行（python src/wnacg_crawler.py）时 sys.path[0] 是 src/ 目录，
+# 需将项目根加入路径后统一按 src.* 包导入；作为包导入时 __package__ 非空，跳过。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.utils import data_root
+
 # 项目根目录（src 的上级目录）与配置文件路径
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = data_root()
 CONFIG_PATH = ROOT_DIR / "Config" / "Config.json"
 
 # 目标页面与列表容器 XPath（<ul> 下每个 <li class="gallary_item"> 为一条漫画）
@@ -307,6 +314,47 @@ def _fetch_with_retry(url: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str:
     raise RuntimeError(f"页面请求重试 {retries} 次仍失败: {url}")
 
 
+def _normalize_image_url(url: str) -> str:
+    """将提取到的图片 URL 归一化为可请求的完整地址。"""
+    url = url.strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = f"https:{url}"
+    elif not url.startswith("http"):
+        url = G_URL + url
+    return url
+
+
+def _extract_image_url(detail_doc) -> str | None:
+    """从图片详情页提取大图直链。
+
+    页面结构随站点改版可能变化，因此提供多个候选 XPath 按优先级尝试：
+    优先匹配含常见图片容器的相对路径，最后才回退到历史版本的绝对路径。
+    同时过滤图标/占位图等非内容图片。
+    """
+    candidates = (
+        # 常见大图容器
+        '//div[contains(@class, "pic_box") or contains(@class, "photo")]//a/img/@src',
+        '//span/a/img/@src',
+        # 任意 a 内的大图（排除小图标）
+        '//a/img/@src',
+        # 历史版本结构兜底
+        '/html/body/div[5]/span/a/img/@src',
+    )
+    ignored_keywords = ("icon", "logo", "placeholder", "loading", "spinner")
+    for xpath in candidates:
+        for src in detail_doc.xpath(xpath):
+            url = _normalize_image_url(src)
+            if not url:
+                continue
+            lower = url.lower()
+            if any(k in lower for k in ignored_keywords):
+                continue
+            return url
+    return None
+
+
 def _fetch_picture_link(link: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str | None:
     """获取单张图片详情页中的图片直链，失败时返回 None。
 
@@ -317,15 +365,10 @@ def _fetch_picture_link(link: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str |
         try:
             detail_html = fetch(G_URL + link)
             detail_doc = html.fromstring(detail_html)
-            img_nodes = detail_doc.xpath('/html/body/div[5]/span/a/img/@src')
-            if not img_nodes:
+            img_url = _extract_image_url(detail_doc)
+            if not img_url:
                 logger.warning("图片详情页未找到图片直链: 条目=%s", link)
                 return None
-            img_url = img_nodes[0]
-            if img_url.startswith("//"):
-                img_url = f"https:{img_url}"
-            elif not img_url.startswith("http"):
-                img_url = G_URL + img_url
             return img_url
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else 0
@@ -463,6 +506,14 @@ def download_pictures(
     def _download_one(pic: dict):
         nonlocal done
         url = pic["link"]
+        target = save_dir / f"{pic['number']}.jpg"
+        # 断点续传：目标文件已存在且非空时跳过，不重复下载
+        if target.exists() and target.stat().st_size > 0:
+            with lock:
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total)
+            return
         last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
@@ -473,7 +524,7 @@ def download_pictures(
                         f"HTTP {resp.status_code}", response=resp
                     )
                 resp.raise_for_status()
-                (save_dir / f"{pic['number']}.jpg").write_bytes(resp.content)
+                target.write_bytes(resp.content)
                 break
             except (requests.RequestException, OSError) as exc:
                 last_exc = exc
@@ -512,7 +563,7 @@ def main() -> int:
 
     if args.download:
         # 延迟导入避免循环依赖（downloader 依赖本模块）
-        from downloader import download_comic
+        from src.downloader import download_comic
 
         config = load_config()
         base_dir = Path(config.get("Download", "./Download"))
