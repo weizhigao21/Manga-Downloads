@@ -1,9 +1,10 @@
 """本地漫画数据缓存管理。"""
 
 import json
-from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+from src.utils import data_root
+
+ROOT_DIR = data_root()
 CACHE_PATH = ROOT_DIR / "Config" / "comics_cache.json"
 
 

@@ -11,11 +11,19 @@ Config/*.db
 Config/*.json
 Download/
 
-# 临时/开发脚本
+# 临时/开发脚本（已归档至 tools/_archive/，同名规则同时覆盖归档目录）
 _count_lines.py
 _test_search.py
 正则表达式.py
 btn_check.png
 
+# 工具本地记忆/配置（不进仓库）
+.workbuddy/
+
 # 代码索引（本地生成，可随时重建）
 .codegraph/
+
+# PyInstaller 打包产物（spec 保留，可复现构建）
+build/
+dist/
+*.manifest

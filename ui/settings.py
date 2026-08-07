@@ -5,8 +5,10 @@ from pathlib import Path
 
 from opencc import OpenCC
 
-# 项目根目录
-ROOT_DIR = Path(__file__).resolve().parent.parent
+from src.utils import data_root
+
+# 应用数据根目录（源码=项目根，打包后=exe 所在目录）
+ROOT_DIR = data_root()
 SETTINGS_PATH = ROOT_DIR / "Config" / "settings.json"
 PROJECT_CONFIG_PATH = ROOT_DIR / "Config" / "Config.json"
 
