@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.utils import find_existing_translation
+from src.utils import find_existing_translation, split_title_segments
 from ui.settings import AppSettings
 
 
@@ -30,13 +30,27 @@ class ComicItem:
         1. AI 翻译结果（translated_title，已持久化）；
         2. 标题自带中文翻译（`日文名｜中文名`）或本身就是中文时，取中文部分；
         3. 回落原标题（繁简转换）。
+
+        方括号块（社团/作者/标签）始终原样保留，仅对主体文本做识别。
         """
         if self.translated_title:
             return self.translated_title
-        existing = find_existing_translation(self.title)
-        if existing is not None:
-            return self._settings.convert(existing)
-        return self._settings.convert(self.title)
+        parts: list[str] = []
+        for text, translatable in split_title_segments(self.title):
+            if not translatable or not text.strip():
+                parts.append(text)
+                continue
+            # 保留主体片段原有首尾空白，仅替换中间内容
+            leading = text[: len(text) - len(text.lstrip())]
+            trailing = text[len(text.rstrip()):]
+            existing = find_existing_translation(text)
+            core = (
+                self._settings.convert(existing)
+                if existing is not None
+                else self._settings.convert(text.strip())
+            )
+            parts.append(f"{leading}{core}{trailing}")
+        return "".join(parts)
 
     @property
     def display_category_label(self) -> str:

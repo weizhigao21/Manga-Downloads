@@ -1,6 +1,6 @@
 """漫画浏览器 UI 包。"""
 
-__version__ = "1.2.9"
+__version__ = "1.2.10"
 
 from .main_window import MainWindow
 
