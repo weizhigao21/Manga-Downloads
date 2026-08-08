@@ -1,12 +1,14 @@
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap, QPixmapCache
+from PySide6.QtGui import QContextMenuEvent, QPixmap, QPixmapCache
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -323,3 +325,25 @@ class ComicCard(QFrame):
         elif task.status == DownloadTask.FAILED:
             self.download_btn.setEnabled(True)
             self.download_btn.setText("重试")
+
+    def contextMenuEvent(self, event: QContextMenuEvent):
+        """右键卡片弹出上下文菜单：复制作品名称到剪贴板。"""
+        menu = QMenu(self)
+        menu.addAction("复制作品名称", self._copy_title)
+        menu.exec(event.globalPos())
+
+    def _copy_title(self):
+        """将作品显示名称（含繁简转换）复制到剪贴板。"""
+        text = self.comic.display_title
+        QApplication.clipboard().setText(text)
+        self._show_copied_hint()
+
+    def _show_copied_hint(self):
+        """在下载按钮位置短暂显示“已复制”提示，提供操作反馈。"""
+        if not hasattr(self, "download_btn"):
+            return
+        from PySide6.QtCore import QTimer
+
+        original_text = self.download_btn.text()
+        self.download_btn.setText("已复制")
+        QTimer.singleShot(1200, lambda: self.download_btn.setText(original_text))
