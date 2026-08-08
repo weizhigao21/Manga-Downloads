@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.12] - 2026-08-08
+
+### 变更
+
+- 打包模式由 onefile 改为 onedir：启动时不再解压归档（原单文件每次启动解压 ~80MB），打开窗口速度明显提升；完整程序为 `dist/漫画浏览器/` 目录
+- 打包内容精简：排除误收集的 PIL/Pillow、cryptography、pywin32/Pythonwin 及未使用的 Qt 模块（QML/Quick/PDF/OpenGL 等动态库），产物由 177MB 降至约 108MB
+
 ## [1.2.11] - 2026-08-08
 
 ### 修复

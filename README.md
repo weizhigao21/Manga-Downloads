@@ -116,7 +116,7 @@ pip install pyinstaller
 pyinstaller 漫画浏览器.spec
 ```
 
-打包后 `Config/`（配置、缓存、封面、数据库）以 exe 所在目录为数据根目录，可直接读写。
+打包产物为 onedir 目录 `dist/漫画浏览器/`（主程序 `漫画浏览器.exe` + `_internal/` 依赖），整体拷贝即可分发；onedir 模式启动无需解压归档，打开窗口更快。`Config/`（配置、缓存、封面、数据库）以 exe 所在目录为数据根目录，可直接读写。
 
 ## 免责声明
 
