@@ -28,3 +28,27 @@ def data_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
+
+
+# 方括号块（社团名/作者/标签等），标题翻译时整体保留
+BRACKET_RE = re.compile(r"(\[[^\]]*\])")
+
+
+def split_title_segments(title: str) -> list[tuple[str, bool]]:
+    """将标题按方括号块切分为 [(文本, 是否可翻译)]。
+
+    方括号块（如 `[社团名]`、`[标签]`）标记为不可翻译并原样保留，
+    其余主体文本标记为可翻译。
+
+    Examples:
+        "[A] 主体 [B]" -> [("[A]", False), (" 主体 ", True), ("[B]", False)]
+    """
+    segments: list[tuple[str, bool]] = []
+    for part in BRACKET_RE.split(title or ""):
+        if not part:
+            continue
+        if part.startswith("[") and part.endswith("]"):
+            segments.append((part, False))
+        else:
+            segments.append((part, True))
+    return segments

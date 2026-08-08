@@ -7,6 +7,8 @@ import logging
 
 from PySide6.QtCore import QThread, Signal
 
+from src.utils import split_title_segments
+
 logger = logging.getLogger(__name__)
 
 # 翻译指令：只输出翻译结果，不带解释与引号
@@ -14,6 +16,27 @@ SYSTEM_PROMPT = (
     "你是专业的漫画翻译。将用户输入的作品名称翻译为简体中文，"
     "只输出翻译结果本身，不要任何解释、注释或引号。"
 )
+
+
+def translate_title(title: str, api_base: str, api_key: str, model: str) -> str:
+    """翻译完整标题：方括号块（社团/作者/标签）原样保留，只翻译主体文本。
+
+    如 `[钢鉄しゃぼん玉 (玉ぼん)] 続·カノジョは… [惑星]` 仅翻译中间
+    的作品名，方括号内容不翻译，翻译结果按原顺序拼回。
+    """
+    segments = split_title_segments(title)
+    translated_parts: list[str] = []
+    for text, translatable in segments:
+        if translatable and text.strip():
+            # 保留片段原有首尾空白，翻译结果只替换中间内容
+            leading = text[: len(text) - len(text.lstrip())]
+            trailing = text[len(text.rstrip()):]
+            translated_parts.append(
+                f"{leading}{translate_text(text, api_base, api_key, model)}{trailing}"
+            )
+        else:
+            translated_parts.append(text)
+    return "".join(translated_parts)
 
 
 def translate_text(text: str, api_base: str, api_key: str, model: str) -> str:
@@ -78,7 +101,8 @@ class TranslateWorker(QThread):
 
     def run(self):
         try:
-            result = translate_text(
+            # 使用 translate_title：方括号块（社团/作者/标签）保留，只翻译主体
+            result = translate_title(
                 self.text, self.api_base, self.api_key, self.model
             )
             self.finished.emit(result)
