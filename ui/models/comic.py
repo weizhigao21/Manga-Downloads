@@ -17,12 +17,16 @@ class ComicItem:
     detail_url: str = ""
     category: str = ""
     category_label: str = ""
+    translated_title: str = ""
 
     def __post_init__(self):
         self._settings = AppSettings()
 
     @property
     def display_title(self) -> str:
+        """卡片显示名称：已翻译时优先显示翻译结果，否则显示原标题（繁简转换）。"""
+        if self.translated_title:
+            return self.translated_title
         return self._settings.convert(self.title)
 
     @property

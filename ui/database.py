@@ -119,6 +119,7 @@ class DatabaseManager:
                     detail_url TEXT PRIMARY KEY,
                     aid INTEGER,
                     title TEXT NOT NULL,
+                    translated_title TEXT DEFAULT '',
                     date TEXT DEFAULT '',
                     image_count INTEGER DEFAULT 0,
                     cover_url TEXT DEFAULT '',
@@ -129,7 +130,7 @@ class DatabaseManager:
                 )
                 """
             )
-            # 兼容旧库：补充 downloaded / aid 列，并对 aid 做一次性回填
+            # 兼容旧库：补充 downloaded / aid / translated_title 列，并对 aid 做一次性回填
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(comics)")}
             if "downloaded" not in cols:
                 conn.execute(
@@ -137,6 +138,10 @@ class DatabaseManager:
                 )
             if "aid" not in cols:
                 conn.execute("ALTER TABLE comics ADD COLUMN aid INTEGER")
+            if "translated_title" not in cols:
+                conn.execute(
+                    "ALTER TABLE comics ADD COLUMN translated_title TEXT DEFAULT ''"
+                )
             conn.execute(
                 """
                 UPDATE comics SET aid = CAST(
@@ -161,9 +166,11 @@ class DatabaseManager:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO comics
-                    (detail_url, aid, title, date, image_count, cover_url,
-                     category, category_label, downloaded)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(
+                    (detail_url, aid, title, translated_title, date,
+                     image_count, cover_url, category, category_label, downloaded)
+                VALUES (?, ?, ?, COALESCE(
+                    (SELECT translated_title FROM comics WHERE detail_url = ?), ''),
+                    ?, ?, ?, ?, ?, COALESCE(
                     (SELECT downloaded FROM comics WHERE detail_url = ?), 0))
                 """,
                 [
@@ -171,6 +178,7 @@ class DatabaseManager:
                         c.get("detail_url", ""),
                         _extract_aid(c.get("detail_url", "")),
                         c.get("title", ""),
+                        c.get("detail_url", ""),
                         c.get("date", ""),
                         int(c.get("image_count") or 0),
                         c.get("cover_url", ""),
@@ -181,6 +189,26 @@ class DatabaseManager:
                     for c in comics
                 ],
             )
+        _invalidate_records_cache()
+
+    def save_translated_title(self, detail_url: str, translated_title: str):
+        """保存作品名称的翻译结果（不存在该记录时插入一条最小记录）。"""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE comics SET translated_title = ?, updated_at = datetime('now', 'localtime')
+                WHERE detail_url = ?
+                """,
+                (translated_title, detail_url),
+            )
+            if conn.total_changes == 0:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO comics (detail_url, title, translated_title)
+                    VALUES (?, '', ?)
+                    """,
+                    (detail_url, translated_title),
+                )
         _invalidate_records_cache()
 
     def mark_downloaded(self, detail_url: str):

@@ -238,6 +238,10 @@ class MainWindow(QMainWindow):
         self.comics_grid.render(comics)
         self.status_label.setText(f"共 {len(comics)} 部漫画")
 
+    def set_status(self, text: str):
+        """在左下角状态栏显示提示信息（卡片等子组件可经 window() 调用）。"""
+        self.status_label.setText(text)
+
     def set_comics_from_raw(self, raw_comics: list[dict]):
         """将爬虫原始字典转换为 ComicItem 并展示（自动关联本地封面缓存）。"""
         from ui.database import cover_cache_path
@@ -255,6 +259,7 @@ class MainWindow(QMainWindow):
                     cover_path=cover_cache_path(detail_url),
                     category=c.get("category", ""),
                     category_label=c.get("category_label", ""),
+                    translated_title=c.get("translated_title", ""),
                 )
             )
         self.set_comics(items)

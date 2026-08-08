@@ -129,12 +129,7 @@ class ComicCard(QFrame):
         info_layout.setSpacing(8)
         info_layout.setAlignment(Qt.AlignTop)
 
-        # 标题超过 40 个字符时截断显示省略号，完整标题放入提示
-        full_title = self.comic.display_title
-        shown_title = full_title if len(full_title) <= 40 else full_title[:40] + "..."
-        self.title_label = QLabel(shown_title)
-        if shown_title != full_title:
-            self.title_label.setToolTip(full_title)
+        self.title_label = QLabel()
         self.title_label.setWordWrap(True)
         self.title_label.setStyleSheet(
             f"""
@@ -145,6 +140,7 @@ class ComicCard(QFrame):
             }}
             """
         )
+        self._update_title_label()
 
         self.count_label = QLabel(f"图片: {self.comic.count_text}")
         self.count_label.setStyleSheet(
@@ -366,23 +362,28 @@ class ComicCard(QFrame):
         return menu
 
     def _copy_title(self):
-        """将作品显示名称（含繁简转换）复制到剪贴板。"""
+        """将作品显示名称（含繁简转换）复制到剪贴板，左下角状态栏提示。"""
         text = self.comic.display_title
         QApplication.clipboard().setText(text)
-        self._show_copied_hint()
+        self._show_status(f"已复制作品名称：{text}")
 
-    def _show_copied_hint(self):
-        """在下载按钮位置短暂显示“已复制”提示，提供操作反馈。"""
-        if not hasattr(self, "download_btn"):
-            return
-        from PySide6.QtCore import QTimer
+    def _update_title_label(self):
+        """刷新标题显示（翻译结果更新后调用）。"""
+        full_title = self.comic.display_title
+        shown_title = full_title if len(full_title) <= 40 else full_title[:40] + "..."
+        self.title_label.setText(shown_title)
+        self.title_label.setToolTip(full_title if shown_title != full_title else "")
 
-        original_text = self.download_btn.text()
-        self.download_btn.setText("已复制")
-        QTimer.singleShot(1200, lambda: self.download_btn.setText(original_text))
+    def _show_status(self, text: str):
+        """在左下角状态栏显示提示（经由主窗口 set_status，超长截断）。"""
+        window = self.window()
+        set_status = getattr(window, "set_status", None)
+        if set_status:
+            shown = text if len(text) <= 60 else text[:60] + "..."
+            set_status(shown)
 
     def _translate_title(self):
-        """翻译作品名称：异步调用 AI 接口，完成后复制结果并弹窗显示。"""
+        """翻译作品名称：异步调用 AI 接口，完成后入库、刷新标题并复制。"""
         from ui.settings import AppSettings
         from ui.translate import TranslateWorker
 
@@ -414,10 +415,16 @@ class ComicCard(QFrame):
     def _on_translate_done(self, result: str):
         self._translate_worker = None
         self._sync_download_button()
-        QApplication.clipboard().setText(result)
-        QMessageBox.information(
-            self, "翻译完成", f"翻译结果（已复制到剪贴板）：\n\n{result}"
+        # 翻译结果写入数据库并刷新卡片标题（下次启动仍显示翻译名）
+        self.comic.translated_title = result
+        self._update_title_label()
+        from ui.database import DatabaseManager
+
+        DatabaseManager.instance().save_translated_title(
+            self.comic.detail_url, result
         )
+        QApplication.clipboard().setText(result)
+        self._show_status(f"翻译成功：{result}（已复制到剪贴板）")
 
     def _on_translate_error(self, message: str):
         self._translate_worker = None
