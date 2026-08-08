@@ -6,6 +6,7 @@
 - 下载文件夹命名（含右上角分类标签）
 """
 import logging
+import os
 import random
 import re
 import shutil
@@ -229,11 +230,16 @@ def _extract_with_7z(
 
     7z 命令行不输出逐文件百分比（-bsp1 对 zip 包无效），因此启动一个监控线程
     统计 save_dir 下已解压出的文件数量，按 total_files 换算为百分比回调。
+
+    Windows 下以 CREATE_NO_WINDOW 启动 7z，避免下载/解压时弹出 cmd 黑窗闪烁。
     """
+    # 仅 Windows 生效：不创建控制台窗口（7z.exe 是控制台程序，默认会闪窗）
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     proc = subprocess.Popen(
         [seven_zip, "x", "-y", f"-o{save_dir}", str(archive_path)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        creationflags=creationflags,
     )
 
     stop_monitor = threading.Event()
