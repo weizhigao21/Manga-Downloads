@@ -115,6 +115,7 @@ class DownloadManager(QObject):
             "detail_url": comic.detail_url,
             "image_count": comic.image_count,
             "category_label": comic.display_category_label,
+            "translated_title": comic.translated_title,
         }
         base_dir = Path(ProjectConfig().download_dir)
 

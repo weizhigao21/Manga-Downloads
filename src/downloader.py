@@ -5,6 +5,7 @@
 - 图片逐张下载：分批解析图片页 → 并发下载
 - 下载文件夹命名（含右上角分类标签）
 """
+import json
 import logging
 import os
 import random
@@ -368,6 +369,27 @@ def _extract_reading_page_url(detail_doc) -> str | None:
     return links[-1] if links else None
 
 
+def _write_title_info(save_dir: Path, comic: dict) -> None:
+    """下载完成后在作品目录内写入标题信息 JSON（原始名 + 翻译名）。
+
+    文件名为 title_info.json，包含 original_title（原始名称）、
+    translated_title（翻译名称，未翻译时为空）与 detail_url（详情链接）。
+    """
+    info = {
+        "original_title": comic.get("title", ""),
+        "translated_title": comic.get("translated_title", ""),
+        "detail_url": comic.get("detail_url", ""),
+    }
+    try:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        (save_dir / "title_info.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.info("已写入标题信息: %s/title_info.json", save_dir)
+    except OSError as exc:
+        logger.warning("写入标题信息 JSON 失败: %s", exc)
+
+
 def download_comic(
     comic: dict,
     base_dir: Path | None = None,
@@ -399,6 +421,8 @@ def download_comic(
         if stage_callback:
             stage_callback("准备")
         _download_package(comic, save_dir, progress_callback, stage_callback)
+        # 解压完成后写入标题信息 JSON
+        _write_title_info(save_dir, comic)
         return
 
     detail_html = fetch(G_URL + comic["detail_url"])
@@ -458,3 +482,6 @@ def download_comic(
             f"未解析到任何图片链接（作品: {comic.get('title', '')}），"
             "页面结构可能变化或已被反爬拦截，详见日志"
         )
+
+    # 图片下载完成后写入标题信息 JSON
+    _write_title_info(save_dir, comic)

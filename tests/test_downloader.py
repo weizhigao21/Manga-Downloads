@@ -1,8 +1,10 @@
 """src/downloader.py 纯函数与下载行为测试（不依赖真实网络）。"""
 
+import json
+
 from lxml import html as lxml_html
 
-from src.downloader import _extract_reading_page_url
+from src.downloader import _extract_reading_page_url, _write_title_info
 
 
 class TestExtractReadingPageUrl:
@@ -109,3 +111,31 @@ class TestDownloadPicturesResume:
         download_pictures([], tmp_path, progress_callback=lambda c, t: progress.append((c, t)))
         assert requested == []
         assert progress == [(0, 0)]
+
+
+class TestWriteTitleInfo:
+    def test_writes_original_and_translated(self, tmp_path):
+        _write_title_info(
+            tmp_path,
+            {
+                "title": "[社团] オリジナルタイトル [タグ]",
+                "translated_title": "[社团] 原创标题 [标签]",
+                "detail_url": "/photos-index-page-1-aid-10001.html",
+            },
+        )
+        info_path = tmp_path / "title_info.json"
+        assert info_path.exists()
+        data = json.loads(info_path.read_text(encoding="utf-8"))
+        assert data["original_title"] == "[社团] オリジナルタイトル [タグ]"
+        assert data["translated_title"] == "[社团] 原创标题 [标签]"
+        assert data["detail_url"] == "/photos-index-page-1-aid-10001.html"
+
+    def test_empty_translated_title(self, tmp_path):
+        _write_title_info(tmp_path, {"title": "标题", "detail_url": ""})
+        data = json.loads((tmp_path / "title_info.json").read_text(encoding="utf-8"))
+        assert data["translated_title"] == ""
+
+    def test_creates_nested_dir(self, tmp_path):
+        nested = tmp_path / "a" / "b"
+        _write_title_info(nested, {"title": "x"})
+        assert (nested / "title_info.json").exists()
