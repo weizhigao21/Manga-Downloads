@@ -5,6 +5,40 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.15] - 2026-08-08
+
+### 修复
+
+- 修复左下角状态栏长文本（如错误信息）向右延伸遮挡居中的翻页按钮：状态区启用鼠标事件穿透（点击落到下层按钮），状态文本限宽 260px 并超长自动省略（悬停 tooltip 显示全文），状态设置统一收敛到 `set_status` 入口
+
+### 新增
+
+- 下载失败任务支持**原地重试**：下载管理对话框为失败任务显示"重试"按钮；同一作品失败后再次点击下载会**复用原失败任务**（重置状态重启下载），不再创建重复任务；任务携带作品数据随 `tasks.json` 持久化，重启后仍可重试
+
+## [1.2.14] - 2026-08-08
+
+### 修复
+
+- 修复整包下载限流重试路径崩溃：`src/downloader.py` 缺失 `import time`，遇到 429/403/5xx 时抛 `NameError`（E1）
+- 修复重试次数设为 0 时下载抛 `UnboundLocalError`：`last_exc` 提前初始化（W1）
+- 下载文件名统一经 `safe_filename` 清洗，杜绝 HTML 来源的页码/名称造成路径穿越（W3）
+- 关闭窗口/退出程序时妥善收尾后台线程：抓取线程超时后移交孤儿引用避免 `QThread: Destroyed while thread is still running`；下载线程请求中断并限时等待（W2/W4）
+- 修复退出程序时 `QThread: Destroyed while thread '' is still running` 与关闭卡顿：新增全局线程注册表（`ui/threads.py`），抓取/翻译线程退出时统一收尾；收尾策略改为「短时优雅等待（2s）→ 超时强制终止」，不再等待慢速网络请求拖满超时（关闭程序从 ~15s 降至 ~2s）；下载线程同样支持超时强制终止，且图片写盘改为原子替换（tmp + rename），强制终止不会留下半截文件；翻译接口超时限制为 30s（openai 默认数分钟），网络请求默认超时 60s→30s
+
+### 变更
+
+- 网络层抽取为 `src/net.py`：全局节流 / fetch / 带退避重试 / 携带 Cookie 请求统一收敛，爬虫与下载器复用，删除重复实现（P0-1）
+- 项目配置统一由 `src/config.py` 的 `ProjectConfig` 管理，src 层不再直接读取 Config.json（P0-2）
+- 模块职责拆分：数据库对话框移至 `ui/dialogs/database_dialog.py`（`ui/database.py` 不再依赖 Qt）；下载管理对话框移至 `ui/dialogs/download_manager_dialog.py`（P0-3）
+- 版本号移至 `ui/version.py`，消除 `ui/__init__` 与 `ui/main_window` 循环导入（P0-4）
+- 下载任务持久化到 `Config/tasks.json`，重启后恢复历史任务；退出时未完成任务标记为"程序已退出，任务中断"（P1-5）
+- 列表页解析为 0 条时状态栏提示"站点结构可能已改版"，不再静默显示"共 0 部"（P1-6）
+- 新增工程设施：`pyproject.toml`（ruff 配置 + pytest 配置）、`.pre-commit-config.yaml`；修复 ruff 报告的 B904/B023/B905 告警（P1-8）
+
+### 测试
+
+- 新增 UI 层测试（pytest-qt + offscreen）：DownloadManager 状态机、任务持久化恢复、ComicItem 显示逻辑、ComicsGrid 响应式列数、对话框导入；测试总数 56 → 71
+
 ## [1.2.13] - 2026-08-08
 
 ### 变更

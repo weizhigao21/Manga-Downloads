@@ -5,7 +5,8 @@
 """
 import re
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -23,12 +24,13 @@ from PySide6.QtWidgets import (
 
 from ui.data_store import load_cache, save_cache
 from ui.dialogs import SettingsDialog
+from ui.download_manager import DownloadManager
 from ui.fetch_worker import FetchWorker
 from ui.models import ComicItem
-from ui.settings import AppSettings, BASE_URL, CATEGORIES, ProjectConfig
+from ui.settings import BASE_URL, CATEGORIES, AppSettings, ProjectConfig
 from ui.styles import LIGHT_THEME_QSS
+from ui.version import __version__
 from ui.widgets import ComicsGrid, PageBar
-from ui import __version__
 
 
 class MainWindow(QMainWindow):
@@ -124,12 +126,16 @@ class MainWindow(QMainWindow):
         # 左下角覆盖层：状态信息 + 进度条（透明，叠在翻页栏上层）
         left_host = QWidget()
         left_host.setStyleSheet("background-color: transparent;")
+        # 鼠标事件穿透到下层翻页栏：状态区只是浮层，不拦截按钮点击
+        left_host.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         left_layout = QHBoxLayout(left_host)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(16)
 
         self.status_label = QLabel("就绪")
         self.status_label.setObjectName("statusLabel")
+        # 限制状态文本宽度：覆盖层不会向右延伸遮挡居中的翻页按钮
+        self.status_label.setMaximumWidth(260)
         left_layout.addWidget(self.status_label)
 
         # 加载进度条：放入固定宽度容器，显隐切换不会引起布局跳动
@@ -171,14 +177,14 @@ class MainWindow(QMainWindow):
         )
         if records:
             self.set_comics_from_raw(records)
-            self.status_label.setText(f"已从数据库加载，共 {len(records)} 部漫画")
+            self.set_status(f"已从数据库加载，共 {len(records)} 部漫画")
         else:
             cached = load_cache()
             if cached:
                 # 数据库为空时，将旧 JSON 缓存迁移到数据库
                 DatabaseManager.instance().save_comics(cached)
                 self.set_comics_from_raw(cached)
-                self.status_label.setText(f"已加载本地缓存，共 {len(cached)} 部漫画")
+                self.set_status(f"已加载本地缓存，共 {len(cached)} 部漫画")
             else:
                 self._load_sample_data()
 
@@ -236,11 +242,21 @@ class MainWindow(QMainWindow):
         """设置漫画列表并刷新界面。"""
         self._comics = comics
         self.comics_grid.render(comics)
-        self.status_label.setText(f"共 {len(comics)} 部漫画")
+        self.set_status(f"共 {len(comics)} 部漫画")
 
     def set_status(self, text: str):
-        """在左下角状态栏显示提示信息（卡片等子组件可经 window() 调用）。"""
-        self.status_label.setText(text)
+        """在左下角状态栏显示提示（超长自动省略，悬停显示全文）。
+
+        状态文本统一经此入口设置：超过状态区宽度（maximumWidth）时
+        显示省略号，不会撑宽覆盖层遮挡居中的翻页按钮；完整文本
+        通过悬停 tooltip 查看。卡片等子组件可经 window() 调用。
+        """
+        metrics = QFontMetrics(self.status_label.font())
+        elided = metrics.elidedText(
+            text, Qt.ElideRight, self.status_label.maximumWidth()
+        )
+        self.status_label.setText(elided)
+        self.status_label.setToolTip(text if elided != text else "")
 
     def set_comics_from_raw(self, raw_comics: list[dict]):
         """将爬虫原始字典转换为 ComicItem 并展示（自动关联本地封面缓存）。
@@ -337,11 +353,11 @@ class MainWindow(QMainWindow):
 
         self._silent_fetch = silent
         if self._search_keyword:
-            self.status_label.setText(
+            self.set_status(
                 f"正在搜索“{self._search_keyword}”第 {self._current_page} 页..."
             )
         else:
-            self.status_label.setText(f"正在抓取第 {self._current_page} 页...")
+            self.set_status(f"正在抓取第 {self._current_page} 页...")
         self.progress_bar.setVisible(True)
 
         self._worker = FetchWorker(
@@ -365,7 +381,7 @@ class MainWindow(QMainWindow):
         if self._search_keyword:
             # 搜索结果仅展示，不写入缓存与数据库（避免污染下次启动的本地数据）
             self.set_comics_from_raw(raw_comics)
-            self.status_label.setText(
+            self.set_status(
                 f"搜索“{self._search_keyword}”：第 {self._current_page} 页，"
                 f"共 {len(raw_comics)} 部漫画"
             )
@@ -376,18 +392,24 @@ class MainWindow(QMainWindow):
 
             DatabaseManager.instance().save_comics(raw_comics)
             self.set_comics_from_raw(raw_comics)
-            self.status_label.setText(
-                f"第 {self._current_page} 页：共 {len(raw_comics)} 部漫画"
-            )
+            if not raw_comics:
+                # HTML 正常但解析 0 条：极可能是站点改版导致 XPath 失效
+                self.set_status(
+                    "未解析到漫画数据（站点结构可能已改版，请更新程序或检查网络）"
+                )
+            else:
+                self.set_status(
+                    f"第 {self._current_page} 页：共 {len(raw_comics)} 部漫画"
+                )
         self._worker = None
 
     def _on_fetch_error(self, message: str):
         self.progress_bar.setVisible(False)
         if self._silent_fetch:
-            self.status_label.setText(f"自动抓取失败: {message}")
+            self.set_status(f"自动抓取失败: {message}")
         else:
             QMessageBox.critical(self, "抓取失败", f"抓取过程中出现错误:\n{message}")
-            self.status_label.setText("抓取失败")
+            self.set_status("抓取失败")
         self._worker = None
 
     # ---- 工具栏回调 ----
@@ -398,7 +420,7 @@ class MainWindow(QMainWindow):
 
     def _on_download_manager(self):
         """打开下载管理对话框（显示任务 ID、进度与状态）。"""
-        from ui.download_manager import DownloadManagerDialog
+        from ui.dialogs.download_manager_dialog import DownloadManagerDialog
 
         dialog = DownloadManagerDialog(self)
         dialog.exec()
@@ -408,7 +430,7 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self)
         if dialog.exec() == SettingsDialog.Accepted:
             self.comics_grid.render(self._comics)
-            self.status_label.setText("设置已保存")
+            self.set_status("设置已保存")
 
     # ---- 窗口事件 ----
 
@@ -427,8 +449,13 @@ class MainWindow(QMainWindow):
         self.comics_grid.reflow()
 
     def closeEvent(self, event):
-        """关闭窗口时等待后台抓取线程结束，避免销毁仍在运行的线程。"""
-        if self._worker and self._worker.isRunning():
-            # 限时等待，避免线程处于网络超时等待时阻塞窗口关闭
-            self._worker.wait(3000)
+        """关闭窗口（即退出程序）时快速收尾后台线程：
+
+        1. 抓取线程：引用由全局线程注册表持有（ui/threads.py），
+           应用退出时统一中断并限时强制终止，此处不阻塞；
+        2. 下载线程：请求中断并短时等待（写文件为原子替换，
+           超时强制终止也不会损坏数据），保证退出不卡顿。
+        """
+        self._worker = None
+        DownloadManager.instance().shutdown(timeout_ms=2500)
         super().closeEvent(event)

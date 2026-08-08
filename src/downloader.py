@@ -8,7 +8,6 @@
 import json
 import logging
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -23,16 +22,13 @@ from lxml import html
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.config import ProjectConfig
+from src.net import _throttle, fetch, fetch_page_with_cookies
 from src.utils import display_title_for_comic, safe_filename
 from src.wnacg_crawler import (
-    DOWNLOAD_MAX_RETRIES,
-    DOWNLOAD_WORKERS,
     G_URL,
     HEADERS,
-    _throttle,
     download_pictures,
-    fetch,
-    load_config,
     parse_picture_page,
 )
 
@@ -70,7 +66,7 @@ def fetch_download_package_info(detail_url: str) -> dict:
 
     # 1. 获取下载页，提取 CONFIG 配置
     page_url = f"{G_URL}/download-index-aid-{aid}.html"
-    page_html, page_cookies = _fetch_page_with_cookies(page_url)
+    page_html, page_cookies = fetch_page_with_cookies(page_url, HEADERS)
     config_match = CONFIG_RE.search(page_html)
     if not config_match:
         raise RuntimeError(
@@ -103,10 +99,10 @@ def _generate_link(worker_api: str, file_key: str, file_name: str, cookies: str)
     """
     try:
         from curl_cffi import requests as cffi_requests
-    except ImportError:
+    except ImportError as exc:
         raise RuntimeError(
             "未安装 curl_cffi，请执行: pip install curl_cffi"
-        )
+        ) from exc
 
     headers = {
         **HEADERS,
@@ -127,36 +123,6 @@ def _generate_link(worker_api: str, file_key: str, file_name: str, cookies: str)
     if not data.get("success") or not data.get("url"):
         raise RuntimeError(f"generate-link 返回异常: {data}")
     return data["url"]
-
-
-def _fetch_page_with_cookies(url: str, retries: int = DOWNLOAD_MAX_RETRIES) -> tuple[str, str]:
-    """请求页面并返回 (HTML, Cookie 字符串)，带退避重试。
-
-    下载页的 HTML 与 Cookie 在一次请求中同时取得，避免对同一页面重复
-    请求触发限流；对 429/403/5xx 指数退避重试（与 _fetch_with_retry 一致）。
-    """
-    for attempt in range(retries):
-        try:
-            _throttle()
-            import requests
-
-            resp = requests.get(url, headers=HEADERS, timeout=60)
-            resp.raise_for_status()
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            cookies = "; ".join(f"{c.name}={c.value}" for c in resp.cookies)
-            return resp.text, cookies
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else 0
-            if status in (429, 403, 500, 502, 503):
-                wait = 3.0 * (2**attempt) + random.uniform(0, 1)
-                logger.warning(
-                    "页面请求被限流(HTTP %d)，第 %d/%d 次重试，等待 %.1fs: %s",
-                    status, attempt + 1, retries, wait, url,
-                )
-                time.sleep(wait)
-                continue
-            raise
-    raise RuntimeError(f"页面请求重试 {retries} 次仍失败: {url}")
 
 
 def _download_folder_name(comic: dict, use_label: bool = True) -> str:
@@ -446,16 +412,16 @@ def download_comic(
         batch_pages: 每批解析的页数，默认 4（仅图片模式生效）。
         并发数与重试次数从 Config/Config.json 读取（Download_workers / Download_retries）。
     """
-    config = load_config()
+    config = ProjectConfig()
     if base_dir is None:
-        base_dir = Path(config.get("Download", "./Download"))
-    use_label = bool(config.get("Folder_use_category_label", True))
+        base_dir = Path(config.download_dir)
+    use_label = config.folder_use_category_label
     save_dir = base_dir / _download_folder_name(comic, use_label)
     # 名称冲突（同翻译名不同作品）时自动追加作品 ID，保证目录唯一
     save_dir = _resolve_save_dir(save_dir, comic)
 
     # 压缩包下载模式：下载整包 zip 并自动解压
-    if config.get("Download_mode", "image") == "zip":
+    if config.download_mode == "zip":
         if stage_callback:
             stage_callback("准备")
         _download_package(comic, save_dir, progress_callback, stage_callback)
@@ -463,7 +429,7 @@ def download_comic(
         _write_title_info(save_dir, comic)
         return
 
-    detail_html = fetch(G_URL + comic["detail_url"])
+    detail_html = fetch(G_URL + comic["detail_url"], HEADERS)
     reading_url = _extract_reading_page_url(html.fromstring(detail_html))
     if not reading_url:
         logger.warning("未找到阅读页链接: %s", comic["title"])
@@ -472,8 +438,8 @@ def download_comic(
     # 从阅读页 URL 提取总页数
     match = re.search(r"page-(\d+)-aid-(\d+)", reading_url)
     page_count = int(match.group(1)) if match else 1
-    workers = int(config.get("Download_workers", DOWNLOAD_WORKERS))
-    retries = int(config.get("Download_retries", DOWNLOAD_MAX_RETRIES))
+    workers = config.download_workers
+    retries = config.download_retries
 
     batch_pages = max(1, batch_pages)
     grand_done = 0
@@ -499,8 +465,9 @@ def download_comic(
         if stage_callback:
             stage_callback(f"下载图片 {batch_start}-{batch_end} 页")
 
-        def _batch_cb(cur: int, _total: int):
-            progress_callback(grand_done + cur, grand_total)
+        # 默认参数绑定当前批次的累计值，避免闭包捕获循环变量（若改异步则防患未然）
+        def _batch_cb(cur: int, _total: int, _base: int = grand_done, _all: int = grand_total):
+            progress_callback(_base + cur, _all)
 
         download_pictures(
             batch,

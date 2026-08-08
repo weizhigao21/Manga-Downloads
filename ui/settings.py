@@ -1,16 +1,15 @@
 """应用设置与项目配置管理。"""
 
 import json
-from pathlib import Path
 
 from opencc import OpenCC
 
+from src.config import ProjectConfig
 from src.utils import data_root
 
 # 应用数据根目录（源码=项目根，打包后=exe 所在目录）
 ROOT_DIR = data_root()
 SETTINGS_PATH = ROOT_DIR / "Config" / "settings.json"
-PROJECT_CONFIG_PATH = ROOT_DIR / "Config" / "Config.json"
 
 DEFAULT_SETTINGS = {
     "auto_fetch_on_startup": True,
@@ -18,16 +17,6 @@ DEFAULT_SETTINGS = {
     "translate_api_base": "https://api.deepseek.com",
     "translate_model": "deepseek-v4-pro",
     "translate_api_key": "",
-}
-
-DEFAULT_PROJECT_CONFIG = {
-    "Page_number": 20,
-    "Download": "./Download",
-    "list_url": "https://www.wnacg.com/albums.html",
-    "Download_workers": 3,
-    "Download_retries": 3,
-    "Folder_use_category_label": True,
-    "Download_mode": "image",
 }
 
 # 网站导航栏分类（名称 -> 分类列表页相对 URL），供设置中切换浏览分类
@@ -155,98 +144,3 @@ class AppSettings:
         return self._converter.convert(text)
 
 
-class ProjectConfig:
-    """管理项目级配置文件 Config/Config.json。"""
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._load()
-        return cls._instance
-
-    def _load(self):
-        self._config = DEFAULT_PROJECT_CONFIG.copy()
-        if PROJECT_CONFIG_PATH.exists():
-            try:
-                with open(PROJECT_CONFIG_PATH, encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    self._config.update(loaded)
-            except (json.JSONDecodeError, OSError) as exc:
-                print(f"加载项目配置失败: {exc}", flush=True)
-
-    def save(self):
-        """保存当前项目配置到文件。"""
-        PROJECT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(PROJECT_CONFIG_PATH, encoding="utf-8", mode="w") as f:
-            json.dump(self._config, f, ensure_ascii=False, indent=2)
-
-    @property
-    def page_number(self) -> int:
-        return int(self._config.get("Page_number", 20))
-
-    @page_number.setter
-    def page_number(self, value: int):
-        self._config["Page_number"] = int(value)
-
-    @property
-    def download_dir(self) -> str:
-        return str(self._config.get("Download", "./Download"))
-
-    @download_dir.setter
-    def download_dir(self, value: str):
-        self._config["Download"] = str(value)
-
-    @property
-    def list_url(self) -> str:
-        return str(self._config.get("list_url", "https://www.wnacg.com/albums.html"))
-
-    @list_url.setter
-    def list_url(self, value: str):
-        self._config["list_url"] = str(value)
-
-    @property
-    def convert_traditional_to_simplified(self) -> bool | None:
-        """项目配置中的繁简体转换开关（Config.json）。"""
-        value = self._config.get("convert_traditional_to_simplified")
-        return value if value is None else bool(value)
-
-    @convert_traditional_to_simplified.setter
-    def convert_traditional_to_simplified(self, value: bool):
-        self._config["convert_traditional_to_simplified"] = bool(value)
-
-    @property
-    def download_workers(self) -> int:
-        return int(self._config.get("Download_workers", 3))
-
-    @download_workers.setter
-    def download_workers(self, value: int):
-        self._config["Download_workers"] = int(value)
-
-    @property
-    def download_retries(self) -> int:
-        return int(self._config.get("Download_retries", 3))
-
-    @download_retries.setter
-    def download_retries(self, value: int):
-        self._config["Download_retries"] = int(value)
-
-    @property
-    def folder_use_category_label(self) -> bool:
-        """下载文件夹名是否包含右上角分类标签。"""
-        return bool(self._config.get("Folder_use_category_label", True))
-
-    @folder_use_category_label.setter
-    def folder_use_category_label(self, value: bool):
-        self._config["Folder_use_category_label"] = bool(value)
-
-    @property
-    def download_mode(self) -> str:
-        """下载方式：image=逐图下载，zip=压缩包整包下载（下载后自动解压）。"""
-        mode = str(self._config.get("Download_mode", "image")).lower()
-        return mode if mode in ("image", "zip") else "image"
-
-    @download_mode.setter
-    def download_mode(self, value: str):
-        self._config["Download_mode"] = value if value in ("image", "zip") else "image"

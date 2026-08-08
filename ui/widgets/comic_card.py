@@ -94,15 +94,15 @@ class ComicCard(QFrame):
         self.category_badge.setAlignment(Qt.AlignCenter)
         self.category_badge.setWordWrap(False)
         self.category_badge.setStyleSheet(
-            f"""
-            QLabel {{
+            """
+            QLabel {
                 background-color: rgba(0, 0, 0, 0.55);
                 color: white;
                 border-radius: 4px;
                 padding: 4px 8px;
                 font-size: 11px;
                 font-weight: 500;
-            }}
+            }
             """
         )
         self.category_badge.adjustSize()

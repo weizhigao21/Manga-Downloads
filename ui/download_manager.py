@@ -1,26 +1,23 @@
-"""下载任务管理器：统一管理所有漫画下载任务，展示 ID、进度与状态。"""
+"""下载任务管理器：统一管理所有漫画下载任务（无 UI 依赖）。
+
+状态变化通过 task_updated 信号广播，界面（下载管理对话框等）自行订阅；
+下载线程生命周期与退出收尾（shutdown）也在此管理。
+"""
+import json
 import logging
 import re
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtWidgets import (
-    QDialog,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QProgressBar,
-    QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import QObject, QThread, Signal
 
 from src.downloader import download_comic
+from src.utils import data_root
 from ui.models import ComicItem
 from ui.settings import ProjectConfig
-from ui.styles import PALETTE
+
+# 下载任务持久化文件（重启后恢复历史任务列表）
+TASKS_PATH = data_root() / "Config" / "tasks.json"
 
 
 class DownloadTask:
@@ -41,6 +38,8 @@ class DownloadTask:
         self.total: int = 0     # 总数（解析完成后才知道，0 表示未知）
         self.stage: str = ""    # 当前阶段文本（如 下载压缩包 / 解压中）
         self.error: str = ""
+        # 下载所需的作品数据（供失败后原地重试复用，随任务持久化）
+        self.comic: dict = {}
 
 
 class DownloadWorker(QThread):
@@ -61,16 +60,30 @@ class DownloadWorker(QThread):
         self.task = task
 
     def run(self):
+        def _guard():
+            """中断检查点：应用退出时请求中断，从回调抛出取消下载任务。"""
+            if self.isInterruptionRequested():
+                raise InterruptedError("下载任务已中断")
+
         try:
             download_comic(
                 self.comic,
                 self.base_dir,
-                progress_callback=lambda cur, total: self.progress.emit(
-                    self.task, cur, total
+                progress_callback=lambda cur, total: (
+                    _guard(),
+                    self.progress.emit(self.task, cur, total),
                 ),
-                stage_callback=lambda s: self.stage.emit(self.task, s),
+                stage_callback=lambda s: (
+                    _guard(),
+                    self.stage.emit(self.task, s),
+                ),
             )
             self.finished.emit(self.task, True, "")
+        except InterruptedError:
+            logging.getLogger(__name__).info(
+                "下载任务被中断: title=%s", self.task.title
+            )
+            self.finished.emit(self.task, False, "下载已中断")
         except Exception as exc:
             logging.getLogger(__name__).exception(
                 "下载任务失败: title=%s, detail_url=%s", self.task.title, self.task.detail_url
@@ -97,47 +110,143 @@ class DownloadManager(QObject):
 
     def __init__(self):
         super().__init__()
-        self.tasks: list[DownloadTask] = []
+        self.tasks: list[DownloadTask] = self._load_tasks()
         self._workers: dict[DownloadTask, DownloadWorker] = {}
 
+    # ---- 任务持久化 ----
+
+    def _load_tasks(self) -> list[DownloadTask]:
+        """从本地文件恢复历史任务；中断中的任务（等待/下载中）标记为失败。"""
+        if not TASKS_PATH.exists():
+            return []
+        try:
+            data = json.loads(TASKS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        tasks = []
+        for item in data:
+            task = DownloadTask(
+                item.get("task_id", ""),
+                item.get("title", ""),
+                item.get("detail_url", ""),
+            )
+            task.status = item.get("status", DownloadTask.FAILED)
+            task.current = int(item.get("current", 0) or 0)
+            task.total = int(item.get("total", 0) or 0)
+            task.stage = item.get("stage", "")
+            task.error = item.get("error", "")
+            task.comic = item.get("comic", {}) or {}
+            if task.status in (DownloadTask.WAITING, DownloadTask.DOWNLOADING):
+                # 重启后这些任务已无法续跑，标记为失败并说明原因
+                task.status = DownloadTask.FAILED
+                task.error = "程序已退出，任务中断"
+            tasks.append(task)
+        return tasks
+
+    def _save_tasks(self):
+        """将任务列表写入本地文件（任意状态变化后调用）。"""
+        try:
+            TASKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            data = [
+                {
+                    "task_id": t.task_id,
+                    "title": t.title,
+                    "detail_url": t.detail_url,
+                    "status": t.status,
+                    "current": t.current,
+                    "total": t.total,
+                    "stage": t.stage,
+                    "error": t.error,
+                    "comic": t.comic,
+                }
+                for t in self.tasks
+            ]
+            TASKS_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            logging.getLogger(__name__).warning("保存下载任务列表失败: %s", exc)
+
     def start_download(self, comic: ComicItem) -> DownloadTask | None:
-        """为一部漫画创建并启动下载任务，返回任务对象；无详情链接时返回 None。"""
+        """为一部漫画创建并启动下载任务，返回任务对象；无详情链接时返回 None。
+
+        同一作品存在**失败**任务时，复用该任务原地重试（不新建重复任务）；
+        已下载/进行中的任务不受影响。
+        """
         if not comic.detail_url:
             return None
+
+        existing = self.task_for(comic)
+        if existing and existing.status == DownloadTask.FAILED:
+            # 失败后再次点击下载：复用原任务重试（用最新作品数据刷新）
+            existing.comic = self._comic_dict(comic)
+            return self.retry_task(existing)
 
         task = DownloadTask(
             self._extract_id(comic.detail_url), comic.title, comic.detail_url
         )
+        task.comic = self._comic_dict(comic)
         self.tasks.append(task)
+        self._launch_worker(task)
+        return task
 
-        comic_dict = {
+    @staticmethod
+    def _comic_dict(comic: ComicItem) -> dict:
+        """将 ComicItem 转换为下载所需的作品数据字典。"""
+        return {
             "title": comic.title,
             "detail_url": comic.detail_url,
             "image_count": comic.image_count,
             "category_label": comic.display_category_label,
             "translated_title": comic.translated_title,
         }
-        base_dir = Path(ProjectConfig().download_dir)
 
-        worker = DownloadWorker(comic_dict, base_dir, task)
+    def retry_task(self, task: DownloadTask) -> DownloadTask | None:
+        """原地重试一个失败任务：重置状态并重新启动下载线程。
+
+        使用任务自带的作品数据（task.comic，随任务持久化），
+        因此下载管理对话框/重启后的任务也能直接重试。
+        数据不足（无详情链接）时返回 None。
+        """
+        if not task.comic:
+            # 兼容旧版持久化数据：用已有字段构建最小作品数据
+            task.comic = {"title": task.title, "detail_url": task.detail_url}
+        if not task.comic.get("detail_url"):
+            return None
+        # 清理可能残留的旧线程关联
+        self._workers.pop(task, None)
+        task.status = DownloadTask.WAITING
+        task.current = 0
+        task.total = 0
+        task.stage = ""
+        task.error = ""
+        self._launch_worker(task)
+        return task
+
+    def _launch_worker(self, task: DownloadTask):
+        """创建并启动下载线程（供新建任务与重试复用）。"""
+        base_dir = Path(ProjectConfig().download_dir)
+        worker = DownloadWorker(task.comic, base_dir, task)
         self._workers[task] = worker
         worker.progress.connect(self._on_progress)
         worker.stage.connect(self._on_stage)
         worker.finished.connect(self._on_finished)
         worker.finished.connect(worker.deleteLater)
         self.task_updated.emit()
+        self._save_tasks()
         worker.start()
-        return task
 
     def _on_progress(self, task: DownloadTask, current: int, total: int):
         task.current = current
         task.total = total
         task.status = DownloadTask.DOWNLOADING
         self.task_updated.emit()
+        self._save_tasks()
 
     def _on_stage(self, task: DownloadTask, stage: str):
         task.stage = stage
         self.task_updated.emit()
+        self._save_tasks()
 
     def _on_finished(self, task: DownloadTask, success: bool, error: str):
         self._workers.pop(task, None)
@@ -153,6 +262,7 @@ class DownloadManager(QObject):
             task.status = DownloadTask.FAILED
             task.error = error
         self.task_updated.emit()
+        self._save_tasks()
 
     def task_for(self, comic: ComicItem) -> DownloadTask | None:
         """返回该漫画最近创建的下载任务（若无则 None）。"""
@@ -164,174 +274,40 @@ class DownloadManager(QObject):
                 return task
         return None
 
+    def shutdown(self, timeout_ms: int = 2500, terminate_grace_ms: int = 1000):
+        """请求中断所有下载线程并等待结束；超时后强制终止（应用退出前调用）。
+
+        下载线程处于网络 IO 时无法立即终止，中断粒度约为一小段数据/一张图片；
+        写文件为原子替换（tmp + rename），强制终止不会留下半截文件。
+        限时等待后仍未结束的线程强制终止，保证退出不卡顿。
+        重复调用安全：已结束的线程 wait 立即返回。
+        """
+        workers = [w for w in self._workers.values() if w.isRunning()]
+        if not workers:
+            return
+        logging.getLogger(__name__).info(
+            "等待 %d 个下载线程结束（最多 %dms）...", len(workers), timeout_ms
+        )
+        for worker in workers:
+            worker.requestInterruption()
+        deadline = time.monotonic() + timeout_ms / 1000
+        for worker in workers:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            worker.wait(remaining_ms)
+        still = [w for w in workers if w.isRunning()]
+        if still:
+            logging.getLogger(__name__).warning(
+                "%d 个下载线程等待超时，强制终止", len(still)
+            )
+            for worker in still:
+                worker.terminate()
+                worker.wait(terminate_grace_ms)
+
     @staticmethod
     def _extract_id(detail_url: str) -> str:
         match = re.search(r"aid-(\d+)", detail_url)
         return match.group(1) if match else detail_url
 
 
-class DownloadManagerDialog(QDialog):
-    """下载管理对话框：表格展示所有任务，含 ID、名称、进度条、状态。"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("下载管理")
-        self.resize(760, 420)
-        self.setStyleSheet(
-            f"""
-            QDialog {{
-                background-color: {PALETTE["background"]};
-            }}
-            QLabel {{
-                color: {PALETTE["text"]};
-                font-size: 13px;
-            }}
-            QTableWidget {{
-                background-color: {PALETTE["surface"]};
-                alternate-background-color: {PALETTE["surface_hover"]};
-                color: {PALETTE["text"]};
-                border: 1px solid {PALETTE["border"]};
-                border-radius: 8px;
-                gridline-color: {PALETTE["border"]};
-                font-size: 13px;
-            }}
-            QTableWidget::item {{
-                padding: 6px;
-            }}
-            QHeaderView::section {{
-                background-color: {PALETTE["surface_hover"]};
-                color: {PALETTE["text"]};
-                border: none;
-                border-bottom: 1px solid {PALETTE["border"]};
-                padding: 8px;
-                font-size: 13px;
-                font-weight: 600;
-            }}
-            """
-        )
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(16)
-
-        hint = QLabel("下载任务实时进度（关闭对话框不影响后台下载）")
-        hint.setStyleSheet(f"color: {PALETTE['text_secondary']};")
-        layout.addWidget(hint)
-
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["ID", "名称", "进度", "状态"])
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        self.table.verticalHeader().setVisible(False)
-
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        layout.addWidget(self.table)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.close_btn = QPushButton("关闭")
-        self.close_btn.setObjectName("settingsButton")
-        self.close_btn.setFixedWidth(100)
-        self.close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(self.close_btn)
-        layout.addLayout(btn_row)
-
-        self._manager = DownloadManager.instance()
-        # 保存每行进度控件引用，刷新时只更新数值、不重建控件（避免进度条闪烁）
-        self._bars: dict[int, QProgressBar] = {}
-        self._labels: dict[int, QLabel] = {}
-        self._manager.task_updated.connect(self._refresh)
-        self._refresh()
-
-    def _refresh(self):
-        """刷新任务列表：行数变化时重建整行，否则仅更新进度与状态。"""
-        tasks = self._manager.tasks
-        # 行数变化（任务新增/完成清除）时才重建进度控件
-        if self.table.rowCount() != len(tasks):
-            self._bars.clear()
-            self._labels.clear()
-            self.table.setRowCount(len(tasks))
-            for row, task in enumerate(tasks):
-                self._set_cell(row, 0, task.task_id)
-                self._set_cell(row, 1, task.title)
-
-                # 进度列：进度条 + 文本
-                progress_widget = QWidget()
-                progress_layout = QHBoxLayout(progress_widget)
-                progress_layout.setContentsMargins(4, 2, 4, 2)
-                progress_layout.setSpacing(8)
-                bar = QProgressBar()
-                bar.setFixedWidth(180)
-                bar.setTextVisible(False)
-                progress_layout.addWidget(bar)
-                pct_label = QLabel()
-                pct_label.setStyleSheet(f"color: {PALETTE['text_secondary']};")
-                progress_layout.addWidget(pct_label)
-                progress_layout.addStretch()
-                self.table.setCellWidget(row, 2, progress_widget)
-                self._bars[row] = bar
-                self._labels[row] = pct_label
-
-                self._set_cell(row, 3, task.status, color=self._status_color(task.status))
-            self.table.resizeRowsToContents()
-            return
-
-        # 行数不变：仅更新已有进度条与文本，不重建控件
-        for row, task in enumerate(tasks):
-            bar = self._bars.get(row)
-            label = self._labels.get(row)
-            if bar is not None:
-                if task.status == DownloadTask.DOWNLOADING and task.total == 0:
-                    bar.setRange(0, 0)  # 总数未知：不定态
-                else:
-                    bar.setRange(0, max(task.total, 1))
-                    value = (
-                        max(task.total, 1)
-                        if task.status == DownloadTask.DONE
-                        else min(task.current, task.total) if task.total else 0
-                    )
-                    bar.setValue(value)
-            if label is not None:
-                label.setText(self._progress_text(task))
-            self._set_cell(row, 3, task.status, color=self._status_color(task.status))
-
-    def _set_cell(self, row: int, col: int, text: str, color: str = None):
-        item = QTableWidgetItem(text)
-        if color:
-            from PySide6.QtGui import QBrush, QColor
-
-            item.setForeground(QBrush(QColor(color)))
-        self.table.setItem(row, col, item)
-
-    # 压缩包模式下进度为 0-100 百分比，阶段文本按百分比显示
-    _PERCENT_STAGES = ("下载压缩包", "解压中")
-
-    @staticmethod
-    def _progress_text(task: DownloadTask) -> str:
-        if task.status == DownloadTask.DONE:
-            return "100%"
-        if task.status == DownloadTask.WAITING:
-            return "等待中"
-        if task.status == DownloadTask.FAILED and task.stage:
-            return task.stage
-        if task.stage in DownloadManagerDialog._PERCENT_STAGES and task.total:
-            return f"{task.stage} {min(task.current, task.total)}%"
-        if task.stage:
-            return f"{task.stage} {task.current}/{task.total}" if task.total else task.stage
-        if task.total:
-            return f"{task.current}/{task.total}"
-        return f"{task.current}"
-
-    @staticmethod
-    def _status_color(status: str) -> str:
-        return {
-            DownloadTask.DOWNLOADING: PALETTE["primary"],
-            DownloadTask.DONE: "#16A34A",
-            DownloadTask.FAILED: "#DC2626",
-            DownloadTask.WAITING: PALETTE["text_secondary"],
-        }.get(status, PALETTE["text"])

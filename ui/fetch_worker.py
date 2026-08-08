@@ -5,6 +5,7 @@
 from PySide6.QtCore import QThread, Signal
 
 from src.wnacg_crawler import fetch_page, search_comics
+from ui.threads import register
 
 
 class FetchWorker(QThread):
@@ -12,6 +13,8 @@ class FetchWorker(QThread):
 
     - keyword 非空：按关键词搜索（search_comics）
     - 否则：抓取列表页第 page 页（fetch_page）
+
+    在全局线程注册表登记，应用退出时统一收尾（见 ui/threads.py）。
     """
 
     finished = Signal(list)
@@ -24,6 +27,7 @@ class FetchWorker(QThread):
         self.keyword = keyword
 
     def run(self):
+        register(self)
         try:
             if self.keyword:
                 comics = search_comics(self.keyword, self.page)

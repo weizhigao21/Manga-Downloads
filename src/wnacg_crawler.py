@@ -23,11 +23,13 @@ from lxml import html
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.utils import data_root
+from src.config import ProjectConfig
+from src.net import fetch as _net_fetch
+from src.net import fetch_with_retry
+from src.utils import data_root, safe_filename
 
 # 项目根目录（src 的上级目录）与配置文件路径
 ROOT_DIR = data_root()
-CONFIG_PATH = ROOT_DIR / "Config" / "Config.json"
 
 # 目标页面与列表容器 XPath（<ul> 下每个 <li class="gallary_item"> 为一条漫画）
 URL = "https://www.wnacg.com/albums.html"
@@ -72,38 +74,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def load_config() -> dict:
-    """加载配置文件 Config/Config.json，返回配置字典。"""
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
-
-
-# ---- 全局请求节流：控制对主站的请求密度，避免触发反爬限流 ----
-# 相邻请求的最小间隔（秒）。解析一部 18 页作品约需 234 次请求，
-# 0.6s 间隔 ≈ 1.7 次/秒，显著低于站点限流阈值，且仍在可接受速度。
-REQUEST_INTERVAL = 0.6
-_REQUEST_LOCK = threading.Lock()
-_LAST_REQUEST_TIME = 0.0
-
-
-def _throttle():
-    """相邻请求之间保持最小间隔（跨线程生效）。"""
-    global _LAST_REQUEST_TIME
-    with _REQUEST_LOCK:
-        now = time.monotonic()
-        wait = REQUEST_INTERVAL - (now - _LAST_REQUEST_TIME)
-        if wait > 0:
-            time.sleep(wait)
-        _LAST_REQUEST_TIME = time.monotonic()
-
-
 def fetch(url: str) -> str:
-    """请求页面并返回 HTML 文本（自带全局节流）。"""
-    _throttle()
-    resp = requests.get(url, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or "utf-8"
-    return resp.text
+    """请求页面并返回 HTML 文本（自带全局节流与站点请求头）。"""
+    return _net_fetch(url, HEADERS)
 
 
 def _extract_int(text: str | None, pattern: str) -> int | None:
@@ -218,8 +191,7 @@ def fetch_page(page: int, list_url: str | None = None) -> list[dict]:
     if list_url:
         url = list_url
     else:
-        config = load_config()
-        url = config.get("list_url", URL)
+        url = ProjectConfig().list_url
 
     page_url = _page_url(url, max(1, page))
     logger.info("正在抓取列表: %s", page_url)
@@ -240,8 +212,7 @@ def fetch_comics(
         漫画信息字典列表
     """
     if pages is None:
-        config = load_config()
-        pages = int(config.get("Page_number", 1))
+        pages = ProjectConfig().page_number
     pages = max(1, pages)
 
     comics: list[dict] = []
@@ -280,7 +251,7 @@ def search_comics(keyword: str, page: int = 1) -> list[dict]:
             f"&f=_all&s=create_time_DESC&p={page}"
         )
     logger.info("正在搜索: %s（第 %d 页）", keyword, page)
-    html_text = _fetch_with_retry(url)
+    html_text = fetch_with_retry(url, HEADERS)
     return parse_comics(html_text)
 
 
@@ -289,29 +260,6 @@ DOWNLOAD_WORKERS = 3
 DOWNLOAD_MAX_RETRIES = 3
 # 图片详情页解析并发数（同样保持温和，避免触发限流）
 PARSE_WORKERS = 2
-
-
-def _fetch_with_retry(url: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str:
-    """带退避重试的页面请求，遇 429/403/5xx 时延长等待后重试。
-
-    与详情页的单张重试不同，这里针对整页请求：限流等待时间更长
-    （3s → 6s → 12s），给站点留出恢复窗口。
-    """
-    for attempt in range(retries):
-        try:
-            return fetch(url)
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else 0
-            if status in (429, 403, 500, 502, 503):
-                wait = 3.0 * (2**attempt) + random.uniform(0, 1)
-                logger.warning(
-                    "页面请求被限流(HTTP %d)，第 %d/%d 次重试，等待 %.1fs: %s",
-                    status, attempt + 1, retries, wait, url,
-                )
-                time.sleep(wait)
-                continue
-            raise
-    raise RuntimeError(f"页面请求重试 {retries} 次仍失败: {url}")
 
 
 def _normalize_image_url(url: str) -> str:
@@ -415,7 +363,7 @@ def parse_picture_page(reading_url: str, start: int = 1, end: int | None = None)
     for num in range(start - 1, end):
         page_url = f"{G_URL}/photos-index-page-{num + 1}-aid-{aid}.html"
         try:
-            page_html = _fetch_with_retry(page_url)
+            page_html = fetch_with_retry(page_url, HEADERS)
         except Exception as exc:
             # 记录详细错误后重新抛出，交由上层（下载任务）处理
             logger.warning(
@@ -452,7 +400,7 @@ def parse_picture_page(reading_url: str, start: int = 1, end: int | None = None)
         with ThreadPoolExecutor(max_workers=PARSE_WORKERS) as executor:
             img_urls = list(executor.map(lambda e: _fetch_picture_link(e[0]), entries))
 
-        for (link, number), img_url in zip(entries, img_urls):
+        for (link, number), img_url in zip(entries, img_urls, strict=True):
             if img_url:
                 pictures.append({"link": img_url, "number": number})
                 page_pictures += 1
@@ -506,7 +454,8 @@ def download_pictures(
     def _download_one(pic: dict):
         nonlocal done
         url = pic["link"]
-        target = save_dir / f"{pic['number']}.jpg"
+        # 页码/名称来自网页 HTML（不可信来源），清洗后拼接，防止路径穿越
+        target = save_dir / f"{safe_filename(str(pic['number']))}.jpg"
         # 断点续传：目标文件已存在且非空时跳过，不重复下载
         if target.exists() and target.stat().st_size > 0:
             with lock:
@@ -514,7 +463,7 @@ def download_pictures(
                 if progress_callback:
                     progress_callback(done, total)
             return
-        last_exc: Exception | None = None
+        last_exc: Exception = Exception("未知下载错误")
         for attempt in range(max_retries):
             try:
                 resp = requests.get(url, headers=HEADERS, timeout=30)
@@ -524,7 +473,11 @@ def download_pictures(
                         f"HTTP {resp.status_code}", response=resp
                     )
                 resp.raise_for_status()
-                target.write_bytes(resp.content)
+                # 先写临时文件再原子替换：中断/强制终止不会留下半截图片
+                # （下次下载时 target 不存在会重新下载，.part 残留会被覆盖）
+                tmp = target.with_name(target.name + ".part")
+                tmp.write_bytes(resp.content)
+                tmp.replace(target)
                 break
             except (requests.RequestException, OSError) as exc:
                 last_exc = exc
@@ -565,8 +518,7 @@ def main() -> int:
         # 延迟导入避免循环依赖（downloader 依赖本模块）
         from src.downloader import download_comic
 
-        config = load_config()
-        base_dir = Path(config.get("Download", "./Download"))
+        base_dir = Path(ProjectConfig().download_dir)
         for comic in comics[:3]:
             if comic["image_count"] < 20:
                 logger.info("跳过图片数量不足的漫画: %s", comic["title"])

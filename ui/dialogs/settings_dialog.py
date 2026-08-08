@@ -1,4 +1,3 @@
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -158,7 +157,7 @@ class SettingsDialog(QDialog):
 
     def _open_database_dialog(self):
         """打开数据库管理窗口。"""
-        from ui.database import DatabaseDialog
+        from ui.dialogs.database_dialog import DatabaseDialog
 
         DatabaseDialog(self).exec()
 

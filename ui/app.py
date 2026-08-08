@@ -7,8 +7,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from ui import __version__
+from ui.download_manager import DownloadManager
 from ui.main_window import MainWindow
+from ui.threads import shutdown_all
+from ui.version import __version__
 
 
 def _icon_path() -> Path:
@@ -40,6 +42,12 @@ def main():
     if icon.exists():
         window.setWindowIcon(QIcon(str(icon)))
     window.show()
+
+    # 应用退出兜底：统一收尾所有后台线程（下载线程 + 抓取/翻译线程）。
+    # 短时等待后仍未结束的线程强制终止，保证退出不卡顿。
+    # 主窗口关闭流程也会调用，此处确保即使窗口异常关闭也安全退出。
+    app.aboutToQuit.connect(DownloadManager.instance().shutdown)
+    app.aboutToQuit.connect(lambda: shutdown_all(timeout_ms=2000))
 
     return app.exec()
 

@@ -8,6 +8,7 @@ import logging
 from PySide6.QtCore import QThread, Signal
 
 from src.utils import find_existing_translation, split_title_segments
+from ui.threads import register
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,10 @@ SYSTEM_PROMPT = (
     "你是专业的漫画翻译。将用户输入的作品名称翻译为简体中文，"
     "只输出翻译结果本身，不要任何解释、注释或引号。"
 )
+
+# 单次翻译请求超时（秒）：openai 库默认超时很长（数分钟），
+# 过短影响正常翻译，过长会让应用退出时线程迟迟无法收敛
+TRANSLATE_TIMEOUT = 30
 
 
 def translate_title(title: str, api_base: str, api_key: str, model: str) -> str:
@@ -68,10 +73,10 @@ def translate_text(text: str, api_base: str, api_key: str, model: str) -> str:
 
     try:
         from openai import OpenAI
-    except ImportError:
-        raise RuntimeError("未安装 OpenAI SDK，请执行: pip install openai")
+    except ImportError as exc:
+        raise RuntimeError("未安装 OpenAI SDK，请执行: pip install openai") from exc
 
-    client = OpenAI(api_key=api_key, base_url=api_base)
+    client = OpenAI(api_key=api_key, base_url=api_base, timeout=TRANSLATE_TIMEOUT)
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -106,6 +111,7 @@ class TranslateWorker(QThread):
         self.model = model
 
     def run(self):
+        register(self)
         try:
             # 使用 translate_title：方括号块（社团/作者/标签）保留，只翻译主体
             result = translate_title(

@@ -2,7 +2,6 @@
 
 配置保存在 Config/settings.json（应用本地设置），Key 仅存本地文件。
 """
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,

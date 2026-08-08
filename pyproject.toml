@@ -1,0 +1,27 @@
+[project]
+name = "manga-browser"
+version = "1.2.15"
+description = "wnacg 漫画爬虫与 Qt6 桌面浏览器"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.7",
+    "requests>=2.32",
+    "lxml>=5.0",
+    "opencc-python-reimplemented>=0.1.7",
+    "curl_cffi>=0.15",
+    "openai>=1.0",
+]
+
+# 运行入口：python run_ui.py（PyInstaller 打包见 漫画浏览器.spec）
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build", "dist", "Config", "Download", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]  # 行长约束交给人工把握，不做硬性限制
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
