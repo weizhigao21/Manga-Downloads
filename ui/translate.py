@@ -7,7 +7,7 @@ import logging
 
 from PySide6.QtCore import QThread, Signal
 
-from src.utils import split_title_segments
+from src.utils import find_existing_translation, split_title_segments
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,9 @@ def translate_title(title: str, api_base: str, api_key: str, model: str) -> str:
 
     如 `[钢鉄しゃぼん玉 (玉ぼん)] 続·カノジョは… [惑星]` 仅翻译中间
     的作品名，方括号内容不翻译，翻译结果按原顺序拼回。
+
+    若主体已自带中文翻译（`日文原名｜中文翻译` 格式）或本身就是中文，
+    直接使用，不调用 AI 接口（find_existing_translation）。
     """
     segments = split_title_segments(title)
     translated_parts: list[str] = []
@@ -31,9 +34,12 @@ def translate_title(title: str, api_base: str, api_key: str, model: str) -> str:
             # 保留片段原有首尾空白，翻译结果只替换中间内容
             leading = text[: len(text) - len(text.lstrip())]
             trailing = text[len(text.rstrip()):]
-            translated_parts.append(
-                f"{leading}{translate_text(text, api_base, api_key, model)}{trailing}"
-            )
+            existing = find_existing_translation(text)
+            if existing is not None:
+                translated = existing  # 标题自带中文翻译，无需调 AI
+            else:
+                translated = translate_text(text, api_base, api_key, model)
+            translated_parts.append(f"{leading}{translated}{trailing}")
         else:
             translated_parts.append(text)
     return "".join(translated_parts)

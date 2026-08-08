@@ -1,6 +1,11 @@
 """src/utils.py 纯函数测试。"""
 
-from src.utils import data_root, safe_filename, split_title_segments
+from src.utils import (
+    data_root,
+    find_existing_translation,
+    safe_filename,
+    split_title_segments,
+)
 
 
 class TestSafeFilename:
@@ -68,3 +73,30 @@ class TestSplitTitleSegments:
         # 方括号内的括号不影响整块保留
         segments = split_title_segments("[社团 (作者)] 标题")
         assert segments[0] == ("[社团 (作者)]", False)
+
+
+class TestFindExistingTranslation:
+    def test_pipe_separated_returns_chinese_part(self):
+        # 「日文原名｜中文翻译」取中文段
+        assert find_existing_translation(
+            "破魔の巫女 淫狱に堕つ 2｜破魔巫女 堕入淫狱 2"
+        ) == "破魔巫女 堕入淫狱 2"
+
+    def test_pipe_separated_english_not_used(self):
+        # 「日文｜English」候选不含汉字，交给 AI 翻译
+        assert find_existing_translation("日本語タイトル｜English Title") is None
+
+    def test_reversed_order_handled(self):
+        # 「中文｜日文」反了也能取到中文段
+        assert find_existing_translation("中文标题｜日本語タイトル") == "中文标题"
+
+    def test_already_chinese_no_call(self):
+        # 本身就是中文（无假名、含汉字）：直接使用
+        assert find_existing_translation("破魔巫女 堕入淫狱 2") == "破魔巫女 堕入淫狱 2"
+
+    def test_japanese_no_pipe_returns_none(self):
+        assert find_existing_translation("オリジナルタイトル") is None
+
+    def test_empty_or_blank(self):
+        assert find_existing_translation("") is None
+        assert find_existing_translation("  ") is None

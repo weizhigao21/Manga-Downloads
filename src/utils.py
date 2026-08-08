@@ -33,6 +33,38 @@ def data_root() -> Path:
 # 方括号块（社团名/作者/标签等），标题翻译时整体保留
 BRACKET_RE = re.compile(r"(\[[^\]]*\])")
 
+# 标题内「日文原名｜中文翻译」的分隔符（全角/半角竖线）
+PIPE_RE = re.compile(r"[｜|]")
+
+# 日文假名（平假名/片假名）与汉字字符范围
+_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def find_existing_translation(text: str) -> str | None:
+    """从标题片段中找出可直接使用的已有翻译，无需调用 AI。
+
+    处理两种情况：
+    1. 片段含 `｜`/`|` 分隔（wnacg 部分标题格式为「日文原名｜中文翻译」）：
+       分段后选择含日文假名最少且含汉字的一段作为已有翻译；
+       若候选段不含汉字（如英文），视为无法直接使用，返回 None。
+    2. 片段本身就是中文（无假名且含汉字）：直接返回，避免对中文调用翻译。
+
+    Returns:
+        可直接使用的翻译文本；无法判断时返回 None（交给 AI 翻译）。
+    """
+    parts = [p.strip() for p in PIPE_RE.split(text or "") if p.strip()]
+    if len(parts) >= 2:
+        # 选假名最少的一段，且必须含汉字（排除纯英文等候选）
+        best = min(parts, key=lambda p: len(_KANA_RE.findall(p)))
+        if _CJK_RE.search(best):
+            return best
+        return None
+    # 无分隔符：整段已是中文则直接使用，否则交给 AI
+    if _CJK_RE.search(text or "") and not _KANA_RE.search(text or ""):
+        return text.strip()
+    return None
+
 
 def split_title_segments(title: str) -> list[tuple[str, bool]]:
     """将标题按方括号块切分为 [(文本, 是否可翻译)]。

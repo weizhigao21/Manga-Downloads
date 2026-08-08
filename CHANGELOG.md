@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.8] - 2026-08-08
+
+### 新增
+
+- 标题翻译识别自带中文：标题含 `｜`/`|` 分隔（格式为「日文原名｜中文翻译」）时直接提取中文部分作为翻译结果，不调用 AI 接口；本身就是中文的标题也跳过翻译，节省 API 调用（`src/utils.py::find_existing_translation`）
+
 ## [1.2.7] - 2026-08-08
 
 ### 新增
