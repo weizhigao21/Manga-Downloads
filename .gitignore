@@ -17,6 +17,10 @@ _test_search.py
 正则表达式.py
 btn_check.png
 
+# 本地启动脚本与快捷方式（个人使用，不进仓库）
+start_ui.bat
+*.lnk
+
 # 工具本地记忆/配置（不进仓库）
 .workbuddy/
 
