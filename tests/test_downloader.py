@@ -128,7 +128,8 @@ class TestWriteTitleInfo:
         data = json.loads(info_path.read_text(encoding="utf-8"))
         assert data["original_title"] == "[社团] オリジナルタイトル [タグ]"
         assert data["translated_title"] == "[社团] 原创标题 [标签]"
-        assert data["detail_url"] == "/photos-index-page-1-aid-10001.html"
+        # 不包含 detail_url 字段
+        assert "detail_url" not in data
 
     def test_empty_translated_title(self, tmp_path):
         _write_title_info(tmp_path, {"title": "标题", "detail_url": ""})

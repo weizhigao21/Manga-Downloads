@@ -372,13 +372,12 @@ def _extract_reading_page_url(detail_doc) -> str | None:
 def _write_title_info(save_dir: Path, comic: dict) -> None:
     """下载完成后在作品目录内写入标题信息 JSON（原始名 + 翻译名）。
 
-    文件名为 title_info.json，包含 original_title（原始名称）、
-    translated_title（翻译名称，未翻译时为空）与 detail_url（详情链接）。
+    文件名为 title_info.json，包含 original_title（原始名称）与
+    translated_title（翻译名称，未翻译时为空）。
     """
     info = {
         "original_title": comic.get("title", ""),
         "translated_title": comic.get("translated_title", ""),
-        "detail_url": comic.get("detail_url", ""),
     }
     try:
         save_dir.mkdir(parents=True, exist_ok=True)
