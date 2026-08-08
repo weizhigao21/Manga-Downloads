@@ -243,9 +243,18 @@ class MainWindow(QMainWindow):
         self.status_label.setText(text)
 
     def set_comics_from_raw(self, raw_comics: list[dict]):
-        """将爬虫原始字典转换为 ComicItem 并展示（自动关联本地封面缓存）。"""
-        from ui.database import cover_cache_path
+        """将爬虫原始字典转换为 ComicItem 并展示（自动关联本地封面缓存）。
 
+        抓取/搜索结果不含 translated_title 字段，但该作品可能已在数据库中
+        保存过翻译名（重启后仍生效），此处从数据库缓存合并回填。
+        """
+        from ui.database import _cached_records, cover_cache_path
+
+        # 数据库缓存：detail_url -> translated_title（含增量缓存，无需重复全表查询）
+        translations = {
+            r.get("detail_url", ""): r.get("translated_title", "")
+            for r in _cached_records()
+        }
         items = []
         for c in raw_comics:
             detail_url = c.get("detail_url", "")
@@ -259,7 +268,9 @@ class MainWindow(QMainWindow):
                     cover_path=cover_cache_path(detail_url),
                     category=c.get("category", ""),
                     category_label=c.get("category_label", ""),
-                    translated_title=c.get("translated_title", ""),
+                    translated_title=(
+                        c.get("translated_title") or translations.get(detail_url, "")
+                    ),
                 )
             )
         self.set_comics(items)

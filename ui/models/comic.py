@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from src.utils import find_existing_translation
 from ui.settings import AppSettings
 
 
@@ -24,9 +25,17 @@ class ComicItem:
 
     @property
     def display_title(self) -> str:
-        """卡片显示名称：已翻译时优先显示翻译结果，否则显示原标题（繁简转换）。"""
+        """卡片显示名称，按以下优先级取用：
+
+        1. AI 翻译结果（translated_title，已持久化）；
+        2. 标题自带中文翻译（`日文名｜中文名`）或本身就是中文时，取中文部分；
+        3. 回落原标题（繁简转换）。
+        """
         if self.translated_title:
             return self.translated_title
+        existing = find_existing_translation(self.title)
+        if existing is not None:
+            return self._settings.convert(existing)
         return self._settings.convert(self.title)
 
     @property
