@@ -31,6 +31,7 @@ class ComicCard(QFrame):
         # 本地已有封面时不创建网络管理器（避免每张卡片都初始化网络栈）
         self._network: QNetworkAccessManager | None = None
         self._manager = DownloadManager.instance()
+        self._translate_worker = None  # 保持翻译线程引用，防止被回收
         self._setup_ui()
         self._load_cover()
         # 下载任务状态变化时同步按钮（卡片被销毁后 Qt 会自动断开连接）
@@ -327,11 +328,15 @@ class ComicCard(QFrame):
             self.download_btn.setText("重试")
 
     def contextMenuEvent(self, event: QContextMenuEvent):
-        """右键卡片弹出上下文菜单：复制作品名称到剪贴板。
+        """右键卡片弹出上下文菜单：复制/翻译作品名称。
 
         QMenu 是独立弹出窗口，不继承项目浅色主题；系统深色模式下默认黑底，
         与项目 QSS 的深色文字叠加会出现黑底黑字，因此显式设置浅色样式。
         """
+        self._build_context_menu().exec(event.globalPos())
+
+    def _build_context_menu(self) -> QMenu:
+        """构建右键上下文菜单（独立方法便于测试）。"""
         menu = QMenu(self)
         menu.setStyleSheet(
             f"""
@@ -356,7 +361,9 @@ class ComicCard(QFrame):
             """
         )
         menu.addAction("复制作品名称", self._copy_title)
-        menu.exec(event.globalPos())
+        menu.addSeparator()
+        menu.addAction("翻译作品名称", self._translate_title)
+        return menu
 
     def _copy_title(self):
         """将作品显示名称（含繁简转换）复制到剪贴板。"""
@@ -373,3 +380,46 @@ class ComicCard(QFrame):
         original_text = self.download_btn.text()
         self.download_btn.setText("已复制")
         QTimer.singleShot(1200, lambda: self.download_btn.setText(original_text))
+
+    def _translate_title(self):
+        """翻译作品名称：异步调用 AI 接口，完成后复制结果并弹窗显示。"""
+        from ui.settings import AppSettings
+        from ui.translate import TranslateWorker
+
+        settings = AppSettings()
+        if not settings.translate_api_key:
+            QMessageBox.information(
+                self,
+                "翻译",
+                "尚未配置 API Key，请先到 设置 → 名称翻译设置 中填写。",
+            )
+            return
+
+        self.download_btn.setText("翻译中...")
+        self.download_btn.setEnabled(False)
+
+        worker = TranslateWorker(
+            self.comic.title,
+            settings.translate_api_base,
+            settings.translate_api_key,
+            settings.translate_model,
+        )
+        self._translate_worker = worker  # 保持引用，防止线程被回收
+        worker.finished.connect(self._on_translate_done)
+        worker.error.connect(self._on_translate_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_translate_done(self, result: str):
+        self._translate_worker = None
+        self._sync_download_button()
+        QApplication.clipboard().setText(result)
+        QMessageBox.information(
+            self, "翻译完成", f"翻译结果（已复制到剪贴板）：\n\n{result}"
+        )
+
+    def _on_translate_error(self, message: str):
+        self._translate_worker = None
+        self._sync_download_button()
+        QMessageBox.warning(self, "翻译失败", message)

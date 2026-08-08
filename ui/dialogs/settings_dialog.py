@@ -72,6 +72,21 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(behavior_group)
 
+        # 名称翻译设置入口
+        translate_row = QHBoxLayout()
+        translate_row.setSpacing(12)
+        self.translate_btn = QPushButton("名称翻译设置")
+        self.translate_btn.setObjectName("settingsButton")
+        self.translate_btn.clicked.connect(self._open_translate_settings)
+        translate_row.addWidget(self.translate_btn)
+        translate_hint = QLabel("配置 AI 翻译接口（链接/模型/Key），用于将作品名称翻译为简体中文")
+        translate_hint.setStyleSheet(
+            f"color: {PALETTE['text_secondary']}; font-size: 12px; padding-left: 4px;"
+        )
+        translate_row.addWidget(translate_hint)
+        translate_row.addStretch()
+        layout.addLayout(translate_row)
+
         # 项目配置分组
         config_group = QGroupBox("项目配置 (Config/Config.json)")
         config_layout = QFormLayout(config_group)
@@ -146,6 +161,12 @@ class SettingsDialog(QDialog):
         from ui.database import DatabaseDialog
 
         DatabaseDialog(self).exec()
+
+    def _open_translate_settings(self):
+        """打开名称翻译设置窗口。"""
+        from ui.dialogs.translate_settings_dialog import TranslateSettingsDialog
+
+        TranslateSettingsDialog(self).exec()
 
     def _on_save(self):
         # 保存应用设置

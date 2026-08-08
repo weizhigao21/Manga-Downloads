@@ -5,6 +5,14 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.4] - 2026-08-08
+
+### 新增
+
+- 名称翻译功能：设置对话框新增「名称翻译设置」入口，弹出独立窗口配置接口链接、模型与 API Key（Key 默认掩码显示，可勾选查看），保存至 `Config/settings.json`
+- 漫画卡片右键菜单新增「翻译作品名称」：通过 AI 接口（DeepSeek / OpenAI 兼容）将作品名称翻译为简体中文，翻译在后台线程执行，完成后复制到剪贴板并弹窗显示结果
+- 依赖新增 `openai`（翻译功能所需，可与 DeepSeek 等兼容接口对接）
+
 ## [1.2.3] - 2026-08-08
 
 ### 新增

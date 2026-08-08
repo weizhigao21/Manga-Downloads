@@ -3,3 +3,4 @@ requests>=2.32
 lxml>=5.0
 opencc-python-reimplemented>=0.1.7
 curl_cffi>=0.15
+openai>=1.0

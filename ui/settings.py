@@ -14,6 +14,10 @@ PROJECT_CONFIG_PATH = ROOT_DIR / "Config" / "Config.json"
 
 DEFAULT_SETTINGS = {
     "auto_fetch_on_startup": True,
+    # 名称翻译（DeepSeek / OpenAI 兼容接口）
+    "translate_api_base": "https://api.deepseek.com",
+    "translate_model": "deepseek-v4-pro",
+    "translate_api_key": "",
 }
 
 DEFAULT_PROJECT_CONFIG = {
@@ -114,6 +118,33 @@ class AppSettings:
     @auto_fetch_on_startup.setter
     def auto_fetch_on_startup(self, value: bool):
         self._settings["auto_fetch_on_startup"] = bool(value)
+
+    @property
+    def translate_api_base(self) -> str:
+        """翻译接口地址（OpenAI 兼容，默认 DeepSeek）。"""
+        return str(self._settings.get("translate_api_base", "https://api.deepseek.com"))
+
+    @translate_api_base.setter
+    def translate_api_base(self, value: str):
+        self._settings["translate_api_base"] = str(value).strip()
+
+    @property
+    def translate_model(self) -> str:
+        """翻译使用的模型名。"""
+        return str(self._settings.get("translate_model", "deepseek-v4-pro"))
+
+    @translate_model.setter
+    def translate_model(self, value: str):
+        self._settings["translate_model"] = str(value).strip()
+
+    @property
+    def translate_api_key(self) -> str:
+        """翻译 API Key（仅保存在本地 settings.json）。"""
+        return str(self._settings.get("translate_api_key", ""))
+
+    @translate_api_key.setter
+    def translate_api_key(self, value: str):
+        self._settings["translate_api_key"] = str(value).strip()
 
     def convert(self, text: str) -> str:
         """根据设置将文本转换为简体（若开启）或保持原样。"""
