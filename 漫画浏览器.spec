@@ -13,7 +13,26 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 排除本机已安装但项目未使用的重型依赖：
+    # PyInstaller 会扫描全部已装包的 hook，可能误收集 torch(CUDA ~3GB)/numba/ffmpeg 等
+    excludes=[
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "numba",
+        "llvmlite",
+        "imageio",
+        "imageio_ffmpeg",
+        "playwright",
+        "numpy",
+        "pandas",
+        "scipy",
+        "matplotlib",
+        "sklearn",
+        "scikit_learn",
+        "keras",
+        "tensorflow",
+    ],
     noarchive=False,
 )
 

@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.11] - 2026-08-08
+
+### 修复
+
+- 打包配置：`excludes` 排除本机已装但项目未使用的重型依赖（torch/CUDA 等约 3.2GB、numba/llvmlite、imageio_ffmpeg、pandas/scipy 等），exe 由异常的 2.6GB 恢复至约 80MB；关闭 UPX 压缩（依赖体量增大后 UPX 打包卡死），打包耗时稳定在 1-2 分钟
+
 ## [1.2.10] - 2026-08-08
 
 ### 修复
