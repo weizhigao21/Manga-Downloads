@@ -2,6 +2,7 @@
 
 from src.utils import (
     data_root,
+    display_title_for_comic,
     find_existing_translation,
     safe_filename,
     split_title_segments,
@@ -100,3 +101,19 @@ class TestFindExistingTranslation:
     def test_empty_or_blank(self):
         assert find_existing_translation("") is None
         assert find_existing_translation("  ") is None
+
+
+class TestDisplayTitleForComic:
+    def test_translated_title_priority(self):
+        assert display_title_for_comic("オリジナル", "原创标题") == "原创标题"
+
+    def test_builtin_chinese_translation(self):
+        assert display_title_for_comic(
+            "破魔の巫女 淫狱に堕つ 2｜破魔巫女 堕入淫狱 2"
+        ) == "破魔巫女 堕入淫狱 2"
+
+    def test_fallback_to_original(self):
+        assert display_title_for_comic("[A] オリジナル [B]") == "[A] オリジナル [B]"
+
+    def test_empty(self):
+        assert display_title_for_comic("", "") == ""

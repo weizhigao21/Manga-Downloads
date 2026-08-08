@@ -23,7 +23,7 @@ from lxml import html
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.utils import safe_filename
+from src.utils import display_title_for_comic, safe_filename
 from src.wnacg_crawler import (
     DOWNLOAD_MAX_RETRIES,
     DOWNLOAD_WORKERS,
@@ -160,11 +160,48 @@ def _fetch_page_with_cookies(url: str, retries: int = DOWNLOAD_MAX_RETRIES) -> t
 
 
 def _download_folder_name(comic: dict, use_label: bool = True) -> str:
-    """生成下载文件夹名：`[右上角分类标签] 标题`；use_label=False 或无线标签时仅用标题。"""
+    """生成下载文件夹基础名：`[右上角分类标签] 显示名`；use_label=False 或无线标签时仅用标题。
+
+    显示名优先取翻译名（AI 翻译 > 标题自带中文 > 原标题），
+    与卡片显示一致；名称冲突由 _resolve_save_dir 追加作品 ID 处理。
+    """
     label = (comic.get("category_label") or "").strip()
-    title = (comic.get("title") or "").strip()
+    title = display_title_for_comic(
+        comic.get("title", ""), comic.get("translated_title", "")
+    )
     name = f"[{label}] {title}" if use_label and label else title
     return safe_filename(name)
+
+
+def _extract_aid(detail_url: str) -> str:
+    """从详情链接提取作品 ID（aid），提取失败时返回空字符串。"""
+    match = re.search(r"aid-(\d+)", detail_url or "")
+    return match.group(1) if match else ""
+
+
+def _resolve_save_dir(save_dir: Path, comic: dict) -> Path:
+    """处理下载目录命名冲突：已存在同名目录且非本作品时追加 (aid) 保证唯一。
+
+    判定规则：
+    - 目录不存在：直接使用；
+    - 目录存在且 title_info.json 中 original_title 与本作品相同：视为重下，
+      复用目录（图片模式断点续传自动跳过已下载文件）；
+    - 其余情况（撞名，不同作品同名）：返回 `名称 (aid)` 目录。
+    """
+    if not save_dir.exists():
+        return save_dir
+    info = save_dir / "title_info.json"
+    if info.exists():
+        try:
+            data = json.loads(info.read_text(encoding="utf-8"))
+            if data.get("original_title") == comic.get("title", ""):
+                return save_dir  # 同一作品重下：复用目录
+        except (OSError, json.JSONDecodeError):
+            pass
+    aid = _extract_aid(comic.get("detail_url", ""))
+    if aid:
+        return save_dir.parent / f"{save_dir.name} ({aid})"
+    return save_dir
 
 
 def _find_7z() -> str | None:
@@ -414,6 +451,8 @@ def download_comic(
         base_dir = Path(config.get("Download", "./Download"))
     use_label = bool(config.get("Folder_use_category_label", True))
     save_dir = base_dir / _download_folder_name(comic, use_label)
+    # 名称冲突（同翻译名不同作品）时自动追加作品 ID，保证目录唯一
+    save_dir = _resolve_save_dir(save_dir, comic)
 
     # 压缩包下载模式：下载整包 zip 并自动解压
     if config.get("Download_mode", "image") == "zip":

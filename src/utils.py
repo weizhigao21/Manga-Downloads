@@ -66,6 +66,24 @@ def find_existing_translation(text: str) -> str | None:
     return None
 
 
+def display_title_for_comic(title: str, translated_title: str = "") -> str:
+    """取作品的展示/命名标题，优先级：AI 翻译名 > 标题自带中文 > 原标题。
+
+    与卡片显示逻辑一致，供下载文件夹命名等场景复用：
+    - translated_title 非空时直接使用（AI 翻译结果）；
+    - 否则若标题自带中文翻译（`日文名｜中文名`）或本身就是中文，
+      取中文部分（find_existing_translation）；
+    - 都没有时回落原标题。
+    """
+    translated = (translated_title or "").strip()
+    if translated:
+        return translated
+    existing = find_existing_translation(title)
+    if existing is not None:
+        return existing
+    return (title or "").strip()
+
+
 def split_title_segments(title: str) -> list[tuple[str, bool]]:
     """将标题按方括号块切分为 [(文本, 是否可翻译)]。
 

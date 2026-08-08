@@ -140,3 +140,74 @@ class TestWriteTitleInfo:
         nested = tmp_path / "a" / "b"
         _write_title_info(nested, {"title": "x"})
         assert (nested / "title_info.json").exists()
+
+
+class TestDownloadFolderName:
+    def test_uses_translated_title(self):
+        from src.downloader import _download_folder_name
+
+        name = _download_folder_name(
+            {
+                "title": "破魔の巫女 淫狱に堕つ 2",
+                "translated_title": "破魔巫女 堕入淫狱 2",
+                "category_label": "同人誌",
+            }
+        )
+        assert name == "[同人誌] 破魔巫女 堕入淫狱 2"
+
+    def test_uses_builtin_chinese(self):
+        from src.downloader import _download_folder_name
+
+        name = _download_folder_name(
+            {
+                "title": "日本語タイトル｜中文标题",
+                "translated_title": "",
+                "category_label": "",
+            }
+        )
+        assert name == "中文标题"
+
+    def test_fallback_original_without_label(self):
+        from src.downloader import _download_folder_name
+
+        name = _download_folder_name(
+            {"title": "オリジナル", "translated_title": "", "category_label": ""},
+            use_label=False,
+        )
+        assert name == "オリジナル"
+
+
+class TestResolveSaveDir:
+    def test_no_conflict_returns_original(self, tmp_path):
+        from src.downloader import _resolve_save_dir
+
+        target = tmp_path / "作品"
+        comic = {"title": "作品", "detail_url": "/x-aid-1.html"}
+        assert _resolve_save_dir(target, comic) == target
+
+    def test_same_comic_reuses_dir(self, tmp_path):
+        import json
+
+        from src.downloader import _resolve_save_dir
+
+        target = tmp_path / "作品"
+        target.mkdir()
+        (target / "title_info.json").write_text(
+            json.dumps({"original_title": "作品"}), encoding="utf-8"
+        )
+        comic = {"title": "作品", "detail_url": "/x-aid-1.html"}
+        assert _resolve_save_dir(target, comic) == target
+
+    def test_conflict_appends_aid(self, tmp_path):
+        import json
+
+        from src.downloader import _resolve_save_dir
+
+        target = tmp_path / "作品"
+        target.mkdir()
+        (target / "title_info.json").write_text(
+            json.dumps({"original_title": "别的作品"}), encoding="utf-8"
+        )
+        comic = {"title": "我的作品", "detail_url": "/x-aid-42.html"}
+        resolved = _resolve_save_dir(target, comic)
+        assert resolved == tmp_path / "作品 (42)"

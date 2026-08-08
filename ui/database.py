@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.utils import data_root, safe_filename
+from src.utils import data_root, display_title_for_comic, safe_filename
 from ui.styles import PALETTE
 
 ROOT_DIR = data_root()
@@ -44,13 +44,28 @@ def cover_cache_path(detail_url: str) -> Path | None:
     return path if path.exists() else None
 
 
-def _match_download_folder(base: Path, title: str, label: str) -> bool:
-    """检查下载目录中是否存在标题（或 `[标签] 标题`）对应的文件夹。
+def _match_download_folder(
+    base: Path,
+    title: str,
+    label: str,
+    translated_title: str = "",
+    aid: str = "",
+) -> bool:
+    """检查下载目录中是否存在该作品对应的文件夹。
 
-    兼容两种命名：旧格式（仅标题）与新格式（`[标签] 标题`），
-    并同时检查文件名清洗前后的写法。
+    兼容多种命名（均同时检查文件名清洗前后的写法）：
+    - 旧格式：仅标题 / `[标签] 标题`
+    - 新格式：显示名（AI 翻译名或标题自带中文）/ `[标签] 显示名`
+    - 冲突格式：上述名称后追加 ` (aid)`
     """
-    for raw in (title, f"[{label}] {title}".strip() if label else title):
+    display = display_title_for_comic(title, translated_title)
+    candidates: set[str] = {title, display}
+    for t in list(candidates):
+        candidates.add(f"[{label}] {t}".strip() if label else t)
+    if aid:
+        for t in list(candidates):
+            candidates.add(f"{t} ({aid})")
+    for raw in candidates:
         safe = safe_filename(raw)
         if (base / raw).is_dir() or (base / safe).is_dir():
             return True
@@ -67,7 +82,13 @@ def is_comic_downloaded(record: dict) -> bool:
     from ui.settings import ProjectConfig
 
     base = Path(ProjectConfig().download_dir)
-    return _match_download_folder(base, title, record.get("category_label") or "")
+    return _match_download_folder(
+        base,
+        title,
+        record.get("category_label") or "",
+        record.get("translated_title") or "",
+        _extract_aid(record.get("detail_url", "")) or "",
+    )
 
 
 _comics_records: list[dict] | None = None
