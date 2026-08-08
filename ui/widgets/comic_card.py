@@ -327,8 +327,34 @@ class ComicCard(QFrame):
             self.download_btn.setText("重试")
 
     def contextMenuEvent(self, event: QContextMenuEvent):
-        """右键卡片弹出上下文菜单：复制作品名称到剪贴板。"""
+        """右键卡片弹出上下文菜单：复制作品名称到剪贴板。
+
+        QMenu 是独立弹出窗口，不继承项目浅色主题；系统深色模式下默认黑底，
+        与项目 QSS 的深色文字叠加会出现黑底黑字，因此显式设置浅色样式。
+        """
         menu = QMenu(self)
+        menu.setStyleSheet(
+            f"""
+            QMenu {{
+                background-color: {PALETTE["surface"]};
+                color: {PALETTE["text"]};
+                border: 1px solid {PALETTE["border"]};
+                border-radius: 8px;
+                padding: 6px;
+            }}
+            QMenu::item {{
+                background-color: transparent;
+                color: {PALETTE["text"]};
+                padding: 6px 24px;
+                border-radius: 6px;
+                font-size: 13px;
+            }}
+            QMenu::item:selected {{
+                background-color: {PALETTE["primary"]};
+                color: white;
+            }}
+            """
+        )
         menu.addAction("复制作品名称", self._copy_title)
         menu.exec(event.globalPos())
 
