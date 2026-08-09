@@ -38,6 +38,37 @@ class TestDownloadManager:
         assert fresh_manager.start_download(comic) is None
         assert fresh_manager.tasks == []
 
+    def test_translation_filled_from_database(self, monkeypatch, tmp_path):
+        """卡片数据缺翻译名时，下载前从数据库补全（文件夹用翻译名）。"""
+        import ui.database as db
+        from ui.download_manager import DownloadManager
+
+        # 隔离数据库：重置单例并指向临时文件
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        db.DatabaseManager.instance()
+        try:
+            detail_url = "/photos-index-aid-888.html"
+            db.DatabaseManager.instance().save_translated_title(
+                detail_url, "翻译后的作品名"
+            )
+
+            comic = ComicItem(
+                title="オリジナルタイトル",
+                image_count=10,
+                upload_date="2026-08-08",
+                detail_url=detail_url,
+                # translated_title 故意为空，模拟翻译前创建的旧卡片
+            )
+            comic_dict = DownloadManager._fill_translation(
+                DownloadManager._comic_dict(comic)
+            )
+            assert comic_dict["translated_title"] == "翻译后的作品名"
+        finally:
+            db.DatabaseManager._instance = None
+            db._invalidate_records_cache()
+
     def test_failure_marks_task_failed(self, fresh_manager, qtbot, monkeypatch):
         def fake_fail(*args, **kwargs):
             raise RuntimeError("网络错误")
@@ -149,6 +180,30 @@ class TestDownloadManager:
         fresh_manager.tasks = [failed]
         assert fresh_manager.retry_task(failed) is None
         assert failed.status == DownloadTask.FAILED  # 状态未被破坏
+
+    def test_progress_signals_throttled(self, fresh_manager, qtbot, monkeypatch):
+        """高频进度回调（如压缩包每 256KB 一次）不得刷爆 UI：信号需限频。"""
+        def fake_download(comic, base_dir, progress_callback=None, stage_callback=None, **kw):
+            for i in range(20):
+                progress_callback(i + 1, 20)  # 极快连续触发（模拟大压缩包）
+            stage_callback("下载完成")
+
+        monkeypatch.setattr(dm, "download_comic", fake_download)
+        monkeypatch.setattr(
+            "ui.database.DatabaseManager.mark_downloaded", lambda self, url: None
+        )
+
+        updated: list = []
+        fresh_manager.task_updated.connect(lambda: updated.append(1))
+
+        task = fresh_manager.start_download(_comic())
+        qtbot.waitUntil(lambda: task.status == DownloadTask.DONE, timeout=5000)
+
+        # 20 次 progress 被限频：task_updated 总次数应远小于 20
+        # （launch 1 次 + 限频后少数 progress + finished 1 次）
+        assert len(updated) < 15, f"task_updated 次数过多: {len(updated)}"
+        # 最终进度值仍准确
+        assert task.status == DownloadTask.DONE
 
 
     def test_shutdown_without_tasks_returns_immediately(self, fresh_manager):

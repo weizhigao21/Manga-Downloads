@@ -65,14 +65,23 @@ class DownloadWorker(QThread):
             if self.isInterruptionRequested():
                 raise InterruptedError("下载任务已中断")
 
+        # 进度信号限频：压缩包模式每 256KB 触发一次回调，若每次都 emit，
+        # 会驱动 UI 线程刷新所有卡片（task_updated 有 N 个连接者）造成卡顿。
+        # 最多每 100ms 发一次，cur == total 时强制发出保证最终进度准确。
+        last_progress = [0.0]
+
+        def _progress(cur: int, total: int):
+            _guard()
+            now = time.monotonic()
+            if cur == total or now - last_progress[0] >= 0.1:
+                last_progress[0] = now
+                self.progress.emit(self.task, cur, total)
+
         try:
             download_comic(
                 self.comic,
                 self.base_dir,
-                progress_callback=lambda cur, total: (
-                    _guard(),
-                    self.progress.emit(self.task, cur, total),
-                ),
+                progress_callback=_progress,
                 stage_callback=lambda s: (
                     _guard(),
                     self.stage.emit(self.task, s),
@@ -112,6 +121,8 @@ class DownloadManager(QObject):
         super().__init__()
         self.tasks: list[DownloadTask] = self._load_tasks()
         self._workers: dict[DownloadTask, DownloadWorker] = {}
+        # 进度更新时持久化节流（避免高频磁盘写入卡顿 UI）
+        self._last_save = 0.0
 
     # ---- 任务持久化 ----
 
@@ -171,7 +182,8 @@ class DownloadManager(QObject):
         """为一部漫画创建并启动下载任务，返回任务对象；无详情链接时返回 None。
 
         同一作品存在**失败**任务时，复用该任务原地重试（不新建重复任务）；
-        已下载/进行中的任务不受影响。
+        已下载/进行中的任务不受影响。下载前会从数据库补全最新翻译名，
+        保证文件夹命名使用翻译后的名称。
         """
         if not comic.detail_url:
             return None
@@ -179,13 +191,13 @@ class DownloadManager(QObject):
         existing = self.task_for(comic)
         if existing and existing.status == DownloadTask.FAILED:
             # 失败后再次点击下载：复用原任务重试（用最新作品数据刷新）
-            existing.comic = self._comic_dict(comic)
+            existing.comic = self._fill_translation(self._comic_dict(comic))
             return self.retry_task(existing)
 
         task = DownloadTask(
             self._extract_id(comic.detail_url), comic.title, comic.detail_url
         )
-        task.comic = self._comic_dict(comic)
+        task.comic = self._fill_translation(self._comic_dict(comic))
         self.tasks.append(task)
         self._launch_worker(task)
         return task
@@ -201,12 +213,33 @@ class DownloadManager(QObject):
             "translated_title": comic.translated_title,
         }
 
+    @staticmethod
+    def _fill_translation(comic_dict: dict) -> dict:
+        """若作品数据缺翻译名，从数据库补全最新翻译结果。
+
+        卡片数据可能早于翻译操作（或重试时沿用任务旧快照），
+        这里统一兜底，确保下载文件夹使用翻译后的名称。
+        """
+        if comic_dict.get("translated_title"):
+            return comic_dict
+        detail_url = comic_dict.get("detail_url", "")
+        if not detail_url:
+            return comic_dict
+        from ui.database import _cached_records
+
+        for record in _cached_records():
+            if record.get("detail_url") == detail_url and record.get("translated_title"):
+                comic_dict["translated_title"] = record["translated_title"]
+                break
+        return comic_dict
+
     def retry_task(self, task: DownloadTask) -> DownloadTask | None:
         """原地重试一个失败任务：重置状态并重新启动下载线程。
 
         使用任务自带的作品数据（task.comic，随任务持久化），
         因此下载管理对话框/重启后的任务也能直接重试。
-        数据不足（无详情链接）时返回 None。
+        重试前会从数据库补全最新翻译名，避免使用旧快照导致文件夹
+        未用翻译后的名称。数据不足（无详情链接）时返回 None。
         """
         if not task.comic:
             # 兼容旧版持久化数据：用已有字段构建最小作品数据
@@ -215,6 +248,8 @@ class DownloadManager(QObject):
             return None
         # 清理可能残留的旧线程关联
         self._workers.pop(task, None)
+        # 补全最新翻译名（覆盖旧快照/持久化时尚未翻译的情况）
+        task.comic = self._fill_translation(task.comic)
         task.status = DownloadTask.WAITING
         task.current = 0
         task.total = 0
@@ -241,7 +276,11 @@ class DownloadManager(QObject):
         task.total = total
         task.status = DownloadTask.DOWNLOADING
         self.task_updated.emit()
-        self._save_tasks()
+        # 进度高频到达：持久化最多每 500ms 一次，状态/结果变化仍即时保存
+        now = time.monotonic()
+        if now - self._last_save >= 0.5:
+            self._last_save = now
+            self._save_tasks()
 
     def _on_stage(self, task: DownloadTask, stage: str):
         task.stage = stage
