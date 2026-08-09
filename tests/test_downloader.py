@@ -1,10 +1,18 @@
 """src/downloader.py 纯函数与下载行为测试（不依赖真实网络）。"""
 
 import json
+import zipfile
 
+import pytest
 from lxml import html as lxml_html
 
 from src.downloader import _extract_reading_page_url, _write_title_info
+
+
+@pytest.fixture(autouse=True)
+def _disable_throttle(monkeypatch):
+    """禁用全局请求节流与重试等待，避免 0.6s 间隔拖慢测试。"""
+    monkeypatch.setattr("src.wnacg_crawler._throttle", lambda: None)
 
 
 class TestExtractReadingPageUrl:
@@ -38,6 +46,30 @@ class TestExtractReadingPageUrl:
 class TestDownloadPicturesResume:
     """断点续传：目标文件已存在且非空时跳过下载，不覆盖、不请求网络。"""
 
+    @staticmethod
+    def _fake_response(content: bytes = b"new-content", status_code: int = 200):
+        """构造支持 with/iter_content 协议的假响应（与真实 requests 行为一致）。"""
+
+        class FakeResponse:
+            def __init__(self):
+                self.status_code = status_code
+                self.content = content
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise ConnectionError(f"HTTP {self.status_code}")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def iter_content(self, chunk_size=65536):
+                yield self.content
+
+        return FakeResponse()
+
     def test_skips_existing_file(self, tmp_path, monkeypatch):
         from src.wnacg_crawler import download_pictures
 
@@ -46,16 +78,9 @@ class TestDownloadPicturesResume:
 
         requested: list[str] = []
 
-        class FakeResponse:
-            status_code = 200
-            content = b"new-content"
-
-            def raise_for_status(self):
-                pass
-
         def fake_get(url, **kwargs):
             requested.append(url)
-            return FakeResponse()
+            return self._fake_response()
 
         monkeypatch.setattr("src.wnacg_crawler.requests.get", fake_get)
 
@@ -75,16 +100,9 @@ class TestDownloadPicturesResume:
 
         requested: list[str] = []
 
-        class FakeResponse:
-            status_code = 200
-            content = b"new-content"
-
-            def raise_for_status(self):
-                pass
-
         def fake_get(url, **kwargs):
             requested.append(url)
-            return FakeResponse()
+            return self._fake_response()
 
         monkeypatch.setattr("src.wnacg_crawler.requests.get", fake_get)
 
@@ -111,6 +129,50 @@ class TestDownloadPicturesResume:
         download_pictures([], tmp_path, progress_callback=lambda c, t: progress.append((c, t)))
         assert requested == []
         assert progress == [(0, 0)]
+
+    def test_partial_failure_aggregates_and_continues(self, tmp_path, monkeypatch):
+        """单张失败不中断整批：其余图片继续下载，返回失败数量。"""
+        from src.wnacg_crawler import download_pictures
+
+        def fake_get(url, **kwargs):
+            if "fail" in url:
+                return self._fake_response(status_code=500)
+            return self._fake_response(b"ok-content")
+
+        monkeypatch.setattr("src.wnacg_crawler.requests.get", fake_get)
+
+        failed = download_pictures(
+            [
+                {"link": "https://img.example.com/fail.jpg", "number": "1"},
+                {"link": "https://img.example.com/ok.jpg", "number": "2"},
+                {"link": "https://img.example.com/ok2.jpg", "number": "3"},
+            ],
+            tmp_path,
+            max_retries=2,
+        )
+
+        assert failed == 1  # 只有 fail.jpg 失败
+        assert (tmp_path / "2.jpg").read_bytes() == b"ok-content"  # 其余正常落盘
+        assert (tmp_path / "3.jpg").read_bytes() == b"ok-content"
+
+    def test_no_part_left_after_failure(self, tmp_path, monkeypatch):
+        """下载失败后 .part 临时文件被清理，不留垃圾文件。"""
+        from src.wnacg_crawler import download_pictures
+
+        def fake_get(url, **kwargs):
+            return self._fake_response(status_code=500)
+
+        monkeypatch.setattr("src.wnacg_crawler.requests.get", fake_get)
+
+        download_pictures(
+            [{"link": "https://img.example.com/1.jpg", "number": "1"}],
+            tmp_path,
+            max_retries=1,
+        )
+
+        leftovers = [p for p in tmp_path.iterdir() if p.suffix == ".part"]
+        assert leftovers == []
+        assert not (tmp_path / "1.jpg").exists()
 
 
 class TestWriteTitleInfo:
@@ -211,3 +273,81 @@ class TestResolveSaveDir:
         comic = {"title": "我的作品", "detail_url": "/x-aid-42.html"}
         resolved = _resolve_save_dir(target, comic)
         assert resolved == tmp_path / "作品 (42)"
+
+
+class TestSafeZipMembers:
+    """zip-slip 防御（CVE-2007-4559）：拒绝绝对路径 / .. 段 / 符号链接条目。"""
+
+    @staticmethod
+    def _make_zip(path, entries: dict[str, int]) -> None:
+
+        with zipfile.ZipFile(path, "w") as zf:
+            for name, mode in entries.items():
+                info = zipfile.ZipInfo(name)
+                info.external_attr = (mode | 0o644) << 16
+                zf.writestr(info, "content")
+
+    def test_normal_members_allowed(self, tmp_path):
+        from src.downloader import _safe_zip_members
+
+        archive = tmp_path / "normal.zip"
+        self._make_zip(archive, {"a/b/c.txt": 0, "d.txt": 0})
+        with zipfile.ZipFile(archive) as zf:
+            assert _safe_zip_members(zf) == ["a/b/c.txt", "d.txt"]
+
+    def test_dotdot_rejected(self, tmp_path):
+        from src.downloader import _safe_zip_members
+
+        archive = tmp_path / "evil.zip"
+        self._make_zip(archive, {"../evil.txt": 0})
+        with zipfile.ZipFile(archive) as zf:
+            with pytest.raises(ValueError, match="不安全"):
+                _safe_zip_members(zf)
+
+    def test_absolute_path_rejected(self, tmp_path):
+        from src.downloader import _safe_zip_members
+
+        archive = tmp_path / "abs.zip"
+        self._make_zip(archive, {"/etc/passwd": 0})
+        with zipfile.ZipFile(archive) as zf:
+            with pytest.raises(ValueError, match="不安全"):
+                _safe_zip_members(zf)
+
+    def test_drive_prefix_rejected(self, tmp_path):
+        from src.downloader import _safe_zip_members
+
+        archive = tmp_path / "drive.zip"
+        self._make_zip(archive, {"C:\\evil.exe": 0})
+        with zipfile.ZipFile(archive) as zf:
+            with pytest.raises(ValueError, match="不安全"):
+                _safe_zip_members(zf)
+
+    def test_symlink_rejected(self, tmp_path):
+        import stat
+
+        from src.downloader import _safe_zip_members
+
+        archive = tmp_path / "link.zip"
+        self._make_zip(archive, {"link.txt": stat.S_IFLNK})
+        with zipfile.ZipFile(archive) as zf:
+            with pytest.raises(ValueError, match="不安全"):
+                _safe_zip_members(zf)
+
+    def test_extract_archive_rejects_evil_zip(self, tmp_path):
+        from src.downloader import _extract_archive
+
+        archive = tmp_path / "evil.zip"
+        self._make_zip(archive, {"../evil.txt": 0})
+        with pytest.raises(ValueError, match="不安全"):
+            _extract_archive(archive, tmp_path / "out")
+        # 确认没有写出到父目录之外
+        assert not (tmp_path.parent / "evil.txt").exists()
+
+    def test_extract_archive_extracts_normal_zip(self, tmp_path):
+        from src.downloader import _extract_archive
+
+        archive = tmp_path / "ok.zip"
+        self._make_zip(archive, {"a/b.txt": 0})
+        out = tmp_path / "out"
+        _extract_archive(archive, out)
+        assert (out / "a" / "b.txt").read_bytes() == b"content"

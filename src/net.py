@@ -23,6 +23,10 @@ _LAST_REQUEST_TIME = 0.0
 # 视为限流/反爬、需要退避重试的状态码
 _RETRYABLE_STATUS = (429, 403, 500, 502, 503)
 
+# 会话级连接池：页面请求复用同一 Session，TCP/TLS 握手只做一次，
+# 避免每次请求新建连接（一部 18 页作品约 234 次请求，收益显著）
+_SESSION = requests.Session()
+
 
 def _throttle():
     """相邻请求之间保持最小间隔（跨线程生效）。"""
@@ -35,35 +39,76 @@ def _throttle():
         _LAST_REQUEST_TIME = time.monotonic()
 
 
+def _decode_encoding(resp) -> None:
+    """设置响应编码：优先响应头 charset，无有效声明时才做全文检测。
+
+    requests 对无 charset 的 text 响应默认视为 ISO-8859-1（对中文页面
+    会乱码），且 apparent_encoding 使用 chardet 全文检测开销较高；
+    仅在确实没有有效编码声明时才回退检测。
+    """
+    enc = resp.encoding
+    if not enc or enc.lower() in ("iso-8859-1", "latin-1"):
+        resp.encoding = resp.apparent_encoding or "utf-8"
+
+
 def fetch(url: str, headers: dict, timeout: int = 30) -> str:
-    """请求页面并返回 HTML 文本（自带全局节流）。"""
+    """请求页面并返回 HTML 文本（自带全局节流，复用连接池）。"""
     _throttle()
-    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp = _SESSION.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or "utf-8"
+    _decode_encoding(resp)
     return resp.text
 
 
-def fetch_with_retry(url: str, headers: dict, retries: int = 3, timeout: int = 30) -> str:
-    """带退避重试的页面请求，遇限流状态码时延长等待后重试。
+def _should_retry(exc: BaseException) -> bool:
+    """判断异常是否值得退避重试。
 
-    限流等待时间指数增长（3s → 6s → 12s...），给站点留出恢复窗口。
+    可重试：
+    - 超时（Timeout / ReadTimeout / ConnectTimeout）：网络抖动常见；
+    - 连接错误（ConnectionError 及其子类）：弱网/连接池满时常见；
+    - HTTP 限流状态码（429/403/5xx，见 _RETRYABLE_STATUS）。
+
+    不可重试：业务类 4xx（404/400 等）、证书错误、其他非 requests 异常。
+    """
+    if isinstance(exc, requests.Timeout):
+        return True
+    if isinstance(exc, requests.ConnectionError):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else 0
+        return status in _RETRYABLE_STATUS
+    return False
+
+
+def _request_with_retry(
+    request_fn, url: str, headers: dict, retries: int, timeout: int
+):
+    """通用带退避重试的请求：可重试异常指数退避，其余直接抛出。
+
+    限流/连接错误/超时的等待时间指数增长（3s → 6s → 12s...），
+    给站点与网络留出恢复窗口。
     """
     for attempt in range(retries):
         try:
-            return fetch(url, headers, timeout)
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else 0
-            if status in _RETRYABLE_STATUS:
-                wait = 3.0 * (2**attempt) + random.uniform(0, 1)
-                logger.warning(
-                    "页面请求被限流(HTTP %d)，第 %d/%d 次重试，等待 %.1fs: %s",
-                    status, attempt + 1, retries, wait, url,
-                )
-                time.sleep(wait)
-                continue
-            raise
+            return request_fn(url, headers, timeout)
+        except requests.RequestException as exc:
+            if not _should_retry(exc):
+                raise
+            wait = 3.0 * (2**attempt) + random.uniform(0, 1)
+            logger.warning(
+                "请求失败(%s)，第 %d/%d 次重试，等待 %.1fs: %s",
+                type(exc).__name__, attempt + 1, retries, wait, url,
+            )
+            time.sleep(wait)
     raise RuntimeError(f"页面请求重试 {retries} 次仍失败: {url}")
+
+
+def fetch_with_retry(url: str, headers: dict, retries: int = 3, timeout: int = 30) -> str:
+    """带退避重试的页面请求：限流状态码 / 连接错误 / 超时均会重试。
+
+    限流等待时间指数增长（3s → 6s → 12s...），给站点留出恢复窗口。
+    """
+    return _request_with_retry(fetch, url, headers, retries, timeout)
 
 
 def fetch_page_with_cookies(
@@ -72,25 +117,14 @@ def fetch_page_with_cookies(
     """请求页面并返回 (HTML, Cookie 字符串)，带退避重试。
 
     页面 HTML 与 Cookie 在一次请求中同时取得，避免对同一页面重复
-    请求触发限流；对限流状态码指数退避重试（与 fetch_with_retry 一致）。
+    请求触发限流；对限流/连接错误/超时指数退避重试（与 fetch_with_retry 一致）。
     """
-    for attempt in range(retries):
-        try:
-            _throttle()
-            resp = requests.get(url, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            cookies = "; ".join(f"{c.name}={c.value}" for c in resp.cookies)
-            return resp.text, cookies
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else 0
-            if status in _RETRYABLE_STATUS:
-                wait = 3.0 * (2**attempt) + random.uniform(0, 1)
-                logger.warning(
-                    "页面请求被限流(HTTP %d)，第 %d/%d 次重试，等待 %.1fs: %s",
-                    status, attempt + 1, retries, wait, url,
-                )
-                time.sleep(wait)
-                continue
-            raise
-    raise RuntimeError(f"页面请求重试 {retries} 次仍失败: {url}")
+    def _fetch_page(url, headers, timeout):
+        _throttle()
+        resp = _SESSION.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        _decode_encoding(resp)
+        cookies = "; ".join(f"{c.name}={c.value}" for c in resp.cookies)
+        return resp.text, cookies
+
+    return _request_with_retry(_fetch_page, url, headers, retries, timeout)

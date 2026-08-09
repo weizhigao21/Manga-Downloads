@@ -107,7 +107,9 @@ class DownloadManager(QObject):
     - 任何状态变化都会发出 task_updated 信号，供界面刷新。
     """
 
-    task_updated = Signal()
+    task_updated = Signal()        # 无参广播（下载管理对话框等全量刷新）
+    task_changed = Signal(object)  # 携带任务（漫画卡片等按任务定向响应，避免各自遍历）
+    task_deleted = Signal(object)  # 携带被删除的任务（卡片收到后回到未下载状态）
 
     _instance: "DownloadManager | None" = None
 
@@ -127,7 +129,12 @@ class DownloadManager(QObject):
     # ---- 任务持久化 ----
 
     def _load_tasks(self) -> list[DownloadTask]:
-        """从本地文件恢复历史任务；中断中的任务（等待/下载中）标记为失败。"""
+        """从本地文件恢复历史任务。
+
+        - 已完成（DONE）任务重启后自动隐藏：不再恢复显示（已下载状态
+          由数据库 downloaded 字段与磁盘目录检查负责，不依赖任务记录）；
+        - 中断中的任务（等待/下载中）标记为失败，说明退出原因。
+        """
         if not TASKS_PATH.exists():
             return []
         try:
@@ -147,6 +154,9 @@ class DownloadManager(QObject):
             task.stage = item.get("stage", "")
             task.error = item.get("error", "")
             task.comic = item.get("comic", {}) or {}
+            if task.status == DownloadTask.DONE:
+                # 已完成任务重启后自动隐藏（不恢复显示）
+                continue
             if task.status in (DownloadTask.WAITING, DownloadTask.DOWNLOADING):
                 # 重启后这些任务已无法续跑，标记为失败并说明原因
                 task.status = DownloadTask.FAILED
@@ -258,6 +268,26 @@ class DownloadManager(QObject):
         self._launch_worker(task)
         return task
 
+    def delete_task(self, task: DownloadTask):
+        """删除任务记录（不影响已下载的磁盘文件）。
+
+        运行中的任务先请求中断并短时等待（写文件为原子替换，
+        中断不会留下半截文件）；删除后广播 task_deleted，相关卡片
+        重新自查并回到未下载状态。
+        """
+        worker = self._workers.pop(task, None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(1500)
+            if worker.isRunning():
+                worker.terminate()
+                worker.wait(500)
+        if task in self.tasks:
+            self.tasks.remove(task)
+        self._save_tasks()
+        self.task_deleted.emit(task)
+        self.task_updated.emit()
+
     def _launch_worker(self, task: DownloadTask):
         """创建并启动下载线程（供新建任务与重试复用）。"""
         base_dir = Path(ProjectConfig().download_dir)
@@ -267,6 +297,7 @@ class DownloadManager(QObject):
         worker.stage.connect(self._on_stage)
         worker.finished.connect(self._on_finished)
         worker.finished.connect(worker.deleteLater)
+        self.task_changed.emit(task)
         self.task_updated.emit()
         self._save_tasks()
         worker.start()
@@ -275,6 +306,7 @@ class DownloadManager(QObject):
         task.current = current
         task.total = total
         task.status = DownloadTask.DOWNLOADING
+        self.task_changed.emit(task)
         self.task_updated.emit()
         # 进度高频到达：持久化最多每 500ms 一次，状态/结果变化仍即时保存
         now = time.monotonic()
@@ -284,6 +316,7 @@ class DownloadManager(QObject):
 
     def _on_stage(self, task: DownloadTask, stage: str):
         task.stage = stage
+        self.task_changed.emit(task)
         self.task_updated.emit()
         self._save_tasks()
 
@@ -300,6 +333,7 @@ class DownloadManager(QObject):
         else:
             task.status = DownloadTask.FAILED
             task.error = error
+        self.task_changed.emit(task)
         self.task_updated.emit()
         self._save_tasks()
 
@@ -312,6 +346,17 @@ class DownloadManager(QObject):
             if task.task_id == task_id:
                 return task
         return None
+
+    def request_interruption(self):
+        """请求中断所有下载线程（不等待）。
+
+        窗口关闭时先快速触发中断，让线程在下一个检查点退出，
+        实际收尾等待由应用退出流程（aboutToQuit → shutdown）统一完成，
+        避免关闭窗口时同步阻塞等待。
+        """
+        for worker in self._workers.values():
+            if worker.isRunning():
+                worker.requestInterruption()
 
     def shutdown(self, timeout_ms: int = 2500, terminate_grace_ms: int = 1000):
         """请求中断所有下载线程并等待结束；超时后强制终止（应用退出前调用）。

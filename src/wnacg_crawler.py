@@ -24,8 +24,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import ProjectConfig
+from src.net import _RETRYABLE_STATUS, _throttle, fetch_with_retry
 from src.net import fetch as _net_fetch
-from src.net import fetch_with_retry
 from src.utils import data_root, safe_filename
 
 # 项目根目录（src 的上级目录）与配置文件路径
@@ -70,7 +70,10 @@ CATE_LABELS = {
     "cate-37": "AI&圖集",
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# 仅独立运行（CLI）或未配置过日志时初始化 root logger；
+# 作为库被 UI 层导入时不改动调用方的日志配置
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -320,7 +323,7 @@ def _fetch_picture_link(link: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str |
             return img_url
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else 0
-            if status in (429, 403, 500, 502, 503):
+            if status in _RETRYABLE_STATUS:
                 wait = 0.5 * (2**attempt) + random.uniform(0, 0.5)
                 logger.warning(
                     "获取图片详情页被限流(HTTP %d)，第 %d/%d 次重试，等待 %.1fs: %s",
@@ -431,24 +434,29 @@ def download_pictures(
     progress_callback=None,
     max_workers: int = DOWNLOAD_WORKERS,
     max_retries: int = DOWNLOAD_MAX_RETRIES,
-):
+) -> int:
     """并发下载图片列表到指定目录。
 
-    通过受控并发数 + 指数退避重试，在提升速度的同时避免触发站点反爬限制。
+    通过受控并发数 + 全局节流 + 指数退避重试，在提升速度的同时避免触发站点反爬限制。
+    单张图片失败（重试耗尽）只记录不中断整批，其余图片继续下载。
 
     Args:
         progress_callback: 可选回调 (当前张数, 总张数)，每下载一张调用一次。
         max_workers: 并发线程数，默认 3（并发过高容易被反爬拦截）。
         max_retries: 失败重试次数，默认 3。
+
+    Returns:
+        下载失败（重试耗尽）的图片数量；调用方可用于修正累计进度。
     """
     save_dir.mkdir(parents=True, exist_ok=True)
     total = len(pictures)
     if total == 0:
         if progress_callback:
             progress_callback(0, 0)
-        return
+        return 0
 
     done = 0
+    failed: list[Exception] = []
     lock = threading.Lock()
 
     def _download_one(pic: dict):
@@ -466,25 +474,40 @@ def download_pictures(
         last_exc: Exception = Exception("未知下载错误")
         for attempt in range(max_retries):
             try:
-                resp = requests.get(url, headers=HEADERS, timeout=30)
-                # 429（限流）/ 403（反爬）/ 5xx（服务端错误）时退避重试
-                if resp.status_code in (429, 403) or resp.status_code >= 500:
-                    raise requests.HTTPError(
-                        f"HTTP {resp.status_code}", response=resp
-                    )
-                resp.raise_for_status()
-                # 先写临时文件再原子替换：中断/强制终止不会留下半截图片
-                # （下次下载时 target 不存在会重新下载，.part 残留会被覆盖）
-                tmp = target.with_name(target.name + ".part")
-                tmp.write_bytes(resp.content)
-                tmp.replace(target)
+                # 全局节流：与页面抓取共用请求密度控制，避免密集下载触发反爬
+                _throttle()
+                with requests.get(url, headers=HEADERS, timeout=30, stream=True) as resp:
+                    # 429（限流）/ 403（反爬）/ 5xx（服务端错误）时退避重试
+                    if resp.status_code in _RETRYABLE_STATUS or resp.status_code >= 500:
+                        raise requests.HTTPError(
+                            f"HTTP {resp.status_code}", response=resp
+                        )
+                    resp.raise_for_status()
+                    # 先写临时文件再原子替换：中断/强制终止不会留下半截图片
+                    tmp = target.with_name(target.name + ".part")
+                    try:
+                        with open(tmp, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                        tmp.replace(target)
+                    finally:
+                        # 失败/中断时清理残留 .part，避免积累垃圾文件
+                        if tmp.exists():
+                            try:
+                                tmp.unlink()
+                            except OSError:
+                                pass
                 break
             except (requests.RequestException, OSError) as exc:
                 last_exc = exc
                 # 指数退避：0.5s, 1s, 2s
                 time.sleep(0.5 * (2**attempt))
         else:
-            raise last_exc
+            # 重试耗尽：记录失败原因，不中断整批（其余图片继续下载）
+            with lock:
+                failed.append(last_exc)
+            return
 
         with lock:
             done += 1
@@ -493,6 +516,13 @@ def download_pictures(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         list(executor.map(_download_one, pictures))
+
+    if failed:
+        logger.warning(
+            "图片下载完成：成功 %d/%d 张，失败 %d 张（示例原因: %s）",
+            done, total, len(failed), failed[0],
+        )
+    return len(failed)
 
 
 def main() -> int:

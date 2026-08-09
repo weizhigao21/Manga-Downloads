@@ -1,10 +1,13 @@
-"""下载管理对话框：表格展示所有下载任务（ID/名称/进度条/状态）。"""
+"""下载管理对话框：表格展示所有下载任务（ID/名称/进度条/状态），支持右键删除任务。"""
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QTableWidget,
@@ -69,8 +72,12 @@ class DownloadManagerDialog(QDialog):
         self.table.setHorizontalHeaderLabels(["ID", "名称", "进度", "状态", "操作"])
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
+        # 右键菜单：删除所选任务
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -168,6 +175,63 @@ class DownloadManagerDialog(QDialog):
             retry_btn = self._retry_buttons.get(row)
             if retry_btn is not None:
                 retry_btn.setVisible(task.status == DownloadTask.FAILED)
+
+    def _on_context_menu(self, pos):
+        """表格右键：弹出删除菜单（支持多选批量删除）。
+
+        QMenu 为独立弹出窗口，不继承项目浅色主题；系统深色模式下默认
+        黑底，与浅色文字叠加不可见，因此显式设置浅色样式（与卡片菜单一致）。
+        """
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not rows:
+            # 未选中任何行时，按右键位置定位所在行
+            row = self.table.rowAt(pos.y())
+            if row < 0:
+                return
+            rows = [row]
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"""
+            QMenu {{
+                background-color: {PALETTE["surface"]};
+                color: {PALETTE["text"]};
+                border: 1px solid {PALETTE["border"]};
+                border-radius: 8px;
+                padding: 6px;
+            }}
+            QMenu::item {{
+                background-color: transparent;
+                color: {PALETTE["text"]};
+                padding: 6px 24px;
+                border-radius: 6px;
+                font-size: 13px;
+            }}
+            QMenu::item:selected {{
+                background-color: {PALETTE["primary"]};
+                color: white;
+            }}
+            """
+        )
+        label = f"删除所选 {len(rows)} 个任务" if len(rows) > 1 else "删除任务"
+        action = menu.addAction(label)
+        if menu.exec(self.table.viewport().mapToGlobal(pos)) == action:
+            self._delete_selected_tasks(rows)
+
+    def _delete_selected_tasks(self, rows: list[int]):
+        """删除选中行对应的任务（仅移除任务记录，不影响已下载的磁盘文件）。"""
+        tasks = [self._manager.tasks[r] for r in rows if 0 <= r < len(self._manager.tasks)]
+        if not tasks:
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除 {len(tasks)} 个下载任务吗？\n已下载的文件不会删除。",
+        )
+        if answer == QMessageBox.Yes:
+            for task in tasks:
+                self._manager.delete_task(task)
+            # delete_task 已触发 task_updated → 表格自动刷新
 
     def _set_cell(self, row: int, col: int, text: str, color: str = None):
         item = QTableWidgetItem(text)

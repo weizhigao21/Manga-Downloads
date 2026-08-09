@@ -85,19 +85,25 @@ class ProjectConfig:
 
     @property
     def download_workers(self) -> int:
-        return int(self._config.get("Download_workers", 3))
+        """下载并发数，夹取到 [1, 8]：0/负数会让线程池抛错，过高易触发反爬。"""
+        value = int(self._config.get("Download_workers", 3))
+        return max(1, min(value, 8))
 
     @download_workers.setter
     def download_workers(self, value: int):
-        self._config["Download_workers"] = int(value)
+        value = int(value)
+        self._config["Download_workers"] = max(1, min(value, 8))
 
     @property
     def download_retries(self) -> int:
-        return int(self._config.get("Download_retries", 3))
+        """失败重试次数，夹取到 [0, 10]（0 表示不重试）。"""
+        value = int(self._config.get("Download_retries", 3))
+        return max(0, min(value, 10))
 
     @download_retries.setter
     def download_retries(self, value: int):
-        self._config["Download_retries"] = int(value)
+        value = int(value)
+        self._config["Download_retries"] = max(0, min(value, 10))
 
     @property
     def folder_use_category_label(self) -> bool:

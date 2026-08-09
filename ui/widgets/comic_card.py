@@ -25,18 +25,47 @@ class ComicCard(QFrame):
     COVER_WIDTH = 160
     COVER_HEIGHT = 220
 
-    def __init__(self, comic: ComicItem, parent=None):
+    def __init__(self, comic: ComicItem, parent=None, downloaded: bool | None = None):
         super().__init__(parent)
         self.comic = comic
+        # 网格批量预计算的"已下载"结果（True/False 时直接使用，避免卡片
+        # 各自遍历全表与磁盘 stat）；None 表示卡片按需自查（独立使用场景）
+        self._pre_downloaded: bool | None = downloaded
         # 本地已有封面时不创建网络管理器（避免每张卡片都初始化网络栈）
         self._network: QNetworkAccessManager | None = None
         self._manager = DownloadManager.instance()
+        self._task_id = self._manager._extract_id(comic.detail_url)
         self._translate_worker = None  # 保持翻译线程引用，防止被回收
         self._setup_ui()
         self._load_cover()
-        # 下载任务状态变化时同步按钮（卡片被销毁后 Qt 会自动断开连接）
-        self._manager.task_updated.connect(self._sync_download_button)
+        # 按任务定向响应：仅本作品的任务变化才同步按钮（避免每张卡片
+        # 在每次广播时都遍历全部任务）；卡片销毁后 Qt 自动断开连接
+        self._manager.task_changed.connect(self._on_task_changed)
+        self._manager.task_deleted.connect(self._on_task_deleted)
         self._sync_download_button()
+
+    def update_comic(self, comic: ComicItem, downloaded: bool | None = None):
+        """网格 diff 复用时更新卡片数据（标题/封面/下载状态）。"""
+        old = self.comic
+        self.comic = comic
+        self._task_id = self._manager._extract_id(comic.detail_url)
+        if downloaded is not None:
+            self._pre_downloaded = downloaded
+        self._update_title_label()
+        self._sync_download_button()
+        # 封面来源变化时重新加载（QPixmapCache 命中则直接复用，无需网络）
+        if comic.cover_path != old.cover_path or comic.cover_url != old.cover_url:
+            self._load_cover()
+
+    def _on_task_changed(self, task):
+        """下载任务变化回调：只响应本作品的任务（O(1) 过滤，免遍历任务列表）。"""
+        if task.task_id and task.task_id == self._task_id:
+            self._sync_download_button(task)
+
+    def _on_task_deleted(self, task):
+        """任务被删除回调：本作品任务被移除后，按钮重新自查（回到未下载状态）。"""
+        if task.task_id and task.task_id == self._task_id:
+            self._sync_download_button()
 
     def _setup_ui(self):
         self.setObjectName("comicCard")
@@ -230,6 +259,8 @@ class ComicCard(QFrame):
                 self._network = QNetworkAccessManager(self)
                 self._network.finished.connect(self._on_cover_reply)
             request = QNetworkRequest(self.comic.cover_url)
+            # 封面请求设置超时：QNAM 默认无限等待，站点慢时 reply 会长期挂起
+            request.setTransferTimeout(15000)
             self._network.get(request)
             return
 
@@ -296,7 +327,12 @@ class ComicCard(QFrame):
         self._sync_download_button()
 
     def _is_downloaded(self) -> bool:
-        """判断当前作品是否已下载（任务完成、数据库标记或下载目录文件夹）。"""
+        """判断当前作品是否已下载（任务完成、数据库标记或下载目录文件夹）。
+
+        优先使用网格批量预计算的结果（True/False），避免独立全表遍历与磁盘检查。
+        """
+        if self._pre_downloaded is not None:
+            return self._pre_downloaded
         task = self._manager.task_for(self.comic)
         if task and task.status == DownloadTask.DONE:
             return True
@@ -304,9 +340,14 @@ class ComicCard(QFrame):
 
         return is_downloaded(self.comic.detail_url, self.comic.title)
 
-    def _sync_download_button(self):
-        """根据下载管理器中的任务状态，同步按钮文本与可用性。"""
-        task = self._manager.task_for(self.comic)
+    def _sync_download_button(self, task: DownloadTask | None = None):
+        """根据下载管理器中的任务状态，同步按钮文本与可用性。
+
+        Args:
+            task: 定向信号传入的本作品任务（免遍历任务列表）；None 时自行查找。
+        """
+        if task is None:
+            task = self._manager.task_for(self.comic)
         if task is None:
             self.download_btn.setEnabled(True)
             self.download_btn.setText("下载")

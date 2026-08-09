@@ -4,6 +4,7 @@
 """
 import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from src.utils import data_root, display_title_for_comic, safe_filename
@@ -86,6 +87,50 @@ def _invalidate_records_cache():
     _comics_records = None
 
 
+def _update_records_cache(records: list[dict]):
+    """将新抓取的记录增量合并进缓存（按 detail_url upsert）。
+
+    相比直接失效缓存（下次访问全表重查），翻页抓取时缓存持续累积，
+    避免每次翻页都触发一次 SQLite 全表查询。
+    """
+    global _comics_records
+    if _comics_records is None:
+        # 缓存未初始化：直接作为初始数据（与数据库内容一致）
+        _comics_records = records
+        return
+    merged = {r["detail_url"]: r for r in _comics_records}
+    for rec in records:
+        url = rec.get("detail_url", "")
+        prev = merged.get(url)
+        if prev is not None:
+            # 保留 SQL 中 COALESCE 保住、但爬虫数据里没有的字段（翻译名/下载标记/完成时间）
+            merged_rec = dict(rec)
+            merged_rec.setdefault("translated_title", prev.get("translated_title", ""))
+            merged_rec.setdefault("downloaded", prev.get("downloaded", 0))
+            merged_rec.setdefault("downloaded_at", prev.get("downloaded_at", ""))
+            merged[url] = merged_rec
+        else:
+            merged[url] = rec
+    _comics_records = list(merged.values())
+
+
+def _upsert_cached_record(record: dict):
+    """按 detail_url 就地更新缓存中的记录；缓存中不存在时追加一条。
+
+    用于翻译名/下载标记等单条更新：保证缓存与数据库一致，
+    即使该记录不在当前缓存（如重启后从 tasks.json 恢复的任务）。
+    """
+    global _comics_records
+    if _comics_records is None:
+        return
+    url = record.get("detail_url", "")
+    for rec in _comics_records:
+        if rec.get("detail_url") == url:
+            rec.update(record)
+            return
+    _comics_records.append(record)
+
+
 def _cached_records() -> list[dict]:
     """读取全部漫画记录并缓存，避免渲染每张卡片时重复全表查询。"""
     global _comics_records
@@ -100,6 +145,40 @@ def is_downloaded(detail_url: str, title: str) -> bool:
         if record.get("detail_url") == detail_url:
             return is_comic_downloaded(record)
     return is_comic_downloaded({"downloaded": 0, "title": title})
+
+
+def is_comics_downloaded(items: list[tuple[str, str, str, str]]) -> dict[str, bool]:
+    """批量判断一批作品是否已下载，返回 {detail_url: bool}。
+
+    Args:
+        items: [(detail_url, title, translated_title, category_label), ...]，
+            数据来自 ComicItem，避免此处依赖 ui 层类型。
+
+    与逐个调用 is_downloaded 相比：只做一次已下载标记查询与
+    每作品一次的目录检查，替代"每卡片遍历全表 + 重复 stat"。
+    """
+    from src.config import ProjectConfig
+
+    base = Path(ProjectConfig().download_dir)
+    downloaded_urls = {
+        r["detail_url"] for r in _cached_records() if r.get("downloaded")
+    }
+    result: dict[str, bool] = {}
+    for detail_url, title, translated_title, category_label in items:
+        if not detail_url:
+            result[detail_url] = False
+            continue
+        if detail_url in downloaded_urls:
+            result[detail_url] = True
+            continue
+        result[detail_url] = _match_download_folder(
+            base,
+            title,
+            category_label,
+            translated_title,
+            _extract_aid(detail_url) or "",
+        )
+    return result
 
 
 class DatabaseManager:
@@ -133,15 +212,20 @@ class DatabaseManager:
                     category TEXT DEFAULT '',
                     category_label TEXT DEFAULT '',
                     downloaded INTEGER DEFAULT 0,
+                    downloaded_at TEXT DEFAULT '',
                     updated_at TEXT DEFAULT (datetime('now', 'localtime'))
                 )
                 """
             )
-            # 兼容旧库：补充 downloaded / aid / translated_title 列，并对 aid 做一次性回填
+            # 兼容旧库：补充 downloaded / downloaded_at / aid / translated_title 列，并对 aid 做一次性回填
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(comics)")}
             if "downloaded" not in cols:
                 conn.execute(
                     "ALTER TABLE comics ADD COLUMN downloaded INTEGER DEFAULT 0"
+                )
+            if "downloaded_at" not in cols:
+                conn.execute(
+                    "ALTER TABLE comics ADD COLUMN downloaded_at TEXT DEFAULT ''"
                 )
             if "aid" not in cols:
                 conn.execute("ALTER TABLE comics ADD COLUMN aid INTEGER")
@@ -174,11 +258,14 @@ class DatabaseManager:
                 """
                 INSERT OR REPLACE INTO comics
                     (detail_url, aid, title, translated_title, date,
-                     image_count, cover_url, category, category_label, downloaded)
+                     image_count, cover_url, category, category_label,
+                     downloaded, downloaded_at)
                 VALUES (?, ?, ?, COALESCE(
                     (SELECT translated_title FROM comics WHERE detail_url = ?), ''),
                     ?, ?, ?, ?, ?, COALESCE(
-                    (SELECT downloaded FROM comics WHERE detail_url = ?), 0))
+                    (SELECT downloaded FROM comics WHERE detail_url = ?), 0),
+                    COALESCE(
+                    (SELECT downloaded_at FROM comics WHERE detail_url = ?), ''))
                 """,
                 [
                     (
@@ -192,11 +279,14 @@ class DatabaseManager:
                         c.get("category", ""),
                         c.get("category_label", ""),
                         c.get("detail_url", ""),
+                        c.get("detail_url", ""),
                     )
                     for c in comics
                 ],
             )
-        _invalidate_records_cache()
+        # 增量合并缓存：新抓取的记录直接并入（含 COALESCE 保留字段），
+        # 不触发下次访问时的全表重查
+        _update_records_cache(comics)
 
     def save_translated_title(self, detail_url: str, translated_title: str):
         """保存作品名称的翻译结果（不存在该记录时插入一条最小记录）。"""
@@ -216,16 +306,22 @@ class DatabaseManager:
                     """,
                     (detail_url, translated_title),
                 )
-        _invalidate_records_cache()
+        _upsert_cached_record(
+            {"detail_url": detail_url, "translated_title": translated_title}
+        )
 
     def mark_downloaded(self, detail_url: str):
-        """将指定作品标记为已下载。"""
+        """将指定作品标记为已下载，并记录下载完成时间（downloaded_at）。"""
+        downloaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._connect() as conn:
             conn.execute(
-                "UPDATE comics SET downloaded = 1, updated_at = datetime('now', 'localtime') WHERE detail_url = ?",
-                (detail_url,),
+                "UPDATE comics SET downloaded = 1, downloaded_at = ?, "
+                "updated_at = datetime('now', 'localtime') WHERE detail_url = ?",
+                (downloaded_at, detail_url),
             )
-        _invalidate_records_cache()
+        _upsert_cached_record(
+            {"detail_url": detail_url, "downloaded": 1, "downloaded_at": downloaded_at}
+        )
 
     def load_comics(self, category: str | None = None, limit: int | None = None) -> list[dict]:
         """读取漫画记录，按作品 ID（aid）倒序（最新上传优先）。

@@ -5,7 +5,54 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [1.2.16] - 2026-08-09
+## [1.2.18] - 2026-08-09
+
+### 新增
+
+- 下载管理对话框支持**右键删除任务**：选中一行或多行后右键弹出「删除任务」，确认后移除任务记录（不影响已下载的磁盘文件）；运行中的任务删除时先请求中断并限时等待（`ui/dialogs/download_manager_dialog.py`、`ui/download_manager.py::delete_task`）
+- 任务删除后相关漫画卡片的下载按钮自动回到未下载状态（新增 `task_deleted` 定向信号，`ui/widgets/comic_card.py`）
+- 下载完成的任务**重启后自动隐藏**：`_load_tasks` 不再恢复 DONE 任务（已下载状态由数据库 `downloaded` 字段与磁盘目录检查负责，不受影响）；失败/中断任务仍保留（中断任务标记为"程序已退出，任务中断"）（`ui/download_manager.py`）
+- 数据库新增**下载完成时间字段** `downloaded_at`：旧库自动迁移（ALTER TABLE），下载完成时由 `mark_downloaded` 自动写入本地时间；翻页重新抓取（INSERT OR REPLACE）时通过 COALESCE 保留完成时间不丢失（`ui/database.py`）
+- 数据库管理对话框新增「下载完成时间」列展示（`ui/dialogs/database_dialog.py`）
+
+### 测试
+
+- 新增 6 个测试用例（106 → 111）：任务删除（移除/持久化/信号/no-op）、DONE 任务重启隐藏、失败/中断任务重启保留、`downloaded_at` 写入与翻页保留、对话框右键删除集成；更新原有"重启恢复 DONE 任务"用例为新的隐藏语义
+
+## [1.2.17] - 2026-08-09
+
+### 安全修复
+
+- 修复 zip 解压路径穿越（zip-slip，CVE-2007-4559）：解压前统一校验所有条目路径，拒绝绝对路径 / 盘符前缀 / `..` 段 / 符号链接条目，7z 与 zipfile 两种解压路径均生效（`src/downloader.py::_safe_zip_members`）
+- 修复文件名清洗漏网：`safe_filename` 拒绝纯 `.`/`..`（可穿越下载目录到父级）、Windows 保留设备名（CON/NUL/COM1 等）、控制字符与尾随点/空格（`src/utils.py`）
+
+### 修复
+
+- 修复搜索/分类切换竞态导致搜索结果污染本地数据库与缓存：抓取调度引入请求序号（stale-guard），过期结果直接丢弃；worker 繁忙时新请求不再静默丢弃，记录为待执行请求、完成后立即执行（`ui/main_window.py`）
+- 修复 `self._worker` 引用竞态：`_on_fetch_finished` 仅在序号匹配时清空引用，避免旧 worker 的 finished 覆盖新 worker 导致多线程并发与结果乱序
+- 修复连点翻页请求被静默丢弃：worker 运行中的翻页/切分类请求进入待执行队列，页码与数据不再不符
+- 修复网络重试只覆盖 HTTP 状态码：`fetch_with_retry`/`fetch_page_with_cookies` 对连接错误（ConnectionError）与超时（Timeout）同样指数退避重试，两处重复重试逻辑合并为 `_request_with_retry`（`src/net.py`）
+- 修复图片逐张下载绕过全局节流：`_download_one` 复用全局 `_throttle()`，请求密度与页面抓取统一受控（`src/wnacg_crawler.py`）
+- 修复图片下载整批中断：单张失败（重试耗尽）只记录不中断，其余图片继续下载，返回失败数量供累计进度修正；下载改为流式写入（iter_content）并清理 `.part` 残留
+- 修复 `download_workers`/`download_retries` 无校验：并发数夹取至 [1, 8]，重试次数夹取至 [0, 10]（`src/config.py`）
+- 修复 7z 解压 `-o` 参数对含空格路径不可靠：改用 `cwd` 指定解压目录；7z 错误输出按 GBK/UTF-8 优先级解码（`src/downloader.py`）
+- 修复封面网络请求无超时（QNAM 默认无限等待）：设置 15s 传输超时（`ui/widgets/comic_card.py`）
+- 修复模块级 `logging.basicConfig` 副作用：作为库导入时不再改动调用方 root logger 配置，仅在独立运行/未配置日志时初始化（`src/wnacg_crawler.py`）
+
+### 性能
+
+- 数据库缓存增量合并：`save_comics` 将新抓取记录直接并入内存缓存（保留翻译名/下载标记），翻页抓取不再触发 SQLite 全表重查；翻译/下载标记就地更新缓存（`ui/database.py`）
+- 已下载状态批量判断：网格渲染时一次性计算整批作品的已下载状态（单次遍历 + 每作品一次目录检查），替代每张卡片独立遍历全表与重复磁盘 stat（`ui/database.py::is_comics_downloaded`）
+- 漫画卡片按 `detail_url` diff 复用：翻页/刷新仅重建新增与移除的卡片，相同作品直接更新数据，不再全量销毁重建（`ui/widgets/comics_grid.py`、`ui/widgets/comic_card.py::update_comic`）
+- 下载状态信号定向分发：新增携带任务的 `task_changed` 信号，卡片按作品 ID O(1) 过滤响应，不再每次广播遍历全部任务列表（`ui/download_manager.py`、`ui/widgets/comic_card.py`）
+- 网络层引入 `requests.Session` 连接池：页面请求复用 TCP/TLS 连接，一部 18 页作品约 234 次请求不再反复握手（`src/net.py`）
+- 编码检测优化：优先响应头 charset，仅在无有效声明时才做 `apparent_encoding` 全文检测（`src/net.py::_decode_encoding`）
+- 7z 解压进度监控轮询间隔 50ms → 500ms，解压数千文件时显著降低 IO 开销（`src/downloader.py`）
+- 关闭窗口不再同步等待下载线程：closeEvent 仅请求中断（不阻塞），统一由应用退出流程限时收尾，关窗即时响应（`ui/main_window.py`、`ui/download_manager.py::request_interruption`）
+
+### 测试
+
+- 新增 28 个测试用例（78 → 106）：safe_filename 安全清洗、zip-slip 拒绝（`..`/绝对路径/盘符/符号链接）、解压安全、图片下载失败聚合与 `.part` 清理、网络重试（连接错误/超时/限流重试、4xx 不重试、耗尽抛错）、数据库增量缓存，全部离线运行
 
 ### 修复
 

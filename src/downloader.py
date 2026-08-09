@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from lxml import html
 
@@ -184,6 +184,32 @@ def _find_7z() -> str | None:
     return None
 
 
+def _safe_zip_members(zf: zipfile.ZipFile) -> list[str]:
+    """校验 zip 内所有条目路径安全，返回通过校验的成员名列表。
+
+    防御 zip-slip（CVE-2007-4559，Python < 3.11 的 extract 无内置防护）：
+    - 拒绝绝对路径（如 ``/etc/passwd``）与盘符前缀（如 ``C:\\evil``）；
+    - 拒绝含 ``..`` 段的条目（可写出到解压目录之外）；
+    - 拒绝符号链接条目（symlink 可指向任意路径，配合后续写入造成写穿）。
+
+    Raises:
+        ValueError: 存在不安全条目时抛出（中止解压）。
+    """
+    members = []
+    for info in zf.infolist():
+        raw = info.filename
+        parts = PurePosixPath(raw.replace("\\", "/")).parts
+        if (
+            raw.startswith(("/", "\\"))
+            or re.match(r"^[A-Za-z]:", raw)
+            or any(part == ".." for part in parts)
+            or (info.external_attr >> 16) & 0o170000 == 0o120000  # S_IFLNK
+        ):
+            raise ValueError(f"压缩包包含不安全的条目路径: {raw!r}")
+        members.append(raw)
+    return members
+
+
 def _extract_archive(
     archive_path: Path,
     save_dir: Path,
@@ -194,12 +220,19 @@ def _extract_archive(
 ) -> None:
     """解压压缩包到 save_dir：优先使用 7z（快、中文文件名稳），回退内置 zipfile。
 
+    解压前统一校验 zip 条目路径安全（zip-slip 防御），
+    无论 7z 还是 zipfile 模式，不安全的压缩包一律拒绝解压。
+
     Args:
         progress_callback: 可选回调 (当前进度, 100)。进度统一为 0-100 的百分比，
             可用 base/span 将本阶段映射到整体进度区间（如下载占 0-80，解压占 80-100）。
         total_files: zip 内的文件总数（zipfile 模式用于逐文件进度计算）。
         base/span: 本阶段在整体进度中的起始值与跨度（默认 0-100）。
     """
+    with zipfile.ZipFile(archive_path) as zf:
+        safe_names = _safe_zip_members(zf)
+    total_files = total_files or len(safe_names)
+
     seven_zip = _find_7z()
     if seven_zip:
         try:
@@ -212,9 +245,7 @@ def _extract_archive(
 
     logger.info("使用内置 zipfile 解压: %s", archive_path)
     with zipfile.ZipFile(archive_path) as zf:
-        names = zf.namelist()
-        total_files = total_files or len(names)
-        for i, name in enumerate(names, 1):
+        for i, name in enumerate(safe_names, 1):
             zf.extract(name, save_dir)
             if progress_callback and total_files:
                 pct = min(int(i * span / total_files), span)
@@ -239,8 +270,12 @@ def _extract_with_7z(
     """
     # 仅 Windows 生效：不创建控制台窗口（7z.exe 是控制台程序，默认会闪窗）
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    # 用 cwd 指定解压目标目录而非 `-o` 参数：7z 的 -o 对含空格路径解析不可靠，
+    # cwd 方式彻底规避，且解压结构（含归档内子目录）与目标目录语义一致。
+    save_dir.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(
-        [seven_zip, "x", "-y", f"-o{save_dir}", str(archive_path)],
+        [seven_zip, "x", "-y", str(archive_path)],
+        cwd=str(save_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         creationflags=creationflags,
@@ -259,7 +294,7 @@ def _extract_with_7z(
                     last = count
                     pct = min(int(count * span / total_files), span)
                     progress_callback(base + pct, 100)
-            stop_monitor.wait(0.05)
+            stop_monitor.wait(0.5)
 
     monitor = threading.Thread(target=_monitor, daemon=True)
     monitor.start()
@@ -271,7 +306,17 @@ def _extract_with_7z(
         if proc.poll() is None:
             proc.kill()
     if proc.returncode != 0:
-        stderr = proc.stderr.read().decode("utf-8", "ignore")
+        # 中文系统 7z 输出为 GBK/cp936，按编码优先级尝试解码，失败再宽容替换
+        raw_err = proc.stderr.read()
+        stderr = None
+        for encoding in ("gbk", "utf-8"):
+            try:
+                stderr = raw_err.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if stderr is None:
+            stderr = raw_err.decode("utf-8", "replace")
         raise RuntimeError(f"7z 解压失败: {stderr}")
     if progress_callback:
         progress_callback(base + span, 100)
@@ -469,14 +514,14 @@ def download_comic(
         def _batch_cb(cur: int, _total: int, _base: int = grand_done, _all: int = grand_total):
             progress_callback(_base + cur, _all)
 
-        download_pictures(
+        failed = download_pictures(
             batch,
             save_dir,
             _batch_cb if progress_callback else None,
             max_workers=workers,
             max_retries=retries,
         )
-        grand_done += len(batch)
+        grand_done += len(batch) - failed
         logger.info(
             "第 %d-%d 页下载完成，累计 %d/%d 张图片",
             batch_start, batch_end, grand_done, grand_total,

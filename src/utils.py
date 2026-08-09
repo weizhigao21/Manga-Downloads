@@ -4,6 +4,13 @@ import re
 import sys
 from pathlib import Path
 
+# Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9，含 "CON.txt" 这类带扩展名变体）
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
 
 def safe_filename(name: str) -> str:
     """将名称转换为可用的目录名。
@@ -12,11 +19,35 @@ def safe_filename(name: str) -> str:
     - 半角/全角斜杠与竖线（\\ / ／ ＼ | ｜）：替换为下划线，避免被当作路径分隔符
     - 半角/全角 &（& ＆）：替换为下划线
     - : * ? " < > 等非法字符：替换为下划线
+    - 控制字符（\\x00-\\x1f、\\x7f）：替换为下划线
+
+    同时防御路径穿越与 Windows 命名规则：
+    - 纯 "." / ".."（可解析到父目录）→ 返回 "untitled"
+    - 尾随点/空格（Windows 不允许）→ 去除
+    - 保留设备名（CON/NUL/COM1 等，含扩展名变体）→ 前缀下划线规避
+
+    Args:
+        name: 原始名称（可能来自网站标题等不可信输入）。
+
+    Returns:
+        可安全用于目录/文件名的字符串，绝不包含路径分隔符或穿越段。
     """
     name = re.sub(r'[\\/:*?"<>|｜／＼]', "_", name)
     name = name.replace("&", "_").replace("＆", "_")
+    name = re.sub(r"[\x00-\x1f\x7f]", "_", name)
     name = re.sub(r"_+", "_", name).strip(" _")
-    return name or "untitled"
+    # 纯 "." / ".." 是路径穿越段，直接丢弃
+    if not name or name in (".", ".."):
+        return "untitled"
+    # Windows 不允许目录/文件名以点或空格结尾
+    name = name.rstrip(". ")
+    if not name:
+        return "untitled"
+    # Windows 保留设备名（含 "CON.txt" 变体）：前缀下划线即可合法使用
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    return name
 
 
 def data_root() -> Path:

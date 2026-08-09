@@ -34,6 +34,40 @@ class TestSafeFilename:
         assert safe_filename("普通标题-01") == "普通标题-01"
 
 
+class TestSafeFilenameSecurity:
+    """safe_filename 路径穿越与 Windows 命名规则防御。"""
+
+    def test_dot_and_dotdot_return_untitled(self):
+        assert safe_filename("..") == "untitled"
+        assert safe_filename(".") == "untitled"
+
+    def test_trailing_dots_stripped(self):
+        assert safe_filename("标题.") == "标题"
+        assert safe_filename("标题...") == "标题"
+
+    def test_windows_reserved_names_prefixed(self):
+        assert safe_filename("CON") == "_CON"
+        assert safe_filename("con.txt") == "_con.txt"
+        assert safe_filename("NUL") == "_NUL"
+        assert safe_filename("COM1") == "_COM1"
+        assert safe_filename("LPT9") == "_LPT9"
+
+    def test_control_chars_replaced(self):
+        assert safe_filename("a\x00b") == "a_b"
+        assert safe_filename("a\x1fb") == "a_b"
+
+    def test_dotdot_as_plain_text_kept(self):
+        # 中间的 ".." 只是普通文本（不构成路径段），正常保留
+        assert safe_filename("a..b") == "a..b"
+
+    def test_no_path_traversal_segments(self):
+        # 拼接场景：safe_filename 结果绝不能是 "." / ".." / 含分隔符
+        result = safe_filename("..\\..\\evil")
+        assert "\\" not in result
+        assert "/" not in result
+        assert result not in (".", "..")
+
+
 class TestDataRoot:
     def test_points_to_project_root(self):
         root = data_root()

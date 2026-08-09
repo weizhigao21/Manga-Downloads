@@ -45,6 +45,12 @@ class MainWindow(QMainWindow):
         self._silent_fetch: bool = False
         self._current_page: int = 1
         self._search_keyword: str = ""  # 非空时处于"关键词搜索"模式
+        # 请求序号：每次发起新抓取递增；worker 完成回调时校验序号，
+        # 过期结果（期间已发起新请求）直接丢弃，防止旧结果覆盖/污染数据。
+        self._fetch_seq: int = 0
+        # 待执行请求：worker 繁忙时记录 (silent, page)，当前 worker 结束后立即执行，
+        # 避免连点翻页/切换分类时请求被静默丢弃。
+        self._pending_request: tuple[bool, int] | None = None
         self._settings = AppSettings()
         self._project_config = ProjectConfig()
         self._setup_ui()
@@ -340,12 +346,23 @@ class MainWindow(QMainWindow):
     def _start_fetch(self, silent: bool = False, page: int | None = None):
         """启动后台抓取/搜索线程。
 
+        worker 繁忙（信号槽为异步排队，期间状态可能已变化）时不再静默丢弃
+        新请求，而是记录为待执行请求，当前 worker 结束后立即执行。
+
         Args:
             silent: 为 True 时出错不弹窗，仅在状态栏提示（用于启动自动刷新）。
             page: 要抓取的页码，默认使用当前页码。
         """
         if self._worker and self._worker.isRunning():
+            # 记录最新请求（连点翻页/切分类时只保留最后一次），完成后立即执行
+            self._pending_request = (silent, page if page is not None else self._current_page)
             return
+        self._launch_fetch(silent, page)
+
+    def _launch_fetch(self, silent: bool, page: int | None):
+        """实际创建并启动抓取线程，绑定本次请求序号。"""
+        self._fetch_seq += 1
+        seq = self._fetch_seq
 
         if page is not None and page >= 1:
             self._current_page = page
@@ -365,8 +382,12 @@ class MainWindow(QMainWindow):
             page=self._current_page,
             keyword=self._search_keyword,
         )
-        self._worker.finished.connect(self._on_fetch_finished)
-        self._worker.error.connect(self._on_fetch_error)
+        self._worker.finished.connect(
+            lambda raw, s=seq: self._on_fetch_finished(raw, s)
+        )
+        self._worker.error.connect(
+            lambda msg, s=seq: self._on_fetch_error(msg, s)
+        )
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.error.connect(self._worker.deleteLater)
         self._worker.start()
@@ -376,7 +397,13 @@ class MainWindow(QMainWindow):
         if page >= 1:
             self._start_fetch(page=page)
 
-    def _on_fetch_finished(self, raw_comics: list[dict]):
+    def _on_fetch_finished(self, raw_comics: list[dict], seq: int):
+        """抓取线程完成回调；seq 与当前请求不符时视为过期结果，直接丢弃。"""
+        if seq != self._fetch_seq:
+            # 期间已发起新请求（搜索/切分类/翻页），旧结果不再使用：
+            # 避免搜索结果被当成列表写入数据库/缓存（数据污染）
+            return
+        self._worker = None
         self.progress_bar.setVisible(False)
         if self._search_keyword:
             # 搜索结果仅展示，不写入缓存与数据库（避免污染下次启动的本地数据）
@@ -401,16 +428,27 @@ class MainWindow(QMainWindow):
                 self.set_status(
                     f"第 {self._current_page} 页：共 {len(raw_comics)} 部漫画"
                 )
-        self._worker = None
+        self._run_pending_request()
 
-    def _on_fetch_error(self, message: str):
+    def _on_fetch_error(self, message: str, seq: int):
+        """抓取线程错误回调；过期请求的错误同样丢弃，不打扰用户。"""
+        if seq != self._fetch_seq:
+            return
+        self._worker = None
         self.progress_bar.setVisible(False)
         if self._silent_fetch:
             self.set_status(f"自动抓取失败: {message}")
         else:
             QMessageBox.critical(self, "抓取失败", f"抓取过程中出现错误:\n{message}")
             self.set_status("抓取失败")
-        self._worker = None
+        self._run_pending_request()
+
+    def _run_pending_request(self):
+        """当前 worker 结束后，若期间有排队请求则立即执行。"""
+        if self._pending_request is not None:
+            silent, page = self._pending_request
+            self._pending_request = None
+            self._start_fetch(silent=silent, page=page)
 
     # ---- 工具栏回调 ----
 
@@ -453,9 +491,11 @@ class MainWindow(QMainWindow):
 
         1. 抓取线程：引用由全局线程注册表持有（ui/threads.py），
            应用退出时统一中断并限时强制终止，此处不阻塞；
-        2. 下载线程：请求中断并短时等待（写文件为原子替换，
-           超时强制终止也不会损坏数据），保证退出不卡顿。
+        2. 下载线程：此处仅请求中断（不等待），让线程在下一个检查点
+           退出；最终限时收尾由应用退出流程（aboutToQuit → shutdown）
+           完成，关闭窗口不再同步阻塞 2.5s（写文件为原子替换，
+           中断/强制终止也不会损坏数据）。
         """
         self._worker = None
-        DownloadManager.instance().shutdown(timeout_ms=2500)
+        DownloadManager.instance().request_interruption()
         super().closeEvent(event)

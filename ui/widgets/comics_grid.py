@@ -32,27 +32,58 @@ class ComicsGrid(QScrollArea):
         # 当前持有的卡片与已计算列数；列数未变化时 resize 重排直接跳过
         self._cards: list[ComicCard] = []
         self._columns = 0
+        self._empty_label: QLabel | None = None
 
     def render(self, comics: list[ComicItem]):
-        """渲染漫画列表，替换旧卡片（仅数据变化时调用）。
+        """渲染漫画列表（刷新/翻页/搜索产生新数据时调用，自动回到列表顶部）。
 
-        刷新/翻页/搜索产生新数据时自动回到列表顶部。
+        与全量重建相比：
+        - 已下载状态批量预计算（一次磁盘检查替代每卡片独立扫描）；
+        - 按 detail_url 复用相同作品的卡片（更新数据），仅重建新增/移除的。
         """
-        self._clear()
-        self.verticalScrollBar().setValue(0)
-        self._cards = []
+        if self._empty_label is not None:
+            self._grid.removeWidget(self._empty_label)
+            self._empty_label.deleteLater()
+            self._empty_label = None
+
+        # 批量预计算"已下载"状态：单次遍历缓存 + 每作品一次目录检查
+        from ui.database import is_comics_downloaded
+
+        downloaded_map = is_comics_downloaded(
+            [
+                (c.detail_url, c.title, c.translated_title, c.display_category_label)
+                for c in comics
+            ]
+        )
+
+        # 按 detail_url diff：复用相同作品卡片，仅重建新增与移除的
+        old = {c.comic.detail_url: c for c in self._cards}
+        new_cards: list[ComicCard] = []
+        for comic in comics:
+            card = old.pop(comic.detail_url, None)
+            if card is None:
+                card = ComicCard(comic, downloaded=downloaded_map.get(comic.detail_url))
+            else:
+                card.update_comic(
+                    comic, downloaded=downloaded_map.get(comic.detail_url)
+                )
+            new_cards.append(card)
+        for stale in old.values():
+            stale.deleteLater()
+
+        self._cards = new_cards
         self._columns = 0
+        self.verticalScrollBar().setValue(0)
 
         if not comics:
             empty_label = QLabel("暂无数据")
             empty_label.setAlignment(Qt.AlignCenter)
             empty_label.setStyleSheet("font-size: 16px; color: #9CA3AF; margin-top: 80px;")
+            self._empty_label = empty_label
             self._grid.addWidget(empty_label, 0, 0, 1, 1)
             self._grid.setColumnStretch(1, 1)
             return
 
-        for comic in comics:
-            self._cards.append(ComicCard(comic))
         self._reflow()
 
     def reflow(self):
@@ -81,11 +112,3 @@ class ComicsGrid(QScrollArea):
         for col in range(columns + 1):
             self._grid.setColumnStretch(col, 0)
         self._grid.setColumnStretch(columns, 1)
-
-    def _clear(self):
-        """清空网格中的所有旧卡片。"""
-        while self._grid.count():
-            item = self._grid.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()

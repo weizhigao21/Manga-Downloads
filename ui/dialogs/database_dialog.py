@@ -118,8 +118,10 @@ class DatabaseDialog(QDialog):
         layout.addLayout(stats_row)
 
         # 记录表格
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["ID", "名称", "日期", "张数", "是否下载"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["ID", "名称", "日期", "张数", "是否下载", "下载完成时间"]
+        )
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(True)
@@ -131,6 +133,7 @@ class DatabaseDialog(QDialog):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         layout.addWidget(self.table)
 
         # 操作按钮
@@ -193,6 +196,14 @@ class DatabaseDialog(QDialog):
                 4,
                 "已下载" if downloaded else "未下载",
                 color="#16A34A" if downloaded else PALETTE["text_secondary"],
+            )
+
+            downloaded_at = record.get("downloaded_at", "")
+            self._set_cell(
+                row,
+                5,
+                downloaded_at if downloaded and downloaded_at else "—",
+                color=PALETTE["text_secondary"],
             )
         self.table.resizeRowsToContents()
 

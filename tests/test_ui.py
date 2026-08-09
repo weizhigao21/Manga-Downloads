@@ -209,9 +209,34 @@ class TestDownloadManager:
     def test_shutdown_without_tasks_returns_immediately(self, fresh_manager):
         fresh_manager.shutdown(timeout_ms=50)
 
+    def test_delete_task_removes_and_emits(self, fresh_manager):
+        """删除任务：从列表移除、持久化、发出 task_deleted 信号。"""
+        task = DownloadTask("1", "作品1", "/x-aid-1.html")
+        task.status = DownloadTask.DONE
+        fresh_manager.tasks = [task]
+
+        deleted: list = []
+        fresh_manager.task_deleted.connect(lambda t: deleted.append(t))
+
+        fresh_manager.delete_task(task)
+
+        assert fresh_manager.tasks == []
+        assert deleted == [task]
+        # 持久化已同步：重新加载后列表为空
+        dm.DownloadManager._instance = None
+        restored = dm.DownloadManager.instance()
+        assert restored.tasks == []
+
+    def test_delete_unknown_task_noop(self, fresh_manager):
+        other = DownloadTask("9", "别的作品", "/x-aid-9.html")
+        fresh_manager.tasks = []
+        fresh_manager.delete_task(other)  # 不在列表中的任务：安全 no-op
+        assert fresh_manager.tasks == []
+
 
 class TestTaskPersistence:
-    def test_roundtrip_restores_done_task(self, fresh_manager, monkeypatch, tmp_path):
+    def test_done_task_hidden_after_restart(self, fresh_manager, monkeypatch, tmp_path):
+        """下载完成的任务重启后自动隐藏（不恢复显示）。"""
         done = DownloadTask("10002", "作品B", "/x-aid-10002.html")
         done.status = DownloadTask.DONE
         done.current = done.total = 5
@@ -221,9 +246,24 @@ class TestTaskPersistence:
         # 模拟重启：重置单例重新加载
         dm.DownloadManager._instance = None
         restored = dm.DownloadManager.instance()
-        assert len(restored.tasks) == 1
-        assert restored.tasks[0].status == DownloadTask.DONE
-        assert restored.tasks[0].current == 5
+        assert restored.tasks == []  # DONE 任务被过滤
+
+    def test_failed_and_interrupted_tasks_kept_on_restart(self, fresh_manager):
+        """失败任务保留可重试；中断任务标记为失败。"""
+        failed = DownloadTask("2", "失败", "/x-aid-2.html")
+        failed.status = DownloadTask.FAILED
+        running = DownloadTask("3", "中断", "/x-aid-3.html")
+        running.status = DownloadTask.DOWNLOADING
+        fresh_manager.tasks = [failed, running]
+        fresh_manager._save_tasks()
+
+        dm.DownloadManager._instance = None
+        restored = dm.DownloadManager.instance()
+        ids = [t.task_id for t in restored.tasks]
+        assert ids == ["2", "3"]
+        assert restored.tasks[0].status == DownloadTask.FAILED
+        assert restored.tasks[1].status == DownloadTask.FAILED
+        assert restored.tasks[1].error == "程序已退出，任务中断"
 
     def test_running_task_marked_interrupted(self, fresh_manager):
         running = DownloadTask("10001", "作品A", "/x-aid-10001.html")
@@ -333,3 +373,146 @@ class TestDownloadManagerDialog:
         dialog._refresh()
         assert not failed_btn.isVisibleTo(dialog)
         dialog.close()
+
+    def test_delete_selected_tasks(self, fresh_manager, qtbot, monkeypatch):
+        """右键删除：确认后移除选中任务并刷新表格（不删磁盘文件）。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        from ui.dialogs.download_manager_dialog import DownloadManagerDialog
+
+        t1 = DownloadTask("1", "作品1", "/x-aid-1.html")
+        t2 = DownloadTask("2", "作品2", "/x-aid-2.html")
+        fresh_manager.tasks = [t1, t2]
+
+        dialog = DownloadManagerDialog()
+        qtbot.addWidget(dialog)
+        dialog._refresh()
+        assert dialog.table.rowCount() == 2
+
+        monkeypatch.setattr(
+            "ui.dialogs.download_manager_dialog.QMessageBox.question",
+            lambda *args, **kwargs: QMessageBox.Yes,
+        )
+        dialog._delete_selected_tasks([0])
+
+        assert fresh_manager.tasks == [t2]  # 仅移除选中任务
+        assert dialog.table.rowCount() == 1  # 表格已刷新
+        dialog.close()
+
+
+class TestDatabaseIncrementalCache:
+    """增量缓存：save_comics 后不再触发全表重查；翻译/下载标记就地更新缓存。"""
+
+    def test_save_comics_merges_without_full_requery(self, monkeypatch, tmp_path):
+        import ui.database as db
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "cache.db")
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        manager = db.DatabaseManager.instance()
+        try:
+            # 首次访问触发一次全表查询
+            assert db._cached_records() == []
+            calls = [0]
+            original_load = manager.load_comics
+
+            def counting_load(*args, **kwargs):
+                calls[0] += 1
+                return original_load(*args, **kwargs)
+
+            monkeypatch.setattr(manager, "load_comics", counting_load)
+
+            manager.save_comics(
+                [{"detail_url": "/x-aid-1.html", "title": "作品1", "image_count": 5}]
+            )
+            manager.save_comics(
+                [{"detail_url": "/x-aid-2.html", "title": "作品2", "image_count": 8}]
+            )
+            # 增量合并：两次 save 都不触发数据库查询
+            urls = {r["detail_url"] for r in db._cached_records()}
+            assert urls == {"/x-aid-1.html", "/x-aid-2.html"}
+            assert calls[0] == 0
+
+            # 翻译名就地更新缓存，且不触发查询
+            manager.save_translated_title("/x-aid-1.html", "翻译名1")
+            rec1 = next(
+                r for r in db._cached_records() if r["detail_url"] == "/x-aid-1.html"
+            )
+            assert rec1["translated_title"] == "翻译名1"
+            assert calls[0] == 0
+
+            # 下载标记就地更新缓存，且不触发查询
+            manager.mark_downloaded("/x-aid-2.html")
+            rec2 = next(
+                r for r in db._cached_records() if r["detail_url"] == "/x-aid-2.html"
+            )
+            assert rec2["downloaded"] == 1
+            assert calls[0] == 0
+        finally:
+            db.DatabaseManager._instance = None
+            db._invalidate_records_cache()
+
+    def test_cache_preserves_translation_on_remerge(self, monkeypatch, tmp_path):
+        """再次抓取同一作品（爬虫数据无翻译字段）时，缓存保留已保存的翻译名。"""
+        import ui.database as db
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "merge.db")
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        manager = db.DatabaseManager.instance()
+        try:
+            manager.save_comics(
+                [{"detail_url": "/x-aid-9.html", "title": "原名", "image_count": 3}]
+            )
+            manager.save_translated_title("/x-aid-9.html", "翻译名")
+            # 模拟翻页再次抓取同一作品（爬虫数据不含翻译字段）
+            manager.save_comics(
+                [{"detail_url": "/x-aid-9.html", "title": "原名", "image_count": 3}]
+            )
+            rec = next(
+                r for r in db._cached_records() if r["detail_url"] == "/x-aid-9.html"
+            )
+            assert rec["translated_title"] == "翻译名"
+        finally:
+            db.DatabaseManager._instance = None
+            db._invalidate_records_cache()
+
+    def test_mark_downloaded_writes_timestamp(self, monkeypatch, tmp_path):
+        """下载完成写入 downloaded_at：数据库与缓存同步，且翻页重新抓取后保留。"""
+        import ui.database as db
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "ts.db")
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        manager = db.DatabaseManager.instance()
+        try:
+            url = "/x-aid-77.html"
+            manager.save_comics(
+                [{"detail_url": url, "title": "作品", "image_count": 3}]
+            )
+            manager.mark_downloaded(url)
+
+            with manager._connect() as conn:
+                row = conn.execute(
+                    "SELECT downloaded, downloaded_at FROM comics WHERE detail_url = ?",
+                    (url,),
+                ).fetchone()
+            assert row["downloaded"] == 1
+            assert row["downloaded_at"]  # 非空时间
+
+            # 缓存同步
+            rec = next(r for r in db._cached_records() if r["detail_url"] == url)
+            assert rec["downloaded_at"] == row["downloaded_at"]
+
+            # 再次抓取（INSERT OR REPLACE）后完成时间保留（COALESCE）
+            manager.save_comics(
+                [{"detail_url": url, "title": "作品", "image_count": 3}]
+            )
+            with manager._connect() as conn:
+                row2 = conn.execute(
+                    "SELECT downloaded_at FROM comics WHERE detail_url = ?", (url,)
+                ).fetchone()
+            assert row2["downloaded_at"] == row["downloaded_at"]
+        finally:
+            db.DatabaseManager._instance = None
+            db._invalidate_records_cache()
