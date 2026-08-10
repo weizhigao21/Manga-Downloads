@@ -51,6 +51,10 @@ class MainWindow(QMainWindow):
         # 待执行请求：worker 繁忙时记录 (silent, page)，当前 worker 结束后立即执行，
         # 避免连点翻页/切换分类时请求被静默丢弃。
         self._pending_request: tuple[bool, int] | None = None
+        # 相似作品模式：列表切换为"某作品 + 本地库相似作品"的过滤视图
+        self._similar_mode: bool = False
+        self._similar_prev_comics: list[ComicItem] | None = None
+        self._similar_worker = None  # 后台相似扫描线程引用
         self._settings = AppSettings()
         self._project_config = ProjectConfig()
         self._setup_ui()
@@ -112,8 +116,51 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(toolbar)
 
+        # 相似模式提示条（查看"某作品 + 相似作品"时显示，默认隐藏）
+        self.similar_banner = QFrame()
+        self.similar_banner.setObjectName("similarBanner")
+        self.similar_banner.setStyleSheet(
+            """
+            QFrame#similarBanner {
+                background-color: #FFF7ED;
+                border-bottom: 1px solid #FDBA74;
+                padding: 8px 24px;
+            }
+            QLabel#similarBannerLabel {
+                color: #9A3412;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #F97316;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 5px 16px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #EA580C;
+            }
+            """
+        )
+        banner_layout = QHBoxLayout(self.similar_banner)
+        banner_layout.setContentsMargins(0, 0, 0, 0)
+        banner_layout.setSpacing(16)
+        self.similar_banner_label = QLabel()
+        self.similar_banner_label.setObjectName("similarBannerLabel")
+        banner_layout.addWidget(self.similar_banner_label)
+        banner_layout.addStretch()
+        exit_similar_btn = QPushButton("返回列表")
+        exit_similar_btn.setCursor(Qt.PointingHandCursor)
+        # 用 lambda 包裹：clicked 信号携带的 bool 参数不能误传为 restore
+        exit_similar_btn.clicked.connect(lambda: self._exit_similar_mode())
+        banner_layout.addWidget(exit_similar_btn)
+        self.similar_banner.setVisible(False)
+        root_layout.addWidget(self.similar_banner)
+
         # 内容区（漫画网格）
         self.comics_grid = ComicsGrid()
+        self.comics_grid.similar_requested.connect(self._on_view_similar)
         root_layout.addWidget(self.comics_grid)
 
         # 底部栏：统一底色（QFrame#pageBar 背景+顶边框）
@@ -361,6 +408,8 @@ class MainWindow(QMainWindow):
 
     def _launch_fetch(self, silent: bool, page: int | None):
         """实际创建并启动抓取线程，绑定本次请求序号。"""
+        # 翻页/刷新/搜索/切分类都会离开相似过滤视图（列表将重新抓取）
+        self._exit_similar_mode(restore=False)
         self._fetch_seq += 1
         seq = self._fetch_seq
 
@@ -428,6 +477,9 @@ class MainWindow(QMainWindow):
                 self.set_status(
                     f"第 {self._current_page} 页：共 {len(raw_comics)} 部漫画"
                 )
+        # 页面数据就绪后自动查询本地库相似作品（后台，不阻塞界面）
+        if raw_comics:
+            self._start_similar_scan(raw_comics)
         self._run_pending_request()
 
     def _on_fetch_error(self, message: str, seq: int):
@@ -442,6 +494,116 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "抓取失败", f"抓取过程中出现错误:\n{message}")
             self.set_status("抓取失败")
         self._run_pending_request()
+
+    # ---- 相似作品 ----
+
+    def _start_similar_scan(self, raw_comics: list[dict]):
+        """页面抓取/搜索完成后：后台扫描本页作品与本地库的相似关系。
+
+        只查询本地数据库（名称/作者/封面三信号）；封面缺失时后台
+        下载并计算感知哈希存入缓存表，随后一次性更新卡片角标。
+        """
+        from ui.similar_worker import SimilarWorker
+
+        items = [
+            (
+                c.get("detail_url", ""),
+                c.get("title", ""),
+                c.get("translated_title", ""),
+                c.get("cover_url", ""),
+            )
+            for c in raw_comics
+            if c.get("detail_url")
+        ]
+        if not items:
+            return
+        worker = SimilarWorker(items)
+        self._similar_worker = worker
+        worker.finished_ok.connect(self._on_similar_done)
+        worker.error.connect(
+            lambda msg: self.set_status(f"相似查询失败: {msg}")
+        )
+        worker.finished_ok.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_similar_done(self, similar_map: dict):
+        """后台相似扫描完成：批量更新当前卡片左下角 ≈N 角标。"""
+        self._similar_worker = None
+        self.comics_grid.apply_similar_map(similar_map)
+
+    def _on_view_similar(self, comic: ComicItem):
+        """右键「查看类似作品」：列表切换为只显示该作品与本地库相似作品。"""
+        from ui.database import AID_RE, _cover_hash, find_similar_records
+
+        # 封面哈希（已下载时）参与封面信号，与卡片角标口径一致
+        match = AID_RE.search(comic.detail_url or "")
+        cover_hash = _cover_hash(match.group(1)) if match else None
+        records = find_similar_records(
+            comic.detail_url,
+            comic.title,
+            comic.translated_title,
+            cover_hash,
+        )
+        if not records:
+            self.set_status("本地数据库没有找到相似作品")
+            return
+        self._similar_prev_comics = self._comics
+        self.set_comics(self._comic_items_for_similar(comic, records))
+        self._similar_mode = True
+        self.similar_banner_label.setText(
+            f"正在查看「{comic.display_title}」及 {len(records)} 部相似作品"
+        )
+        self.similar_banner.setVisible(True)
+        self.set_status(
+            f"相似作品：{comic.display_title}（含其本身共 {len(records) + 1} 部）"
+        )
+
+    def _comic_items_for_similar(
+        self, source: ComicItem, records: list[dict]
+    ) -> list[ComicItem]:
+        """构造相似视图列表：源作品置顶，库内相似记录按 aid 倒序排列。"""
+        from ui.database import cover_cache_path
+
+        others = []
+        for rec in records:
+            detail_url = rec.get("detail_url", "")
+            others.append(
+                ComicItem(
+                    title=rec.get("title", "未知"),
+                    image_count=rec.get("image_count", 0),
+                    upload_date=rec.get("date", ""),
+                    detail_url=detail_url,
+                    cover_url=rec.get("cover_url", ""),
+                    cover_path=cover_cache_path(detail_url),
+                    category=rec.get("category", ""),
+                    category_label=rec.get("category_label", ""),
+                    translated_title=rec.get("translated_title", ""),
+                )
+            )
+
+        def _aid(item: ComicItem) -> int:
+            match = re.search(r"aid-(\d+)", item.detail_url or "")
+            return int(match.group(1)) if match else 0
+
+        others.sort(key=_aid, reverse=True)
+        return [source, *others]
+
+    def _exit_similar_mode(self, restore: bool = True):
+        """退出相似模式。
+
+        Args:
+            restore: 为 True 时恢复进入前的作品列表（banner「返回列表」）；
+                为 False 时仅隐藏 banner（抓取/翻页等即将产生新列表）。
+        """
+        if not self._similar_mode:
+            return
+        self._similar_mode = False
+        self.similar_banner.setVisible(False)
+        if restore and self._similar_prev_comics is not None:
+            prev = self._similar_prev_comics
+            self._similar_prev_comics = None
+            self.set_comics(prev)
 
     def _run_pending_request(self):
         """当前 worker 结束后，若期间有排队请求则立即执行。"""

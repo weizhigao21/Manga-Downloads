@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 
 from ui.database import (
     AID_RE,
+    COVERS_DIR,
+    DB_PATH,
     DatabaseManager,
     format_size,
     is_comic_downloaded,
@@ -47,6 +49,10 @@ class DatabaseDialog(QDialog):
             QLabel#statValue {{
                 font-weight: 600;
                 color: {PALETTE["primary"]};
+            }}
+            QLabel#pathLabel {{
+                color: {PALETTE["text_secondary"]};
+                font-size: 12px;
             }}
             QTableWidget {{
                 background-color: {PALETTE["surface"]};
@@ -117,6 +123,19 @@ class DatabaseDialog(QDialog):
         stats_row.addStretch()
         layout.addLayout(stats_row)
 
+        # 存储路径（当前生效的数据库与封面缓存位置）
+        self.db_path_label = QLabel()
+        self.db_path_label.setObjectName("pathLabel")
+        self.covers_path_label = QLabel()
+        self.covers_path_label.setObjectName("pathLabel")
+        path_box = QWidget()
+        path_form = QVBoxLayout(path_box)
+        path_form.setContentsMargins(0, 0, 0, 0)
+        path_form.setSpacing(2)
+        path_form.addWidget(self.db_path_label)
+        path_form.addWidget(self.covers_path_label)
+        layout.addWidget(path_box)
+
         # 记录表格
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
@@ -143,6 +162,14 @@ class DatabaseDialog(QDialog):
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(self._refresh)
         btn_row.addWidget(self.refresh_btn)
+
+        self.dedupe_btn = QPushButton("查重")
+        self.dedupe_btn.clicked.connect(self._open_dedupe)
+        btn_row.addWidget(self.dedupe_btn)
+
+        self.storage_btn = QPushButton("更改路径")
+        self.storage_btn.clicked.connect(self._open_storage)
+        btn_row.addWidget(self.storage_btn)
 
         self.clear_comics_btn = QPushButton("清空数据库")
         self.clear_comics_btn.setObjectName("dangerButton")
@@ -179,6 +206,8 @@ class DatabaseDialog(QDialog):
         self.comics_value.setText(f"{self._db.count()} 部")
         self.db_size_value.setText(format_size(self._db.db_size()))
         self.cover_count_value.setText(f"{self._db.cover_count()} 张 / {format_size(self._db.cover_size())}")
+        self.db_path_label.setText(f"数据库：{DB_PATH}")
+        self.covers_path_label.setText(f"封面缓存：{COVERS_DIR}")
 
         records = self._db.load_comics()
         self.table.setRowCount(len(records))
@@ -206,6 +235,20 @@ class DatabaseDialog(QDialog):
                 color=PALETTE["text_secondary"],
             )
         self.table.resizeRowsToContents()
+
+    def _open_dedupe(self):
+        """打开查重对话框（封面/名称/作者维度扫描重复记录）。"""
+        from ui.dialogs.dedupe_dialog import DedupeDialog
+
+        DedupeDialog(self).exec()
+
+    def _open_storage(self):
+        """打开存储路径设置；切换后刷新统计与路径显示。"""
+        from ui.dialogs.storage_dialog import StoragePathsDialog
+
+        if StoragePathsDialog(self).exec() == QDialog.Accepted:
+            self._db = DatabaseManager.instance()
+            self._refresh()
 
     def _set_cell(self, row: int, col: int, text: str, color: str = None):
         item = QTableWidgetItem(text)

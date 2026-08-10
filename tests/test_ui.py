@@ -12,6 +12,7 @@ import pytest
 import ui.download_manager as dm
 from ui.download_manager import DownloadTask
 from ui.models import ComicItem
+from ui.widgets.comic_card import ComicCard
 
 
 @pytest.fixture
@@ -317,10 +318,153 @@ class TestComicsGrid:
         grid.render(items)
         assert len(grid._cards) == 10
 
+
+class TestSimilarFeature:
+    """相似作品功能：卡片角标 / 右键菜单 / 网格角标批量更新。"""
+
+    def _make_comic(self, title="[社团A] 测试作品", aid=999) -> ComicItem:
+        return ComicItem(
+            title=title,
+            image_count=10,
+            upload_date="2026-08-01",
+            detail_url=f"/photos-index-aid-{aid}.html",
+            cover_url="",
+            category="",
+            category_label="",
+        )
+
+    def test_badge_visibility_and_text(self, qtbot):
+        """左下角相似角标：similar_count > 0 时显示 ≈N，为 0 时隐藏。"""
+        comic = self._make_comic()
+        card = ComicCard(comic)
+        qtbot.addWidget(card)
+        card.show()
+        card.set_similar_count(3)
+        assert card.comic.similar_count == 3
+        assert card.similar_badge.text() == "≈3"
+        assert card.similar_badge.isVisible()
+        card.set_similar_count(0)
+        assert card.comic.similar_count == 0
+        assert not card.similar_badge.isVisible()
+
+    def test_context_menu_has_view_similar_when_count(self, qtbot):
+        """similar_count > 0 时右键菜单含「查看类似作品」。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card.set_similar_count(2)
+        actions = [a.text() for a in card._build_context_menu().actions() if a.text()]
+        assert "查看类似作品" in actions
+
+    def test_context_menu_hides_view_similar_without_count(self, qtbot):
+        """similar_count == 0 时右键菜单不含「查看类似作品」。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        actions = [a.text() for a in card._build_context_menu().actions() if a.text()]
+        assert "查看类似作品" not in actions
+
+    def test_view_similar_emits_signal(self, qtbot):
+        """触发「查看类似」发出 similar_requested 信号（携带 ComicItem）。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card.set_similar_count(1)
+        received = []
+        card.similar_requested.connect(received.append)
+        card._on_view_similar()
+        assert len(received) == 1
+        assert received[0].title == "[社团A] 测试作品"
+
+    def test_grid_apply_similar_map(self, qtbot):
+        """网格批量更新角标：命中作品显示数量，未命中清零。"""
+        from ui.widgets import ComicsGrid
+
+        grid = ComicsGrid()
+        qtbot.addWidget(grid)
+        grid.render(
+            [self._make_comic(aid=1), self._make_comic(title="另一部", aid=2)]
+        )
+        grid.apply_similar_map(
+            {
+                "/photos-index-aid-1.html": [{"aid": 3, "title": "相似"}],
+            }
+        )
+        assert grid._cards[0].comic.similar_count == 1
+        assert grid._cards[1].comic.similar_count == 0
+
         width = max(grid.viewport().width(), ComicsGrid.MIN_COLUMN_WIDTH)
         expected = max(1, width // ComicsGrid.MIN_COLUMN_WIDTH)
         assert grid._columns == expected
         grid.reflow()  # 列数未变时应安全跳过
+
+    def test_similar_banner_button_restores_list(self, qtbot, monkeypatch, tmp_path):
+        """点击 banner「返回列表」按钮（真实 clicked 信号）恢复进入前列表。
+
+        回归：clicked 信号携带的 bool 参数曾误传为 _exit_similar_mode 的
+        restore 参数，导致只隐藏提示条、列表不恢复。
+        """
+        import ui.data_store as ds
+        import ui.database as db
+        from ui.settings import AppSettings
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "similar.db")
+        monkeypatch.setattr(db, "COVERS_DIR", tmp_path / "covers")
+        db.COVERS_DIR.mkdir(parents=True, exist_ok=True)
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        db.DatabaseManager.instance().save_comics(
+            [
+                {
+                    "title": "[社团A] 测试作品",
+                    "detail_url": "/photos-index-aid-1.html",
+                    "date": "2026-01-01",
+                    "image_count": 10,
+                    "cover_url": "",
+                    "category": "",
+                    "category_label": "",
+                },
+                {
+                    "title": "[社团A] 測試作品",
+                    "detail_url": "/photos-index-aid-2.html",
+                    "date": "2026-02-01",
+                    "image_count": 12,
+                    "cover_url": "",
+                    "category": "",
+                    "category_label": "",
+                },
+            ]
+        )
+        monkeypatch.setattr(ds, "load_cache", lambda: None)
+        monkeypatch.setattr(
+            AppSettings, "auto_fetch_on_startup", property(lambda self: False)
+        )
+
+        from PySide6.QtWidgets import QPushButton
+
+        from ui.main_window import MainWindow
+
+        win = MainWindow()
+        qtbot.addWidget(win)
+        win.set_comics_from_raw(
+            [
+                {
+                    "title": "[社团A] 测试作品",
+                    "detail_url": "/photos-index-aid-999.html",
+                    "date": "2026-08-01",
+                    "image_count": 20,
+                    "cover_url": "",
+                    "category": "",
+                    "category_label": "",
+                }
+            ]
+        )
+        assert len(win._comics) == 1
+        win._on_view_similar(win.comics_grid._cards[0].comic)
+        assert len(win._comics) == 3
+
+        buttons = win.similar_banner.findChildren(QPushButton)
+        assert [b.text() for b in buttons] == ["返回列表"]
+        buttons[0].click()  # 触发 clicked(bool=False) 信号路径
+        assert win._similar_mode is False
+        assert len(win._comics) == 1
 
     def test_render_empty_shows_placeholder(self, qtbot):
         from ui.widgets import ComicsGrid

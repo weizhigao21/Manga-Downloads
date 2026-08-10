@@ -19,6 +19,7 @@ class ComicItem:
     category: str = ""
     category_label: str = ""
     translated_title: str = ""
+    similar_count: int = 0  # 本地库中相似记录数（>0 时卡片显示 ≈N 角标）
 
     def __post_init__(self):
         self._settings = AppSettings()

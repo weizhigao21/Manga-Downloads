@@ -27,6 +27,9 @@ start_ui.bat
 # 代码索引（本地生成，可随时重建）
 .codegraph/
 
+# pytest 临时目录（--basetemp 指向项目内时产生）
+.pytest_tmp/
+
 # PyInstaller 打包产物（spec 保留，可复现构建）
 build/
 dist/

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QContextMenuEvent, QPixmap, QPixmapCache
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -24,6 +24,9 @@ class ComicCard(QFrame):
 
     COVER_WIDTH = 160
     COVER_HEIGHT = 220
+
+    # 右键菜单「查看类似作品」触发（emit 当前 ComicItem），由主窗口切换相似视图
+    similar_requested = Signal(object)
 
     def __init__(self, comic: ComicItem, parent=None, downloaded: bool | None = None):
         super().__init__(parent)
@@ -53,6 +56,7 @@ class ComicCard(QFrame):
             self._pre_downloaded = downloaded
         self._update_title_label()
         self._sync_download_button()
+        self._update_similar_badge()
         # 封面来源变化时重新加载（QPixmapCache 命中则直接复用，无需网络）
         if comic.cover_path != old.cover_path or comic.cover_url != old.cover_url:
             self._load_cover()
@@ -66,6 +70,24 @@ class ComicCard(QFrame):
         """任务被删除回调：本作品任务被移除后，按钮重新自查（回到未下载状态）。"""
         if task.task_id and task.task_id == self._task_id:
             self._sync_download_button()
+
+    def set_similar_count(self, count: int):
+        """更新本地库相似记录数并刷新左下角角标（后台扫描完成后调用）。"""
+        if count == self.comic.similar_count:
+            return
+        self.comic.similar_count = count
+        self._update_similar_badge()
+
+    def _update_similar_badge(self):
+        """刷新相似角标文本与定位（仅 similar_count > 0 时显示）。"""
+        if self.comic.similar_count > 0:
+            self.similar_badge.setText(f"≈{self.comic.similar_count}")
+            self.similar_badge.adjustSize()
+            self.similar_badge.move(
+                8,
+                self.COVER_HEIGHT - self.similar_badge.height() - 8,
+            )
+        self.similar_badge.setVisible(self.comic.similar_count > 0)
 
     def _setup_ui(self):
         self.setObjectName("comicCard")
@@ -150,6 +172,26 @@ class ComicCard(QFrame):
             self.category_badge.setVisible(True)
         else:
             self.category_badge.setVisible(False)
+
+        # 左下角"相似"角标（橙色，本地库存在相似作品时显示 ≈N）
+        self.similar_badge = QLabel(self.cover_container)
+        self.similar_badge.setAlignment(Qt.AlignCenter)
+        self.similar_badge.setWordWrap(False)
+        self.similar_badge.setStyleSheet(
+            """
+            QLabel {
+                background-color: #F97316;
+                color: white;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            """
+        )
+        self.similar_badge.setToolTip("本地数据库存在相似作品，右键卡片可查看")
+        self._update_similar_badge()
+        self.similar_badge.setVisible(self.comic.similar_count > 0)
 
         layout.addWidget(self.cover_container)
 
@@ -399,8 +441,16 @@ class ComicCard(QFrame):
         )
         menu.addAction("复制作品名称", self._copy_title)
         menu.addSeparator()
+        # 仅本地库存在相似作品时提供「查看类似」，避免无意义的空视图
+        if self.comic.similar_count > 0:
+            menu.addAction("查看类似作品", self._on_view_similar)
+            menu.addSeparator()
         menu.addAction("翻译作品名称", self._translate_title)
         return menu
+
+    def _on_view_similar(self):
+        """触发「查看类似作品」：由主窗口切换为只显示该作品与相似作品。"""
+        self.similar_requested.emit(self.comic)
 
     def _copy_title(self):
         """将作品显示名称（含繁简转换）复制到剪贴板，左下角状态栏提示。"""

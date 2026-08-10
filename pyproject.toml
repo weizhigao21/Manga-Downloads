@@ -1,6 +1,6 @@
 [project]
 name = "manga-browser"
-version = "1.2.18"
+version = "1.2.21"
 description = "wnacg 漫画爬虫与 Qt6 桌面浏览器"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     "opencc-python-reimplemented>=0.1.7",
     "curl_cffi>=0.15",
     "openai>=1.0",
+    "Pillow>=10.0",
 ]
 
 # 运行入口：python run_ui.py（PyInstaller 打包见 漫画浏览器.spec）

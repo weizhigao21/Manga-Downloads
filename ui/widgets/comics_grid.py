@@ -3,7 +3,7 @@
 从 main_window 拆出，独立成模块：负责根据可视宽度动态计算列数、
 渲染 ComicCard，以及无数据时的空状态展示。
 """
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QGridLayout, QLabel, QScrollArea, QWidget
 
 from ui.models import ComicItem
@@ -15,6 +15,9 @@ class ComicsGrid(QScrollArea):
 
     # 每列最小宽度（px），窗口变宽时列数自动增加
     MIN_COLUMN_WIDTH = 340
+
+    # 卡片右键「查看类似作品」转发到主窗口
+    similar_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -63,6 +66,8 @@ class ComicsGrid(QScrollArea):
             card = old.pop(comic.detail_url, None)
             if card is None:
                 card = ComicCard(comic, downloaded=downloaded_map.get(comic.detail_url))
+                # 转发右键「查看类似」信号（仅新建卡片连接，复用卡片已连接）
+                card.similar_requested.connect(self.similar_requested)
             else:
                 card.update_comic(
                     comic, downloaded=downloaded_map.get(comic.detail_url)
@@ -91,6 +96,17 @@ class ComicsGrid(QScrollArea):
         if not self._cards:
             return
         self._reflow()
+
+    def apply_similar_map(self, similar_map: dict[str, list]):
+        """后台相似扫描完成后批量更新卡片左下角 ≈N 角标（不重建卡片）。
+
+        Args:
+            similar_map: {detail_url: [相似记录, ...]}，未出现的作品角标清零。
+        """
+        for card in self._cards:
+            url = card.comic.detail_url
+            matches = similar_map.get(url)
+            card.set_similar_count(len(matches) if matches else 0)
 
     def _reflow(self):
         """按当前可视宽度重排已有卡片。

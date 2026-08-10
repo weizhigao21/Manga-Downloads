@@ -17,6 +17,9 @@ DEFAULT_SETTINGS = {
     "translate_api_base": "https://api.deepseek.com",
     "translate_model": "deepseek-v4-pro",
     "translate_api_key": "",
+    # 存储路径（空字符串 = 使用默认位置 Config/comics.db 与 Config/covers）
+    "db_path": "",
+    "covers_dir": "",
 }
 
 # 网站导航栏分类（名称 -> 分类列表页相对 URL），供设置中切换浏览分类
@@ -134,6 +137,24 @@ class AppSettings:
     @translate_api_key.setter
     def translate_api_key(self, value: str):
         self._settings["translate_api_key"] = str(value).strip()
+
+    @property
+    def db_path(self) -> str:
+        """漫画数据库文件路径（空字符串表示默认位置）。"""
+        return str(self._settings.get("db_path", "")).strip()
+
+    @db_path.setter
+    def db_path(self, value: str):
+        self._settings["db_path"] = str(value).strip()
+
+    @property
+    def covers_dir(self) -> str:
+        """封面缓存目录（空字符串表示默认位置）。"""
+        return str(self._settings.get("covers_dir", "")).strip()
+
+    @covers_dir.setter
+    def covers_dir(self, value: str):
+        self._settings["covers_dir"] = str(value).strip()
 
     def convert(self, text: str) -> str:
         """根据设置将文本转换为简体（若开启）或保持原样。"""
