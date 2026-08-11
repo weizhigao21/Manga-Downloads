@@ -520,9 +520,7 @@ class MainWindow(QMainWindow):
         worker = SimilarWorker(items)
         self._similar_worker = worker
         worker.finished_ok.connect(self._on_similar_done)
-        worker.error.connect(
-            lambda msg: self.set_status(f"相似查询失败: {msg}")
-        )
+        worker.error.connect(self._on_similar_error)
         worker.finished_ok.connect(worker.deleteLater)
         worker.error.connect(worker.deleteLater)
         worker.start()
@@ -531,6 +529,11 @@ class MainWindow(QMainWindow):
         """后台相似扫描完成：批量更新当前卡片左下角 ≈N 角标。"""
         self._similar_worker = None
         self.comics_grid.apply_similar_map(similar_map)
+
+    def _on_similar_error(self, message: str):
+        """后台相似扫描失败：清理引用并在状态栏提示。"""
+        self._similar_worker = None
+        self.set_status(f"相似查询失败: {message}")
 
     def _on_view_similar(self, comic: ComicItem):
         """右键「查看类似作品」：列表切换为只显示该作品与本地库相似作品。"""

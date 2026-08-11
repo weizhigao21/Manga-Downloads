@@ -5,6 +5,16 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.23] - 2026-08-11
+
+### 修复
+
+- 修复退出时崩溃 `RuntimeError: Internal C++ object (SimilarWorker) already deleted`：后台线程注册表原为「只登记不注销」，worker 完成后 `deleteLater` 销毁了 C++ 对象、注册表仍持有其 Python wrapper，应用退出收尾调用 `requestInterruption()` 访问已删除对象而崩溃。现改为：线程结束（`finished` 信号）时**自动从注册表注销**，`shutdown_all` 对已销毁对象做防御（`RuntimeError` 跳过），双保险覆盖退出瞬间的窗口期（`ui/threads.py`）；同时补 `_on_similar_error` 清理 worker 引用（`ui/main_window.py`）
+
+### 测试
+
+- 新增 2 个回归用例（156 → 158）：worker 完成后自动注销、`shutdown_all` 跳过已销毁对象不抛异常；全部离线运行
+
 ## [1.2.22] - 2026-08-11
 
 ### 新增

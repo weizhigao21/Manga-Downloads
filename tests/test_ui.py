@@ -525,6 +525,59 @@ def test_dialogs_importable():
     )
 
 
+class TestThreadRegistry:
+    """后台线程注册表：完成自动注销 + 退出收尾防御已销毁对象。"""
+
+    def test_worker_auto_unregisters_after_finish(self, qtbot):
+        """线程结束后自动从注册表注销（避免残留已销毁的 C++ 对象）。"""
+        from PySide6.QtCore import QThread, Signal
+
+        from ui import threads
+
+        class FakeWorker(QThread):
+            done = Signal()
+
+            def run(self):
+                threads.register(self)
+                self.done.emit()
+
+        worker = FakeWorker()
+        # 模拟 SimilarWorker 完成路径：自定义信号触发 deleteLater
+        worker.done.connect(worker.deleteLater)
+        worker.start()
+        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=3000)
+        # 等待 finished 信号（自动注销）与 deleteLater 被事件循环处理
+        qtbot.wait(100)
+        with threads._registry_lock:
+            assert worker not in threads._registry
+
+    def test_shutdown_all_skips_deleted_objects(self, qtbot):
+        """退出收尾遇到已销毁的线程对象不抛 RuntimeError（回归）。"""
+        from PySide6.QtCore import QThread, Signal
+
+        from ui import threads
+
+        class FakeWorker(QThread):
+            done = Signal()
+
+            def run(self):
+                threads.register(self)
+                self.done.emit()
+
+        worker = FakeWorker()
+        worker.done.connect(worker.deleteLater)
+        worker.start()
+        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=3000)
+        qtbot.wait(100)
+        # 模拟 finished 信号尚未处理的窗口期：对象已销毁但仍在注册表
+        with threads._registry_lock:
+            threads._registry.add(worker)
+        # 不应抛 RuntimeError（Internal C++ object already deleted）
+        threads.shutdown_all(timeout_ms=100, terminate_grace_ms=50)
+        with threads._registry_lock:
+            threads._registry.discard(worker)
+
+
 class TestDownloadManagerDialog:
     def test_retry_button_visible_only_for_failed(self, fresh_manager, qtbot):
         from ui.dialogs.download_manager_dialog import DownloadManagerDialog
