@@ -347,6 +347,38 @@ class TestSimilarFeature:
         assert card.comic.similar_count == 0
         assert not card.similar_badge.isVisible()
 
+    def test_badge_red_when_similar_downloaded(self, qtbot):
+        """相似记录中存在已下载时角标变红（默认橙色）。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card.set_similar_count(2, has_downloaded=True)
+        assert "#DC2626" in card.similar_badge.styleSheet()
+        card.set_similar_count(2, has_downloaded=False)
+        assert "#F97316" in card.similar_badge.styleSheet()
+
+    def test_menu_items_have_color_icons(self, qtbot):
+        """右键菜单项均带固定颜色圆点图标（复制/查看类似/翻译）。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card.set_similar_count(1)
+        actions = [a for a in card._build_context_menu().actions() if a.text()]
+        assert len(actions) == 3
+        assert all(not a.icon().isNull() for a in actions)
+        assert not card._menu_color_icon("#DC2626").isNull()
+
+    def test_download_button_fixed_width(self, qtbot):
+        """下载按钮固定宽度：文本切换（下载→下载中...）时宽度不膨胀。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card.show()
+        width_before = card.download_btn.width()
+        card._sync_download_button()
+        # 模拟任务开始后的按钮状态（文本切换）
+        task = DownloadTask("999", "测试", "/photos-index-aid-999.html")
+        task.status = DownloadTask.DOWNLOADING
+        card._sync_download_button(task)
+        assert card.download_btn.width() == width_before
+
     def test_context_menu_has_view_similar_when_count(self, qtbot):
         """similar_count > 0 时右键菜单含「查看类似作品」。"""
         card = ComicCard(self._make_comic())

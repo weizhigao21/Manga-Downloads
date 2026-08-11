@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QContextMenuEvent, QPixmap, QPixmapCache
+from PySide6.QtGui import QColor, QContextMenuEvent, QIcon, QPainter, QPixmap, QPixmapCache
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
@@ -71,15 +71,39 @@ class ComicCard(QFrame):
         if task.task_id and task.task_id == self._task_id:
             self._sync_download_button()
 
-    def set_similar_count(self, count: int):
-        """更新本地库相似记录数并刷新左下角角标（后台扫描完成后调用）。"""
-        if count == self.comic.similar_count:
+    def set_similar_count(self, count: int, has_downloaded: bool = False):
+        """更新本地库相似信息并刷新左下角角标（后台扫描完成后调用）。
+
+        Args:
+            count: 相似记录数（0 时隐藏角标）。
+            has_downloaded: 相似记录中是否存在已下载作品（角标变红提示）。
+        """
+        if count == self.comic.similar_count and (
+            has_downloaded == self.comic.similar_downloaded
+        ):
             return
         self.comic.similar_count = count
+        self.comic.similar_downloaded = has_downloaded
         self._update_similar_badge()
 
     def _update_similar_badge(self):
-        """刷新相似角标文本与定位（仅 similar_count > 0 时显示）。"""
+        """刷新相似角标文本/颜色/定位（仅 similar_count > 0 时显示）。
+
+        颜色语义：橙色 = 有相似作品可查看；红色 = 相似记录中已有下载。
+        """
+        color = "#DC2626" if self.comic.similar_downloaded else "#F97316"
+        self.similar_badge.setStyleSheet(
+            f"""
+            QLabel {{
+                background-color: {color};
+                color: white;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            """
+        )
         if self.comic.similar_count > 0:
             self.similar_badge.setText(f"≈{self.comic.similar_count}")
             self.similar_badge.adjustSize()
@@ -173,22 +197,11 @@ class ComicCard(QFrame):
         else:
             self.category_badge.setVisible(False)
 
-        # 左下角"相似"角标（橙色，本地库存在相似作品时显示 ≈N）
+        # 左下角"相似"角标（本地库存在相似作品时显示 ≈N；
+        # 相似记录中有已下载时数字变红提示，否则橙色）
         self.similar_badge = QLabel(self.cover_container)
         self.similar_badge.setAlignment(Qt.AlignCenter)
         self.similar_badge.setWordWrap(False)
-        self.similar_badge.setStyleSheet(
-            """
-            QLabel {
-                background-color: #F97316;
-                color: white;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            """
-        )
         self.similar_badge.setToolTip("本地数据库存在相似作品，右键卡片可查看")
         self._update_similar_badge()
         self.similar_badge.setVisible(self.comic.similar_count > 0)
@@ -242,7 +255,9 @@ class ComicCard(QFrame):
         self.download_btn = QPushButton("下载")
         self.download_btn.setObjectName("downloadButton")
         self.download_btn.setCursor(Qt.PointingHandCursor)
-        self.download_btn.setFixedHeight(28)
+        # 固定宽度：文本在「下载/下载中.../已下载/重试/翻译中...」间切换时
+        # 宽度保持稳定，避免按钮膨胀导致卡片内布局重排、界面视觉跳动
+        self.download_btn.setFixedSize(104, 28)
         self.download_btn.setStyleSheet(
             f"""
             QPushButton {{
@@ -414,8 +429,27 @@ class ComicCard(QFrame):
         """
         self._build_context_menu().exec(event.globalPos())
 
+    @staticmethod
+    def _menu_color_icon(color: str) -> QIcon:
+        """生成 12x12 圆角色块图标，作为右键菜单项的颜色提示。"""
+        pixmap = QPixmap(12, 12)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(0, 0, 11, 11)
+        painter.end()
+        return QIcon(pixmap)
+
     def _build_context_menu(self) -> QMenu:
-        """构建右键上下文菜单（独立方法便于测试）。"""
+        """构建右键上下文菜单（独立方法便于测试）。
+
+        菜单项带固定颜色圆点提示，与角标语义一致：
+        - 复制作品名称：灰色
+        - 查看类似作品：橙色（相似中有已下载时为红色）
+        - 翻译作品名称：蓝色
+        """
         menu = QMenu(self)
         menu.setStyleSheet(
             f"""
@@ -439,13 +473,22 @@ class ComicCard(QFrame):
             }}
             """
         )
-        menu.addAction("复制作品名称", self._copy_title)
+        menu.addAction(
+            self._menu_color_icon("#9CA3AF"), "复制作品名称", self._copy_title
+        )
         menu.addSeparator()
         # 仅本地库存在相似作品时提供「查看类似」，避免无意义的空视图
         if self.comic.similar_count > 0:
-            menu.addAction("查看类似作品", self._on_view_similar)
+            similar_color = "#DC2626" if self.comic.similar_downloaded else "#F97316"
+            menu.addAction(
+                self._menu_color_icon(similar_color),
+                "查看类似作品",
+                self._on_view_similar,
+            )
             menu.addSeparator()
-        menu.addAction("翻译作品名称", self._translate_title)
+        menu.addAction(
+            self._menu_color_icon("#3B82F6"), "翻译作品名称", self._translate_title
+        )
         return menu
 
     def _on_view_similar(self):

@@ -102,11 +102,15 @@ class ComicsGrid(QScrollArea):
 
         Args:
             similar_map: {detail_url: [相似记录, ...]}，未出现的作品角标清零。
+                相似记录含 downloaded 字段：其中存在已下载时角标变红提示。
         """
         for card in self._cards:
             url = card.comic.detail_url
             matches = similar_map.get(url)
-            card.set_similar_count(len(matches) if matches else 0)
+            has_downloaded = bool(
+                matches and any(r.get("downloaded") for r in matches)
+            )
+            card.set_similar_count(len(matches) if matches else 0, has_downloaded)
 
     def _reflow(self):
         """按当前可视宽度重排已有卡片。

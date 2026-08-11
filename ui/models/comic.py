@@ -20,6 +20,7 @@ class ComicItem:
     category_label: str = ""
     translated_title: str = ""
     similar_count: int = 0  # 本地库中相似记录数（>0 时卡片显示 ≈N 角标）
+    similar_downloaded: bool = False  # 相似记录中是否存在已下载（角标变红提示）
 
     def __post_init__(self):
         self._settings = AppSettings()

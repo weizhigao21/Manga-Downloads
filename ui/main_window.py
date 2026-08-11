@@ -562,7 +562,11 @@ class MainWindow(QMainWindow):
     def _comic_items_for_similar(
         self, source: ComicItem, records: list[dict]
     ) -> list[ComicItem]:
-        """构造相似视图列表：源作品置顶，库内相似记录按 aid 倒序排列。"""
+        """构造相似视图列表：源作品置顶，库内相似记录按 aid 倒序排列。
+
+        源作品角标与相似记录保持一致（count=len(records)，其中有已下载
+        时显示红色），避免进入相似视图后源卡片角标与右键菜单口径不一致。
+        """
         from ui.database import cover_cache_path
 
         others = []
@@ -587,6 +591,8 @@ class MainWindow(QMainWindow):
             return int(match.group(1)) if match else 0
 
         others.sort(key=_aid, reverse=True)
+        source.similar_count = len(records)
+        source.similar_downloaded = any(r.get("downloaded") for r in records)
         return [source, *others]
 
     def _exit_similar_mode(self, restore: bool = True):
