@@ -13,12 +13,14 @@
    留下半截文件。
 
 线程生命周期与注册表：
-- register 在 worker 的 run() 中调用；同时连接 finished 信号，线程结束
-  （run 返回）后自动从注册表注销，避免已完成线程的 C++ 对象被
-  deleteLater 销毁后注册表仍持有其 Python wrapper，退出收尾时访问
-  已删除对象而抛 "Internal C++ object already deleted"。
-- shutdown_all 仍对已销毁对象做防御（RuntimeError 跳过），覆盖
-  finished 信号尚未被事件循环处理（退出瞬间）的窗口期。
+- register 在 worker 的 run() 中调用；登记时顺手清理已销毁（deleteLater
+  后 C++ 对象失效）的线程，避免注册表长期累积。不使用 finished/
+  destroyed 信号做自动注销：FetchWorker/TranslateWorker 等子类用自定义
+  信号覆盖了内置 finished（如 `FetchWorker.finished = Signal(list)`，
+  携带业务数据），连接 finished 会收到 list；而 destroyed 在对象析构
+  期间不保证调用 Python 槽。
+- shutdown_all 对已销毁对象做防御（RuntimeError 跳过），双保险覆盖
+  清理窗口期。
 """
 import logging
 import threading
@@ -44,19 +46,17 @@ def _alive(thread: QThread) -> bool:
 def register(thread: QThread):
     """登记一个运行中的后台线程（run 中调用，持锁保证跨线程安全）。
 
-    线程结束后自动注销：finished 信号发出时从注册表移除，确保注册表
-    只持有仍有效的线程对象（线程结束后析构是安全的，不会触发
-    "Destroyed while thread is still running" 警告）。
+    登记时惰性清理已销毁（C++ 对象被 deleteLater 移除）的线程对象，
+    避免注册表长期累积；已结束但对象仍存活的线程留待下次清理，
+    收尾时由 shutdown_all 的 _alive 防御兜底。
     """
     with _registry_lock:
+        for stale in list(_registry):
+            try:
+                stale.isRunning()
+            except RuntimeError:
+                _registry.discard(stale)
         _registry.add(thread)
-    thread.finished.connect(lambda t=thread: _unregister(t))
-
-
-def _unregister(thread: QThread):
-    """线程结束后从注册表移除（finished 信号槽，持锁保证跨线程安全）。"""
-    with _registry_lock:
-        _registry.discard(thread)
 
 
 def shutdown_all(timeout_ms: int = 2000, terminate_grace_ms: int = 1000):

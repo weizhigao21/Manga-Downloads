@@ -9,11 +9,12 @@
 
 ### 修复
 
-- 修复退出时崩溃 `RuntimeError: Internal C++ object (SimilarWorker) already deleted`：后台线程注册表原为「只登记不注销」，worker 完成后 `deleteLater` 销毁了 C++ 对象、注册表仍持有其 Python wrapper，应用退出收尾调用 `requestInterruption()` 访问已删除对象而崩溃。现改为：线程结束（`finished` 信号）时**自动从注册表注销**，`shutdown_all` 对已销毁对象做防御（`RuntimeError` 跳过），双保险覆盖退出瞬间的窗口期（`ui/threads.py`）；同时补 `_on_similar_error` 清理 worker 引用（`ui/main_window.py`）
+- 修复退出时崩溃 `RuntimeError: Internal C++ object (SimilarWorker) already deleted`：后台线程注册表原为「只登记不注销」，worker 完成后 `deleteLater` 销毁了 C++ 对象、注册表仍持有其 Python wrapper，应用退出收尾调用 `requestInterruption()` 访问已删除对象而崩溃（`ui/threads.py`）
+- 修复上一方案引入的 `TypeError: unhashable type: 'list'`：部分 worker 子类（`FetchWorker.finished = Signal(list)`、`TranslateWorker.finished = Signal(str)`）用自定义信号**覆盖了 QThread 内置 `finished`**，连接该信号做自动注销会收到业务数据（list/str）；`destroyed` 信号在对象析构期间又不保证调用 Python 槽。最终方案：**register 时惰性清理已销毁对象**（`isRunning` 抛 `RuntimeError` 即移除），`shutdown_all` 对已销毁对象防御（`RuntimeError` 跳过）双保险，不依赖任何信号（`ui/threads.py`）；同时补 `_on_similar_error` 清理 worker 引用（`ui/main_window.py`）
 
 ### 测试
 
-- 新增 2 个回归用例（156 → 158）：worker 完成后自动注销、`shutdown_all` 跳过已销毁对象不抛异常；全部离线运行
+- 新增 3 个回归用例（156 → 159）：register 惰性清理已销毁线程、`shutdown_all` 跳过已销毁对象、自定义 `finished(list)` 覆盖不崩溃；全部离线运行（用 `shiboken6.delete` 模拟真实环境 `deleteLater` 已处理，离屏事件循环不处理 DeferredDelete）
 
 ## [1.2.22] - 2026-08-11
 

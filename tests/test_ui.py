@@ -526,56 +526,83 @@ def test_dialogs_importable():
 
 
 class TestThreadRegistry:
-    """后台线程注册表：完成自动注销 + 退出收尾防御已销毁对象。"""
+    """后台线程注册表：register 惰性清理 + 退出收尾防御已销毁对象。"""
 
-    def test_worker_auto_unregisters_after_finish(self, qtbot):
-        """线程结束后自动从注册表注销（避免残留已销毁的 C++ 对象）。"""
-        from PySide6.QtCore import QThread, Signal
+    def _start_done_worker(self, qtbot, cls, *args):
+        """启动 worker 至结束并返回（调用方负责销毁）。"""
+        worker = cls(*args)
+        worker.start()
+        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=3000)
+        return worker
+
+    def test_register_cleans_up_deleted_workers(self, qtbot):
+        """再次 register 时惰性清理已销毁的线程对象（避免注册表累积）。"""
+        import shiboken6
+        from PySide6.QtCore import QThread
 
         from ui import threads
 
-        class FakeWorker(QThread):
-            done = Signal()
-
+        class PlainWorker(QThread):
             def run(self):
                 threads.register(self)
-                self.done.emit()
 
-        worker = FakeWorker()
-        # 模拟 SimilarWorker 完成路径：自定义信号触发 deleteLater
-        worker.done.connect(worker.deleteLater)
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=3000)
-        # 等待 finished 信号（自动注销）与 deleteLater 被事件循环处理
-        qtbot.wait(100)
+        w1 = self._start_done_worker(qtbot, PlainWorker)
+        # 模拟真实环境 deleteLater 已处理：直接删除 C++ 对象（wrapper 失效）
+        shiboken6.delete(w1)
         with threads._registry_lock:
-            assert worker not in threads._registry
+            assert w1 in threads._registry  # 尚未清理（等下次 register）
+
+        w2 = self._start_done_worker(qtbot, PlainWorker)
+        with threads._registry_lock:
+            assert w1 not in threads._registry  # 惰性清理已移除已销毁的 w1
+            assert w2 in threads._registry  # w2 对象仍有效，保留
 
     def test_shutdown_all_skips_deleted_objects(self, qtbot):
         """退出收尾遇到已销毁的线程对象不抛 RuntimeError（回归）。"""
+        import shiboken6
+        from PySide6.QtCore import QThread
+
+        from ui import threads
+
+        class PlainWorker(QThread):
+            def run(self):
+                threads.register(self)
+
+        worker = self._start_done_worker(qtbot, PlainWorker)
+        shiboken6.delete(worker)  # 对象已销毁但仍在注册表
+        with threads._registry_lock:
+            assert worker in threads._registry
+        # 不应抛 RuntimeError（Internal C++ object already deleted）
+        threads.shutdown_all(timeout_ms=100, terminate_grace_ms=50)
+
+    def test_custom_finished_signal_does_not_break_unregister(self, qtbot):
+        """子类用自定义 finished(list) 覆盖内置信号时不崩溃（回归）。
+
+        FetchWorker 的 `finished = Signal(list)` 覆盖了 QThread 内置
+        finished；若自动注销误连该信号，回调会收到 list 导致
+        _registry.discard(list) 抛 TypeError。
+        """
+        import shiboken6
         from PySide6.QtCore import QThread, Signal
 
         from ui import threads
 
-        class FakeWorker(QThread):
-            done = Signal()
+        class CustomSignalWorker(QThread):
+            finished = Signal(list)  # 覆盖内置 finished，模拟 FetchWorker
+            error = Signal(str)
 
             def run(self):
                 threads.register(self)
-                self.done.emit()
+                self.finished.emit([1, 2, 3])  # 模拟抓取结果
 
-        worker = FakeWorker()
-        worker.done.connect(worker.deleteLater)
+        worker = CustomSignalWorker()
+        worker.finished.connect(lambda data: None)
         worker.start()
         qtbot.waitUntil(lambda: not worker.isRunning(), timeout=3000)
-        qtbot.wait(100)
-        # 模拟 finished 信号尚未处理的窗口期：对象已销毁但仍在注册表
-        with threads._registry_lock:
-            threads._registry.add(worker)
-        # 不应抛 RuntimeError（Internal C++ object already deleted）
+        qtbot.wait(50)
+        shiboken6.delete(worker)  # 模拟真实环境销毁
+        # 收尾不应抛异常（TypeError: unhashable list / RuntimeError）
         threads.shutdown_all(timeout_ms=100, terminate_grace_ms=50)
-        with threads._registry_lock:
-            threads._registry.discard(worker)
 
 
 class TestDownloadManagerDialog:

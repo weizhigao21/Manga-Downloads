@@ -56,7 +56,7 @@
 │   ├── models/            # 数据模型
 │   ├── styles/            # 主题样式
 │   └── widgets/           # 漫画卡片、网格视图、翻页栏等组件
-├── tests/                 # pytest 测试套件（158 个用例，离线运行）
+├── tests/                 # pytest 测试套件（159 个用例，离线运行）
 ├── tools/_archive/        # 开发期残留脚本归档（可安全删除）
 ├── requirements.txt       # 运行依赖
 ├── requirements-dev.txt   # 测试/开发依赖
@@ -80,7 +80,7 @@ python src/wnacg_crawler.py -o list.json
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/ -v   # 158 个用例，全部离线运行（UI 用例走 offscreen 离屏渲染）
+python -m pytest tests/ -v   # 159 个用例，全部离线运行（UI 用例走 offscreen 离屏渲染）
 ```
 
 测试覆盖爬虫解析（列表/搜索页）、翻页 URL 构造、图片直链与阅读页提取、文件名清洗与下载跳过逻辑、网络重试与 zip-slip 防御、数据库查重与相似查询（作者提取/名称归一化/封面哈希/三信号聚类/存储路径切换），以及 UI 层（下载任务状态机与持久化恢复、标题显示逻辑、网格响应式列数、相似角标与右键菜单、对话框导入），均不依赖网络。
