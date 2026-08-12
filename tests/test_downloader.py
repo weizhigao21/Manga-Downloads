@@ -2,6 +2,7 @@
 
 import json
 import zipfile
+from pathlib import Path
 
 import pytest
 from lxml import html as lxml_html
@@ -351,3 +352,30 @@ class TestSafeZipMembers:
         out = tmp_path / "out"
         _extract_archive(archive, out)
         assert (out / "a" / "b.txt").read_bytes() == b"content"
+
+
+class TestExtractWith7z:
+    """7z 解压回归：归档相对路径 + 中文 cwd 组合（修复"系统找不到指定的文件"）。"""
+
+    def test_7z_resolves_relative_archive_with_chinese_cwd(self, tmp_path, monkeypatch):
+        """相对路径归档 + 中文 cwd 下 7z 正常解压（不再回退 zipfile）。
+
+        回归：_extract_with_7z 曾把相对路径（如 ./Download/xxx.part）直接传给
+        7z，而 cwd 已切到中文下载目录，7z 以 cwd 为基准找不到文件，
+        报"系统找不到指定的文件"（returncode=2）；现统一 resolve 绝对路径。
+        """
+        from src.downloader import _extract_with_7z, _find_7z
+
+        seven_zip = _find_7z()
+        if not seven_zip:
+            pytest.skip("系统未安装 7z，跳过")
+        monkeypatch.chdir(tmp_path)
+
+        save_dir = Path("下载目录") / "[同人志_汉化] 测试作品"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        archive = Path("下载目录") / "archive.zip.part"  # 相对路径
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("0001.webp", b"x" * 10)
+
+        _extract_with_7z(seven_zip, archive, save_dir)  # 修复前抛 RuntimeError
+        assert (save_dir / "0001.webp").read_bytes() == b"x" * 10

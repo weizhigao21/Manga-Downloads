@@ -255,6 +255,11 @@ class ComicCard(QFrame):
         self.download_btn = QPushButton("下载")
         self.download_btn.setObjectName("downloadButton")
         self.download_btn.setCursor(Qt.PointingHandCursor)
+        # 点击不抢焦点：按钮状态切换（下载→下载中/翻译中→已下载/重试）会
+        # setEnabled(False)，若按钮获焦，焦点移除会触发 QScrollArea 自动
+        # ensureVisible 滚动——按钮恰好部分位于视口边缘外时页面会"自己滑动"。
+        # NoFocus 后点击不获焦，状态切换无焦点变化，滚动不再发生。
+        self.download_btn.setFocusPolicy(Qt.NoFocus)
         # 固定宽度：文本在「下载/下载中.../已下载/重试/翻译中...」间切换时
         # 宽度保持稳定，避免按钮膨胀导致卡片内布局重排、界面视觉跳动
         self.download_btn.setFixedSize(104, 28)

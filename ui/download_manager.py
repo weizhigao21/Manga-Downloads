@@ -303,6 +303,11 @@ class DownloadManager(QObject):
         worker.start()
 
     def _on_progress(self, task: DownloadTask, current: int, total: int):
+        # 终态保护：任务已完成/失败后，迟到的工作线程进度信号（如 7z 解压
+        # 监控线程在 finished 前最后统计的 emit）不得把状态改回"下载中"，
+        # 否则卡片按钮与对话框进度条会从完成态回退（"下载完成又变回下载中"）。
+        if task.status in (DownloadTask.DONE, DownloadTask.FAILED):
+            return
         task.current = current
         task.total = total
         task.status = DownloadTask.DOWNLOADING
@@ -315,6 +320,8 @@ class DownloadManager(QObject):
             self._save_tasks()
 
     def _on_stage(self, task: DownloadTask, stage: str):
+        if task.status in (DownloadTask.DONE, DownloadTask.FAILED):
+            return
         task.stage = stage
         self.task_changed.emit(task)
         self.task_updated.emit()

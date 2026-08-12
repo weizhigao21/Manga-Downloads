@@ -5,6 +5,37 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.26] - 2026-08-12
+
+### 变更
+
+- **设置对话框改为两栏布局**：左侧设置项导航（行为偏好 / 名称翻译 / 项目配置 / 数据库管理），右侧对应详情面板（QListWidget + QStackedWidget），选中项蓝色高亮（`ui/dialogs/settings_dialog.py`）
+- **数据库管理面板内嵌路径配置与清除操作**：直接显示当前数据库/封面缓存路径，提供「更改路径…」入口（打开存储路径设置）；「清除封面缓存」「清空数据库」危险操作按钮（带确认对话框）直接可点，不再需要先打开完整数据库管理窗口（`ui/dialogs/settings_dialog.py`）
+- **数据库管理窗口收敛重复按钮与路径显示**：路径配置与清除操作已在设置面板提供，移除「更改路径」「清空数据库」「清除封面缓存」三个按钮及相关方法、顶部数据库/封面缓存路径显示，仅留「刷新 / 查重 / 关闭」与统计信息（`ui/dialogs/database_dialog.py`）
+- **数据库管理窗口分页 + 搜索 + 状态筛选**：记录表格改为**每页 5 条**分页展示（上一页 / 下一页 / 页码），右上角新增「搜索标题或 ID」输入框与「全部状态 / 已下载 / 未下载」筛选下拉，支持组合过滤（`ui/dialogs/database_dialog.py`）
+
+## [1.2.25] - 2026-08-12
+
+### 修复
+
+- 修复整包下载时 7z 永远解压失败并回退内置 zipfile：`_extract_with_7z` 把**相对路径**压缩包（如 `./Download/xxx.part`）直接传给 7z，而 cwd 已切到中文下载目录——7z 以 cwd 为基准解析不到该相对路径，报 `ERROR: 系统找不到指定的文件`（returncode=2，实测 stderr 含 `Download / System ERROR` 段）；改为归档与 cwd 均传**绝对路径**（`resolve()`），7z 正常解压（`src/downloader.py`）
+- 修复下载管理对话框进度条空白：行数变化时 `_refresh` 重建进度控件但**不按任务状态设初值**（value=0、文本空），需等下一次 `task_updated` 信号才恢复——下载完成后才打开对话框，已完成/进行中任务的进度条永远空白（"下载进度条在下载完成后没有显示了"）；抽出 `_update_row` 供重建/更新分支共用，重建后立即显示真实进度（`ui/dialogs/download_manager_dialog.py`）
+- 修复任务完成态被迟到进度信号覆盖：7z 解压监控线程可能在 `finished` 前最后一次统计时 emit 进度，该信号若排在完成信号之后处理，会把 DONE/FAILED 改回"下载中"（卡片按钮与进度条从完成态回退）；`_on_progress`/`_on_stage` 增加终态保护（`ui/download_manager.py`）
+
+### 测试
+
+- 新增回归用例（155 → 158）：7z 相对路径+中文 cwd 解压成功（`TestExtractWith7z`）、对话框重建后进度条/状态立即初始化（`test_refresh_sets_initial_progress_on_rebuild`）、迟到进度/阶段信号不覆盖 DONE（`test_late_progress_does_not_override_done`）
+
+## [1.2.24] - 2026-08-12
+
+### 修复
+
+- 修复点击下载时页面"自己滑动"：v1.2.22 固定按钮宽度后仍可能触发——下载按钮获得焦点后状态切换（`setEnabled(False)`）移除焦点，QScrollArea 焦点管理会自动 `ensureVisible` 滚动（含 50px 边距），**按钮恰好部分位于视口边缘外时**页面整体上移/下移（实测滚动 75px）。修复：下载按钮设为 `Qt.NoFocus`，点击不获焦 → 状态切换无焦点变化 → 不再触发自动滚动（`ui/widgets/comic_card.py`）；同时覆盖右键「翻译作品名称」按钮复用同一按钮的禁用场景
+
+### 测试
+
+- 新增回归用例（154 → 155）：下载按钮 `focusPolicy == Qt.NoFocus`（保护修复不回归）
+
 ## [1.2.23] - 2026-08-11
 
 ### 修复

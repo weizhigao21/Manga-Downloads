@@ -93,6 +93,23 @@ class TestDownloadManager:
         task = fresh_manager.start_download(_comic())
         qtbot.waitUntil(lambda: task.status == DownloadTask.DONE, timeout=5000)
 
+    def test_late_progress_does_not_override_done(self, fresh_manager):
+        """终态保护：任务完成后，迟到的进度/阶段信号不得把状态改回下载中。
+
+        回归：7z 解压监控线程可能在 finished 前最后一次统计时 emit progress，
+        该信号若排在 finished 之后处理，会把 DONE 覆盖为 DOWNLOADING，
+        卡片按钮与对话框进度条从完成态回退。
+        """
+        task = DownloadTask("1", "完成作品", "/x-aid-1.html")
+        task.status = DownloadTask.DONE
+        task.current, task.total = 100, 100
+        fresh_manager._on_progress(task, 90, 100)
+        fresh_manager._on_stage(task, "解压中")
+        assert task.status == DownloadTask.DONE
+        assert task.current == 100
+        assert task.total == 100
+        assert task.stage == ""
+
     def test_task_for_returns_latest(self, fresh_manager):
         t1 = DownloadTask("1", "作品1", "/x-aid-1.html")
         t2 = DownloadTask("1", "作品1", "/x-aid-1.html")
@@ -379,6 +396,20 @@ class TestSimilarFeature:
         card._sync_download_button(task)
         assert card.download_btn.width() == width_before
 
+    def test_download_button_no_focus_policy(self, qtbot):
+        """下载按钮不抢焦点（NoFocus）。
+
+        回归：按钮状态切换（下载→下载中/翻译中）会 setEnabled(False)，
+        若按钮持有焦点，焦点移除会触发 QScrollArea 自动 ensureVisible 滚动——
+        按钮恰好部分在视口边缘外时页面会"自己滑动"；NoFocus 后点击不获焦，
+        状态切换无焦点变化，滚动不再发生。
+        """
+        from PySide6.QtCore import Qt
+
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        assert card.download_btn.focusPolicy() == Qt.NoFocus
+
     def test_context_menu_has_view_similar_when_count(self, qtbot):
         """similar_count > 0 时右键菜单含「查看类似作品」。"""
         card = ComicCard(self._make_comic())
@@ -628,6 +659,38 @@ class TestDownloadManagerDialog:
         failed.status = DownloadTask.WAITING
         dialog._refresh()
         assert not failed_btn.isVisibleTo(dialog)
+        dialog.close()
+
+    def test_refresh_sets_initial_progress_on_rebuild(self, fresh_manager, qtbot):
+        """重建分支立即按任务状态初始化进度条（回归：打开对话框时进度不空白）。
+
+        修复前：行数变化时重建进度控件，value 恒为 0、文本为空，需等待下一次
+        task_updated 信号才恢复——下载完成后才打开对话框，已完成任务的进度条
+        永远空白（"下载进度条在下载完成后没有显示了"）。
+        """
+        from ui.dialogs.download_manager_dialog import DownloadManagerDialog
+
+        done = DownloadTask("2", "完成作品", "/x-aid-2.html")
+        done.status = DownloadTask.DONE
+        done.current, done.total = 100, 100
+        running = DownloadTask("1", "下载中作品", "/x-aid-1.html")
+        running.status = DownloadTask.DOWNLOADING
+        running.current, running.total = 30, 100
+        fresh_manager.tasks = [done, running]
+
+        dialog = DownloadManagerDialog()  # 打开即 _refresh → 重建分支
+        qtbot.addWidget(dialog)
+        dialog.show()
+
+        done_bar = dialog._bars.get(0)
+        done_label = dialog._labels.get(0)
+        assert done_bar is not None and done_bar.value() == 100
+        assert done_label.text() == "100%"
+        assert dialog.table.item(0, 3).text() == DownloadTask.DONE
+
+        run_bar = dialog._bars.get(1)
+        assert run_bar is not None and run_bar.value() == 30
+        assert dialog._labels.get(1).text() == "30/100"
         dialog.close()
 
     def test_delete_selected_tasks(self, fresh_manager, qtbot, monkeypatch):

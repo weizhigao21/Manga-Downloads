@@ -272,10 +272,13 @@ def _extract_with_7z(
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     # 用 cwd 指定解压目标目录而非 `-o` 参数：7z 的 -o 对含空格路径解析不可靠，
     # cwd 方式彻底规避，且解压结构（含归档内子目录）与目标目录语义一致。
+    # 压缩包与 cwd 必须传绝对路径：归档路径为相对路径（如 ./Download/xxx.part）
+    # 时，7z 会以 cwd（中文下载目录）为基准解析而找不到文件，报
+    # "系统找不到指定的文件"（实测 returncode=2，7z 始终回退 zipfile）。
     save_dir.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(
-        [seven_zip, "x", "-y", str(archive_path)],
-        cwd=str(save_dir),
+        [seven_zip, "x", "-y", str(archive_path.resolve())],
+        cwd=str(save_dir.resolve()),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         creationflags=creationflags,

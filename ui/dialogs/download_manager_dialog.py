@@ -134,8 +134,6 @@ class DownloadManagerDialog(QDialog):
                 self._bars[row] = bar
                 self._labels[row] = pct_label
 
-                self._set_cell(row, 3, task.status, color=self._status_color(task.status))
-
                 # 操作列：失败任务显示重试按钮
                 retry_btn = QPushButton("重试")
                 retry_btn.setObjectName("retryButton")
@@ -150,31 +148,44 @@ class DownloadManagerDialog(QDialog):
                 retry_layout.addStretch()
                 self.table.setCellWidget(row, 4, retry_host)
                 self._retry_buttons[row] = retry_btn
+
+                # 立即按任务状态初始化进度/状态/重试按钮：重建后进度条不再空白
+                # （回归：打开对话框时任务已完成/进行中，重建分支若只建控件不设值，
+                #  进度条将停在 0 且无后续信号恢复——"下载完成后进度条不显示"）
+                self._update_row(row, task)
             self.table.resizeRowsToContents()
             return
 
         # 行数不变：仅更新已有进度条与文本，不重建控件
         for row, task in enumerate(tasks):
-            bar = self._bars.get(row)
-            label = self._labels.get(row)
-            if bar is not None:
-                if task.status == DownloadTask.DOWNLOADING and task.total == 0:
-                    bar.setRange(0, 0)  # 总数未知：不定态
-                else:
-                    bar.setRange(0, max(task.total, 1))
-                    value = (
-                        max(task.total, 1)
-                        if task.status == DownloadTask.DONE
-                        else min(task.current, task.total) if task.total else 0
-                    )
-                    bar.setValue(value)
-            if label is not None:
-                label.setText(self._progress_text(task))
-            self._set_cell(row, 3, task.status, color=self._status_color(task.status))
-            # 重试按钮仅对失败任务可见（重试后自动隐藏）
-            retry_btn = self._retry_buttons.get(row)
-            if retry_btn is not None:
-                retry_btn.setVisible(task.status == DownloadTask.FAILED)
+            self._update_row(row, task)
+
+    def _update_row(self, row: int, task: DownloadTask):
+        """按任务状态刷新单行进度条/进度文本/状态/重试按钮。
+
+        重建分支与更新分支共用：保证新建/打开对话框时进度条立即显示
+        真实进度，而非空白等待下一次信号。
+        """
+        bar = self._bars.get(row)
+        label = self._labels.get(row)
+        if bar is not None:
+            if task.status == DownloadTask.DOWNLOADING and task.total == 0:
+                bar.setRange(0, 0)  # 总数未知：不定态
+            else:
+                bar.setRange(0, max(task.total, 1))
+                value = (
+                    max(task.total, 1)
+                    if task.status == DownloadTask.DONE
+                    else min(task.current, task.total) if task.total else 0
+                )
+                bar.setValue(value)
+        if label is not None:
+            label.setText(self._progress_text(task))
+        self._set_cell(row, 3, task.status, color=self._status_color(task.status))
+        # 重试按钮仅对失败任务可见（重试后自动隐藏）
+        retry_btn = self._retry_buttons.get(row)
+        if retry_btn is not None:
+            retry_btn.setVisible(task.status == DownloadTask.FAILED)
 
     def _on_context_menu(self, pos):
         """表格右键：弹出删除菜单（支持多选批量删除）。
