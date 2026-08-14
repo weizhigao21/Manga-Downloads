@@ -5,6 +5,25 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.27] - 2026-08-14
+
+### 修复
+
+- **修复多任务下载时使用「翻译作品名称」导致程序闪退**（`QThread: Destroyed while thread is still running` → abort）：根因有二——① 所有 worker 子类把 `deleteLater` 连接到了自定义业务完成信号（`finished`/`finished_ok`/`error`），这些信号在 `run()` 返回**之前** emit，主线程处理 DeferredDelete 时底层线程可能仍在收尾，销毁运行中的 QThread 直接崩溃；且自定义 `finished` 遮蔽了 QThread 内置信号，破坏了「线程完全停止后才触发」的清理时机。② `DownloadWorker` 完成时从 `_workers` 弹出即失去唯一强引用（其它 worker 有全局线程注册表保命），Python GC 可能在线程收尾前销毁 C++ 对象。修复：所有 worker 业务信号改名 `done`，清理统一连接**原生 `finished`**，移除 `error`→`deleteLater` 连接，`DownloadWorker` 延迟到原生 finished 再从 `_workers` 移除（`ui/fetch_worker.py`、`ui/translate.py`、`ui/download_manager.py`、`ui/similar_worker.py`、`ui/main_window.py`、`ui/widgets/comic_card.py`、`ui/threads.py`）
+
+### 新增
+
+- **系统托盘驻留**：关闭窗口（点 X）最小化到系统托盘，下载任务在后台继续运行；托盘图标双击/菜单「显示主窗口」恢复窗口，菜单「退出」才真正结束程序（走原有线程安全收尾）。无系统托盘的环境自动降级为直接退出（`ui/tray.py`、`ui/app.py`、`ui/main_window.py`）
+- **下载完成系统通知**：任务下载完成时弹出托盘气泡提示；短时间内的多条完成通知自动合并为一条，避免批量下载刷屏；设置 → 行为偏好新增「下载完成后显示系统通知」开关（`ui/tray.py`、`ui/download_manager.py`、`ui/settings.py`、`ui/dialogs/settings_dialog.py`）
+
+### 变更
+
+- **一键打包脚本健壮性**：依赖检查补 Pillow、新增 Python ≥ 3.10 版本校验、产物目录带版本号（`dist/漫画浏览器-vX.Y.Z/` 不覆盖旧版）、打包日志落盘 `logs/`、打包前清理旧产物并自检主程序 exe（`打包.bat`）
+
+### 测试
+
+- 新增 12 个用例（158 → 170）：下载任务 `task_finished` 信号（成功/失败）、通知合并器（窗口内合并/去重/跨窗口）、托盘控制器（不可用降级/退出标志/窗口显示）、关闭事件三态（托盘可用→隐藏不中断下载、不可用→正常退出、退出流程→放行）、通知设置默认值
+
 ## [1.2.26] - 2026-08-12
 
 ### 变更

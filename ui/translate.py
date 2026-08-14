@@ -96,11 +96,16 @@ class TranslateWorker(QThread):
     """后台翻译线程，避免网络请求阻塞 UI。
 
     Signals:
-        finished(str): 翻译成功，携带翻译结果。
+        done(str): 翻译成功，携带翻译结果。
         error(str): 翻译失败，携带错误信息。
+
+    注意：业务信号命名为 done 而非 finished——QThread 内置 finished 信号
+    在线程完全停止后才触发，清理（deleteLater）必须连它；若自定义信号
+    遮蔽 finished，deleteLater 会在线程仍在运行时执行并触发
+    "QThread: Destroyed while thread is still running" 崩溃（abort）。
     """
 
-    finished = Signal(str)
+    done = Signal(str)
     error = Signal(str)
 
     def __init__(self, text: str, api_base: str, api_key: str, model: str):
@@ -117,7 +122,7 @@ class TranslateWorker(QThread):
             result = translate_title(
                 self.text, self.api_base, self.api_key, self.model
             )
-            self.finished.emit(result)
+            self.done.emit(result)
         except Exception as exc:
             logger.warning("翻译失败: %s", exc)
             self.error.emit(str(exc))

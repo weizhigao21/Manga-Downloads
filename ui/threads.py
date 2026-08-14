@@ -15,10 +15,11 @@
 线程生命周期与注册表：
 - register 在 worker 的 run() 中调用；登记时顺手清理已销毁（deleteLater
   后 C++ 对象失效）的线程，避免注册表长期累积。不使用 finished/
-  destroyed 信号做自动注销：FetchWorker/TranslateWorker 等子类用自定义
-  信号覆盖了内置 finished（如 `FetchWorker.finished = Signal(list)`，
-  携带业务数据），连接 finished 会收到 list；而 destroyed 在对象析构
-  期间不保证调用 Python 槽。
+  destroyed 信号做自动注销：若子类曾用自定义信号遮蔽内置 finished
+  （历史版本 FetchWorker/TranslateWorker 的 `finished = Signal(list/str)`），
+  连接 finished 会收到业务数据；而 destroyed 在对象析构期间不保证调用
+  Python 槽。（现所有 worker 的业务信号已改名 done，deleteLater 统一
+  连接原生 finished，遮蔽问题已消除，注册表清理逻辑仍保留作为双保险。）
 - shutdown_all 对已销毁对象做防御（RuntimeError 跳过），双保险覆盖
   清理窗口期。
 """

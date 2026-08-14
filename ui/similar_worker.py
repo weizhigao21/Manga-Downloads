@@ -34,7 +34,10 @@ class SimilarWorker(QThread):
     即页面抓取所得作品（一页约 20-40 部）。
     """
 
-    finished_ok = Signal(dict)  # {detail_url: [相似记录, ...]}
+    # 业务完成信号。命名 done（而非 finished_ok/finished）并保持与其它
+    # worker 一致：清理（deleteLater）连接原生 finished（线程完全停止后
+    # 才触发），避免在底层线程仍在运行时销毁 QThread 导致 abort 闪退。
+    done = Signal(dict)  # {detail_url: [相似记录, ...]}
     error = Signal(str)
 
     def __init__(self, items: list[tuple[str, str, str, str]], parent=None):
@@ -45,7 +48,7 @@ class SimilarWorker(QThread):
         register(self)
         try:
             similar_map = self._scan()
-            self.finished_ok.emit(similar_map)
+            self.done.emit(similar_map)
         except Exception as exc:  # noqa: BLE001 - 扫描失败不应影响主流程
             logger.warning("相似作品扫描失败: %s", exc)
             self.error.emit(str(exc))

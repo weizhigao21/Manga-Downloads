@@ -17,7 +17,10 @@ class FetchWorker(QThread):
     在全局线程注册表登记，应用退出时统一收尾（见 ui/threads.py）。
     """
 
-    finished = Signal(list)
+    # 业务完成信号。注意：不能命名为 finished——那会遮蔽 QThread 内置的
+    # finished 信号，导致「线程完全停止后才触发」的清理时机丢失；
+    # 清理（deleteLater）应连接原生 finished（见 main_window._launch_fetch）。
+    done = Signal(list)
     error = Signal(str)
 
     def __init__(self, url: str | None = None, page: int = 1, keyword: str = ""):
@@ -33,6 +36,6 @@ class FetchWorker(QThread):
                 comics = search_comics(self.keyword, self.page)
             else:
                 comics = fetch_page(self.page, self.url)
-            self.finished.emit(comics)
+            self.done.emit(comics)
         except Exception as exc:
             self.error.emit(str(exc))

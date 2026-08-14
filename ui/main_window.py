@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -85,6 +86,10 @@ class MainWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索漫画名称，回车搜索")
         self.search_edit.setMinimumWidth(280)
+        # 搜索框随窗口宽度自适应拉伸（上限 480px），避免宽窗口下留出大片空白；
+        # 超出上限后由 addStretch 把按钮组推到右侧
+        self.search_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.search_edit.setMaximumWidth(480)
         self.search_edit.returnPressed.connect(self._on_search_submit)
         self.search_edit.textChanged.connect(self._on_search_text_changed)
         toolbar_layout.addWidget(self.search_edit)
@@ -431,14 +436,16 @@ class MainWindow(QMainWindow):
             page=self._current_page,
             keyword=self._search_keyword,
         )
-        self._worker.finished.connect(
+        self._worker.done.connect(
             lambda raw, s=seq: self._on_fetch_finished(raw, s)
         )
         self._worker.error.connect(
             lambda msg, s=seq: self._on_fetch_error(msg, s)
         )
+        # 清理连原生 finished（线程完全停止后才触发）；error 信号在 run() 内
+        # emit（线程未退出），不能连 deleteLater，否则销毁运行中的 QThread 会
+        # 触发 "QThread: Destroyed while thread is still running" 崩溃
         self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.error.connect(self._worker.deleteLater)
         self._worker.start()
 
     def _on_page_requested(self, page: int):
@@ -519,10 +526,12 @@ class MainWindow(QMainWindow):
             return
         worker = SimilarWorker(items)
         self._similar_worker = worker
-        worker.finished_ok.connect(self._on_similar_done)
+        worker.done.connect(self._on_similar_done)
         worker.error.connect(self._on_similar_error)
-        worker.finished_ok.connect(worker.deleteLater)
-        worker.error.connect(worker.deleteLater)
+        # 清理连原生 finished（线程完全停止后触发），不连 done/error——
+        # 它们在 run() 返回前 emit，此时销毁运行中的 QThread 会触发
+        # "QThread: Destroyed while thread is still running" 崩溃
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _on_similar_done(self, similar_map: dict):
@@ -658,15 +667,21 @@ class MainWindow(QMainWindow):
         self.comics_grid.reflow()
 
     def closeEvent(self, event):
-        """关闭窗口（即退出程序）时快速收尾后台线程：
+        """关闭窗口：托盘可用时最小化到托盘（后台下载继续），否则退出程序。
 
-        1. 抓取线程：引用由全局线程注册表持有（ui/threads.py），
-           应用退出时统一中断并限时强制终止，此处不阻塞；
-        2. 下载线程：此处仅请求中断（不等待），让线程在下一个检查点
-           退出；最终限时收尾由应用退出流程（aboutToQuit → shutdown）
-           完成，关闭窗口不再同步阻塞 2.5s（写文件为原子替换，
-           中断/强制终止也不会损坏数据）。
+        托盘模式（默认）：点 X 仅隐藏窗口，下载任务继续在后台运行；
+        通过托盘菜单「退出」才真正结束程序（is_quitting 放行本次关闭）。
+        非托盘模式（无系统托盘环境）：保持原行为——请求中断下载线程，
+        最终限时收尾由应用退出流程（aboutToQuit → shutdown）完成。
         """
+        from ui.tray import get_tray
+
+        tray = get_tray()
+        if tray.available and not tray.is_quitting:
+            event.ignore()
+            self.hide()
+            tray.on_window_hidden()
+            return
         self._worker = None
         DownloadManager.instance().request_interruption()
         super().closeEvent(event)

@@ -55,6 +55,9 @@ class ComicCard(QFrame):
         if downloaded is not None:
             self._pre_downloaded = downloaded
         self._update_title_label()
+        self.count_label.setText(f"图片: {self.comic.count_text}")
+        self.date_label.setText(f"上传: {self.comic.formatted_date}")
+        self.url_label.setText(self.comic.detail_url)
         self._sync_download_button()
         self._update_similar_badge()
         # 封面来源变化时重新加载（QPixmapCache 命中则直接复用，无需网络）
@@ -545,10 +548,12 @@ class ComicCard(QFrame):
             settings.translate_model,
         )
         self._translate_worker = worker  # 保持引用，防止线程被回收
-        worker.finished.connect(self._on_translate_done)
+        worker.done.connect(self._on_translate_done)
         worker.error.connect(self._on_translate_error)
+        # 清理连原生 finished（线程完全停止后才触发）：done/error 在 run()
+        # 返回前 emit，若连 deleteLater 会在底层线程仍在运行时销毁 QThread，
+        # 触发 "QThread: Destroyed while thread is still running" 闪退
         worker.finished.connect(worker.deleteLater)
-        worker.error.connect(worker.deleteLater)
         worker.start()
 
     def _on_translate_done(self, result: str):

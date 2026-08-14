@@ -139,6 +139,23 @@ class SettingsDialog(QDialog):
         auto_hint.setIndent(22)
         v.addWidget(auto_hint)
 
+        self.notify_checkbox = QCheckBox("下载完成后显示系统通知")
+        self.notify_checkbox.setChecked(
+            self._settings.notify_on_download_done
+        )
+        v.addWidget(self.notify_checkbox)
+
+        notify_hint = QLabel(
+            "开启后，下载完成时通过系统托盘气泡提示；关闭窗口后应用驻留"
+            "托盘继续后台下载，可在设置中随时关闭此提示。"
+        )
+        notify_hint.setStyleSheet(
+            f"color: {PALETTE['text_secondary']}; font-size: 12px;"
+        )
+        notify_hint.setIndent(22)
+        notify_hint.setWordWrap(True)
+        v.addWidget(notify_hint)
+
         v.addStretch()
         return page
 
@@ -384,6 +401,7 @@ class SettingsDialog(QDialog):
             self.convert_checkbox.isChecked()
         )
         self._settings.auto_fetch_on_startup = self.auto_fetch_checkbox.isChecked()
+        self._settings.notify_on_download_done = self.notify_checkbox.isChecked()
         self._settings.save()
 
         # 保存项目配置

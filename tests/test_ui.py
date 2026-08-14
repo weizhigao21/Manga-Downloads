@@ -223,6 +223,43 @@ class TestDownloadManager:
         # 最终进度值仍准确
         assert task.status == DownloadTask.DONE
 
+    def test_task_finished_signal_emitted(self, fresh_manager, qtbot, monkeypatch):
+        """下载完成时发出 task_finished 信号（供系统托盘通知等订阅）。"""
+        def fake_ok(*args, **kwargs):
+            pass
+
+        monkeypatch.setattr(dm, "download_comic", fake_ok)
+        monkeypatch.setattr(
+            "ui.database.DatabaseManager.mark_downloaded", lambda self, url: None
+        )
+
+        finished: list = []
+        fresh_manager.task_finished.connect(
+            lambda t, ok, err: finished.append((t, ok, err))
+        )
+        task = fresh_manager.start_download(_comic())
+        qtbot.waitUntil(lambda: task.status == DownloadTask.DONE, timeout=5000)
+
+        assert len(finished) == 1
+        assert finished[0][0] is task
+        assert finished[0][1] is True
+        assert finished[0][2] == ""
+
+    def test_task_finished_signal_emitted_on_failure(self, fresh_manager, qtbot, monkeypatch):
+        """下载失败同样发出 task_finished（success=False）。"""
+        def fake_fail(*args, **kwargs):
+            raise RuntimeError("网络错误")
+
+        monkeypatch.setattr(dm, "download_comic", fake_fail)
+        finished: list = []
+        fresh_manager.task_finished.connect(
+            lambda t, ok, err: finished.append((ok, err))
+        )
+        task = fresh_manager.start_download(_comic())
+        qtbot.waitUntil(lambda: task.status == DownloadTask.FAILED, timeout=5000)
+
+        assert finished == [(False, "网络错误")]
+
 
     def test_shutdown_without_tasks_returns_immediately(self, fresh_manager):
         fresh_manager.shutdown(timeout_ms=50)
@@ -835,3 +872,189 @@ class TestDatabaseIncrementalCache:
         finally:
             db.DatabaseManager._instance = None
             db._invalidate_records_cache()
+
+
+class TestNotifyMerger:
+    """下载完成通知合并器：窗口内多条合并、标题去重、窗口外分开发出。"""
+
+    def test_merges_within_window(self, qtbot):
+        from ui.tray import NotifyMerger
+
+        flushed: list = []
+        merger = NotifyMerger(window_ms=120)
+        merger.flushed.connect(lambda titles: flushed.append(titles))
+
+        merger.push("作品A")
+        merger.push("作品B")
+        qtbot.wait(250)
+
+        assert flushed == [["作品A", "作品B"]]
+        assert merger.pending == []
+
+    def test_dedupes_duplicate_titles(self, qtbot):
+        from ui.tray import NotifyMerger
+
+        flushed: list = []
+        merger = NotifyMerger(window_ms=120)
+        merger.flushed.connect(lambda titles: flushed.append(titles))
+
+        merger.push("作品A")
+        merger.push("作品A")  # 重复标题（如同一作品重试两次）不重复通知
+        merger.push("作品B")
+        qtbot.wait(250)
+
+        assert flushed == [["作品A", "作品B"]]
+
+    def test_separate_windows_flush_separately(self, qtbot):
+        from ui.tray import NotifyMerger
+
+        flushed: list = []
+        merger = NotifyMerger(window_ms=80)
+        merger.flushed.connect(lambda titles: flushed.append(titles))
+
+        merger.push("作品A")
+        qtbot.wait(150)  # 第一窗口到期
+        merger.push("作品B")
+        qtbot.wait(150)  # 第二窗口到期
+
+        assert flushed == [["作品A"], ["作品B"]]
+
+
+class TestTrayController:
+    """系统托盘控制器：不可用环境降级、退出标志、窗口关闭行为。"""
+
+    def test_unavailable_is_safe_noop(self):
+        from ui.tray import TrayController
+
+        tray = TrayController(available=False)
+        assert not tray.available
+        tray.notify_download_done("X")  # 不应抛异常
+        tray.on_window_hidden()         # 不应抛异常
+        tray.show_window()              # 无关联窗口也不应抛异常
+        assert not tray.is_quitting
+
+    def test_quit_app_marks_quitting(self):
+        from ui.tray import TrayController
+
+        tray = TrayController(available=False)
+        tray.quit_app()
+        assert tray.is_quitting
+
+    def test_attach_show_window(self, qtbot):
+        """show_window 显示并前置关联窗口。"""
+        from PySide6.QtWidgets import QMainWindow
+
+        from ui.tray import TrayController
+
+        tray = TrayController(available=False)
+        window = QMainWindow()
+        tray.attach(window)
+        window.show()
+        qtbot.wait(30)
+        window.hide()
+        tray.show_window()
+        qtbot.wait(30)
+        assert window.isVisible()
+        window.close()
+
+    def test_close_event_hides_window_when_tray_available(self, qtbot, monkeypatch):
+        """托盘可用时点 X 关闭：事件被忽略、窗口隐藏、不请求中断下载。
+
+        回归：托盘模式下关闭窗口不得中断后台下载（request_interruption 不调用）。
+        """
+        from PySide6.QtGui import QCloseEvent
+
+        import ui.main_window as mw_mod
+        from ui.download_manager import DownloadManager
+
+        class FakeTray:
+            available = True
+            is_quitting = False
+            hidden = 0
+
+            def on_window_hidden(self):
+                self.hidden += 1
+
+        fake = FakeTray()
+        monkeypatch.setattr("ui.tray.get_tray", lambda: fake)
+        interrupted: list = []
+        monkeypatch.setattr(
+            DownloadManager, "request_interruption",
+            lambda self: interrupted.append(1),
+        )
+        # 轻量化构造真实 MainWindow（跳过 UI 构建与数据加载）
+        monkeypatch.setattr(mw_mod.MainWindow, "_setup_ui", lambda self: None)
+        monkeypatch.setattr(mw_mod.MainWindow, "_load_initial_data", lambda self: None)
+
+        window = mw_mod.MainWindow()
+        event = QCloseEvent()
+        mw_mod.MainWindow.closeEvent(window, event)
+
+        assert event.isAccepted() is False  # event.ignore() 生效
+        assert not window.isVisible()
+        assert fake.hidden == 1
+        assert interrupted == []  # 下载未被中断
+
+    def test_close_event_quits_when_no_tray(self, qtbot, monkeypatch):
+        """无托盘环境关闭窗口：保持原退出行为（请求中断下载 + 接受关闭）。"""
+        from PySide6.QtGui import QCloseEvent
+
+        import ui.main_window as mw_mod
+        from ui.download_manager import DownloadManager
+
+        class FakeTray:
+            available = False
+            is_quitting = False
+
+            def on_window_hidden(self):
+                raise AssertionError("无托盘时不应隐藏到托盘")
+
+        monkeypatch.setattr("ui.tray.get_tray", lambda: FakeTray())
+        interrupted: list = []
+        monkeypatch.setattr(
+            DownloadManager, "request_interruption",
+            lambda self: interrupted.append(1),
+        )
+        monkeypatch.setattr(mw_mod.MainWindow, "_setup_ui", lambda self: None)
+        monkeypatch.setattr(mw_mod.MainWindow, "_load_initial_data", lambda self: None)
+
+        window = mw_mod.MainWindow()
+        event = QCloseEvent()
+        mw_mod.MainWindow.closeEvent(window, event)
+
+        assert event.isAccepted() is True  # 正常接受关闭
+        assert interrupted == [1]  # 退出流程请求中断下载
+
+    def test_close_event_passes_through_when_quitting(self, qtbot, monkeypatch):
+        """托盘菜单「退出」流程中关闭窗口：放行退出（不再隐藏到托盘）。"""
+        from PySide6.QtGui import QCloseEvent
+
+        import ui.main_window as mw_mod
+        from ui.download_manager import DownloadManager
+
+        class FakeTray:
+            available = True
+            is_quitting = True  # 托盘退出流程已启动
+
+            def on_window_hidden(self):
+                raise AssertionError("退出流程中不应隐藏")
+
+        monkeypatch.setattr("ui.tray.get_tray", lambda: FakeTray())
+        monkeypatch.setattr(
+            DownloadManager, "request_interruption", lambda self: None,
+        )
+        monkeypatch.setattr(mw_mod.MainWindow, "_setup_ui", lambda self: None)
+        monkeypatch.setattr(mw_mod.MainWindow, "_load_initial_data", lambda self: None)
+
+        window = mw_mod.MainWindow()
+        event = QCloseEvent()
+        mw_mod.MainWindow.closeEvent(window, event)
+
+        assert event.isAccepted() is True  # 放行退出
+
+
+def test_notify_setting_default_enabled():
+    """下载完成通知设置默认开启（写入 DEFAULT_SETTINGS）。"""
+    from ui.settings import DEFAULT_SETTINGS
+
+    assert DEFAULT_SETTINGS["notify_on_download_done"] is True

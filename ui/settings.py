@@ -13,6 +13,7 @@ SETTINGS_PATH = ROOT_DIR / "Config" / "settings.json"
 
 DEFAULT_SETTINGS = {
     "auto_fetch_on_startup": True,
+    "notify_on_download_done": True,
     # 名称翻译（DeepSeek / OpenAI 兼容接口）
     "translate_api_base": "https://api.deepseek.com",
     "translate_model": "deepseek-v4-pro",
@@ -110,6 +111,15 @@ class AppSettings:
     @auto_fetch_on_startup.setter
     def auto_fetch_on_startup(self, value: bool):
         self._settings["auto_fetch_on_startup"] = bool(value)
+
+    @property
+    def notify_on_download_done(self) -> bool:
+        """下载完成后是否显示系统托盘通知。"""
+        return bool(self._settings.get("notify_on_download_done", True))
+
+    @notify_on_download_done.setter
+    def notify_on_download_done(self, value: bool):
+        self._settings["notify_on_download_done"] = bool(value)
 
     @property
     def translate_api_base(self) -> str:

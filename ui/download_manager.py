@@ -51,7 +51,13 @@ class DownloadWorker(QThread):
 
     progress = Signal(object, int, int)   # (task, 当前数量, 总数)
     stage = Signal(object, str)           # (task, 阶段文本)
-    finished = Signal(object, bool, str)  # (task, 是否成功, 错误信息)
+    done = Signal(object, bool, str)      # (task, 是否成功, 错误信息)
+
+    # 注意：业务完成信号命名为 done 而非 finished——自定义 finished 会遮蔽
+    # QThread 内置信号，使「线程完全停止后才触发」的清理时机丢失；run() 内
+    # emit 后、底层线程真正退出前存在竞态窗口，若此时 deleteLater 销毁
+    # QThread 对象会触发 "QThread: Destroyed while thread is still running"
+    # 崩溃（abort）。清理连接原生 finished（见 _launch_worker）。
 
     def __init__(self, comic: dict, base_dir: Path, task: DownloadTask):
         super().__init__()
@@ -87,17 +93,17 @@ class DownloadWorker(QThread):
                     self.stage.emit(self.task, s),
                 ),
             )
-            self.finished.emit(self.task, True, "")
+            self.done.emit(self.task, True, "")
         except InterruptedError:
             logging.getLogger(__name__).info(
                 "下载任务被中断: title=%s", self.task.title
             )
-            self.finished.emit(self.task, False, "下载已中断")
+            self.done.emit(self.task, False, "下载已中断")
         except Exception as exc:
             logging.getLogger(__name__).exception(
                 "下载任务失败: title=%s, detail_url=%s", self.task.title, self.task.detail_url
             )
-            self.finished.emit(self.task, False, str(exc))
+            self.done.emit(self.task, False, str(exc))
 
 
 class DownloadManager(QObject):
@@ -110,6 +116,7 @@ class DownloadManager(QObject):
     task_updated = Signal()        # 无参广播（下载管理对话框等全量刷新）
     task_changed = Signal(object)  # 携带任务（漫画卡片等按任务定向响应，避免各自遍历）
     task_deleted = Signal(object)  # 携带被删除的任务（卡片收到后回到未下载状态）
+    task_finished = Signal(object, bool, str)  # (task, 是否成功, 错误信息)：任务终态广播（供系统通知等）
 
     _instance: "DownloadManager | None" = None
 
@@ -295,7 +302,15 @@ class DownloadManager(QObject):
         self._workers[task] = worker
         worker.progress.connect(self._on_progress)
         worker.stage.connect(self._on_stage)
-        worker.finished.connect(self._on_finished)
+        worker.done.connect(self._on_finished)
+        # 清理挂在原生 finished（线程完全停止后才触发）：
+        # 1) 从 _workers 移除——在此之前该 dict 持有强引用，保证 worker
+        #    包装对象在线程停止前不会被 Python GC 销毁（否则 QThread 析构
+        #    时底层线程仍在运行 → "QThread: Destroyed while thread is still
+        #    running" 崩溃闪退；实测多任务下载 + 翻译时高频复现）；
+        # 2) deleteLater 销毁 C++ 对象。
+        # 注意：业务信号 done 在 run() 返回前 emit，不能把清理挂在它上面。
+        worker.finished.connect(lambda: self._workers.pop(task, None))
         worker.finished.connect(worker.deleteLater)
         self.task_changed.emit(task)
         self.task_updated.emit()
@@ -328,7 +343,8 @@ class DownloadManager(QObject):
         self._save_tasks()
 
     def _on_finished(self, task: DownloadTask, success: bool, error: str):
-        self._workers.pop(task, None)
+        # worker 从 _workers 移除由原生 finished 的清理回调负责
+        # （_launch_worker 中连接），此处只更新任务状态与数据库标记。
         if success:
             task.status = DownloadTask.DONE
             task.stage = ""
@@ -342,6 +358,8 @@ class DownloadManager(QObject):
             task.error = error
         self.task_changed.emit(task)
         self.task_updated.emit()
+        # 任务终态广播（成功/失败）：供系统托盘通知等 UI 侧订阅
+        self.task_finished.emit(task, success, error)
         self._save_tasks()
 
     def task_for(self, comic: ComicItem) -> DownloadTask | None:

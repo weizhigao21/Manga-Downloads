@@ -2,7 +2,7 @@
 
 > 项目地址：<https://github.com/weizhigao21/Manga-Downloads>
 >
-> 当前版本：v1.2.26（更新日志见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v1.2.27（更新日志见 [CHANGELOG.md](CHANGELOG.md)）
 
 基于 PySide6 的 wnacg.com（紳士漫畫）桌面浏览器与下载工具，支持分类浏览、关键词搜索、封面缓存、多模式下载与断点续传。
 
@@ -24,6 +24,7 @@
 - **温和反爬**：全局请求节流（统一收敛于 `src/net.py`）+ 指数退避重试（429/403/5xx 自动等待）；整包下载使用 TLS/HTTP2 指纹模拟（curl_cffi）绕过 Cloudflare 校验，避免触发站点限流
 - **站点结构变化感知**：列表页解析为 0 条时状态栏明确提示"站点结构可能已改版"，而非静默显示"共 0 部"
 - **线程安全退出**：关闭窗口/退出程序时统一收尾后台线程（抓取/下载/翻译），请求中断并限时等待，避免 `QThread: Destroyed while thread is still running`
+- **系统托盘驻留**：关闭窗口（点 X）最小化到系统托盘，下载任务在后台继续运行，托盘图标双击/菜单可随时显示主窗口，托盘菜单「退出」才真正结束程序；下载完成时弹出托盘气泡通知（短时间内的多条完成通知自动合并，避免刷屏，可在设置中关闭）
 - **稳定布局**：抓取过程中界面不跳动——进度条置于固定宽度容器，状态信息与进度条固定在左下角，翻页按钮组水平居中；窗口显示即按真实宽度渲染多列网格，首次进入不会出现单列错排；刷新、翻页与搜索加载完成后自动回到列表顶部；下载按钮不抢焦点，点击下载不会因按钮状态切换触发页面滑动；下载管理对话框打开时已完成/进行中任务的进度条立即正常显示
 
 ## 项目结构
@@ -51,6 +52,7 @@
 │   ├── translate.py       # AI 名称翻译（DeepSeek/OpenAI 兼容，后台线程）
 │   ├── similar_worker.py  # 页面相似作品后台扫描（本地库三信号匹配）
 │   ├── threads.py         # 后台线程注册表（退出时统一中断等待）
+│   ├── tray.py            # 系统托盘（最小化驻留 + 下载完成通知合并）
 │   ├── version.py         # 版本号（独立模块避免循环导入）
 │   ├── dialogs/           # 设置、翻译设置、数据库管理、查重、存储路径、下载管理对话框
 │   ├── models/            # 数据模型
@@ -125,6 +127,7 @@ pip install pre-commit && pre-commit install
 | 字段 | 说明 | 默认值 |
 | --- | --- | --- |
 | `auto_fetch_on_startup` | 启动时自动抓取最新数据 | `true` |
+| `notify_on_download_done` | 下载完成时显示系统托盘通知 | `true` |
 | `translate_api_base` | 名称翻译接口地址（OpenAI 兼容） | `https://api.deepseek.com` |
 | `translate_model` | 名称翻译模型 | `deepseek-v4-pro` |
 | `translate_api_key` | 名称翻译 API Key（仅存本地） | 空 |

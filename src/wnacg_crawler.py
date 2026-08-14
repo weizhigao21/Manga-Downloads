@@ -24,7 +24,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import ProjectConfig
-from src.net import _RETRYABLE_STATUS, _throttle, fetch_with_retry
+from src.net import _RETRYABLE_STATUS, _should_retry, _throttle, fetch_with_retry
 from src.net import fetch as _net_fetch
 from src.utils import data_root, safe_filename
 
@@ -309,8 +309,9 @@ def _extract_image_url(detail_doc) -> str | None:
 def _fetch_picture_link(link: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str | None:
     """获取单张图片详情页中的图片直链，失败时返回 None。
 
-    对 429/403/5xx 等反爬/限流响应进行指数退避重试（0.5s → 1s → 2s），
-    避免密集请求触发站点反爬限制。
+    对限流（429/403/5xx）、连接错误与超时进行指数退避重试（0.5s → 1s → 2s），
+    避免密集请求或弱网抖动导致整部作品的图片链接获取失败；业务类 4xx
+    （如 404）不重试，直接跳过。
     """
     for attempt in range(retries):
         try:
@@ -321,21 +322,16 @@ def _fetch_picture_link(link: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str |
                 logger.warning("图片详情页未找到图片直链: 条目=%s", link)
                 return None
             return img_url
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else 0
-            if status in _RETRYABLE_STATUS:
-                wait = 0.5 * (2**attempt) + random.uniform(0, 0.5)
-                logger.warning(
-                    "获取图片详情页被限流(HTTP %d)，第 %d/%d 次重试，等待 %.1fs: %s",
-                    status, attempt + 1, retries, wait, link,
-                )
-                time.sleep(wait)
-                continue
-            logger.warning("获取图片详情页失败(HTTP %d): %s, 错误: %s", status, link, exc)
-            return None
-        except Exception as exc:
-            logger.warning("获取图片详情页失败: %s, 错误: %s", link, exc)
-            return None
+        except requests.RequestException as exc:
+            if not _should_retry(exc):
+                logger.warning("获取图片详情页失败: 条目=%s, 错误: %s", link, exc)
+                return None
+            wait = 0.5 * (2**attempt) + random.uniform(0, 0.5)
+            logger.warning(
+                "获取图片详情页失败(%s)，第 %d/%d 次重试，等待 %.1fs: %s",
+                type(exc).__name__, attempt + 1, retries, wait, link,
+            )
+            time.sleep(wait)
     logger.warning("获取图片详情页重试 %d 次仍失败，跳过: %s", retries, link)
     return None
 

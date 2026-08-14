@@ -34,3 +34,6 @@ start_ui.bat
 build/
 dist/
 *.manifest
+
+# 打包脚本运行日志
+logs/

@@ -9,7 +9,9 @@ from PySide6.QtWidgets import QApplication
 
 from ui.download_manager import DownloadManager
 from ui.main_window import MainWindow
+from ui.settings import AppSettings
 from ui.threads import shutdown_all
+from ui.tray import get_tray
 from ui.version import __version__
 
 
@@ -42,6 +44,18 @@ def main():
     if icon.exists():
         window.setWindowIcon(QIcon(str(icon)))
     window.show()
+
+    # 系统托盘：关闭窗口最小化到托盘，下载在后台继续；
+    # 托盘菜单「退出」才真正结束程序（见 ui/tray.py 与 main_window.closeEvent）
+    tray = get_tray(str(icon) if icon.exists() else None)
+    tray.attach(window)
+
+    # 下载完成系统通知（可合并、可开关；走托盘气泡，无托盘时静默）
+    def _on_task_finished(task, success: bool, error: str):
+        if success and AppSettings().notify_on_download_done:
+            tray.notify_download_done(task.title)
+
+    DownloadManager.instance().task_finished.connect(_on_task_finished)
 
     # 应用退出兜底：统一收尾所有后台线程（下载线程 + 抓取/翻译线程）。
     # 短时等待后仍未结束的线程强制终止，保证退出不卡顿。
