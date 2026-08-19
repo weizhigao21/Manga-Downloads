@@ -36,10 +36,22 @@ QFrame#pageBar {{
     border-top: 1px solid {PALETTE["border"]};
 }}
 
-QLabel#pageLabel {{
+QSpinBox#pageSpinBox {{
     font-size: 14px;
     font-weight: 600;
     color: {PALETTE["text"]};
+    background-color: {PALETTE["surface"]};
+    border: 1px solid {PALETTE["border"]};
+    border-radius: 4px;
+    padding: 2px 6px;
+}}
+
+QSpinBox#pageSpinBox:hover {{
+    border-color: {PALETTE["text_secondary"]};
+}}
+
+QSpinBox#pageSpinBox:focus {{
+    border-color: {PALETTE["primary"]};
 }}
 
 QPushButton#pageButton {{

@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.28] - 2026-08-19
+
+### 新增
+
+- **翻页栏页码跳转**：底部翻页栏页码由纯展示改为可输入框（QSpinBox），直接输入数字回车/失焦即跳转到指定页，方向键可微调；列表浏览与关键词搜索均支持，页码未变化时不会重复加载（`ui/widgets/page_bar.py`、`ui/styles/light_theme.py`）
+- **单实例运行**：程序已运行时再次启动（如最小化到托盘后重新双击 exe）不会多开窗口，二次启动进程自动通知已运行实例并退出，主窗口被唤起并置前（QLockFile 判单例 + QLocalServer 命名管道通知，跨平台可靠；`ui/single_instance.py`、`ui/app.py`）
+
+### 变更
+
+- **打包脚本产物瘦身**：spec 排除环境误收集的非项目依赖（pythonnet / sounddevice / werkzeug / flask / websockets / safehttpx）与 QtSvg / QtVirtualKeyboard 动态库，缩小 onedir 体积（`漫画浏览器.spec`）
+
+### 测试
+
+- 新增 5 个用例（170 → 175）：翻页栏跳页输入（跳页 emit / 同页忽略 / set_page 同步与上一页禁用 / 最小值钳制 / 上一页下一页 ±1）
+
 ## [1.2.27] - 2026-08-14
 
 ### 修复

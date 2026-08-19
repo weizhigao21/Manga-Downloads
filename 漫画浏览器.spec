@@ -47,6 +47,13 @@ a = Analysis(
         "win32con",
         "win32gui",
         "Pythonwin",
+        # 环境里装过、被 hook 误收集进打包的非项目依赖
+        "pythonnet",
+        "sounddevice",
+        "werkzeug",
+        "flask",
+        "websockets",
+        "safehttpx",
         # 未使用的 Qt 模块（项目为纯 Widgets 应用）
         "PySide6.QtQuick",
         "PySide6.QtQml",
@@ -69,12 +76,14 @@ a = Analysis(
         "PySide6.QtDBus",
         "PySide6.QtDesigner",
         "PySide6.QtOpenGLWidgets",
+        "PySide6.QtSvg",
+        "PySide6.QtVirtualKeyboard",
     ],
     noarchive=False,
 )
 
 # PySide6 hook 会全量收集包内所有 DLL（excludes 拦不住），
-# 手动过滤未使用的 Qt 模块动态库（QML/Quick/PDF 等，纯 Widgets 应用用不到）
+# 手动过滤未使用的 Qt 模块动态库（QML/Quick/PDF/VirtualKeyboard/Svg 等，纯 Widgets 应用用不到）
 _QT_UNUSED_KEYWORDS = (
     "qt6quick",
     "qt6qml",
@@ -84,16 +93,78 @@ _QT_UNUSED_KEYWORDS = (
     "qt6qmlworkerscript",
     "qt6opengl",
     "opengl32sw",
+    "virtualkeyboard",
+    "qt6svg",
+    "qsvg",
+    "qt6quickcontrols2",
+)
+
+# 本机环境里被 hook 误收集、项目完全用不到的动态库（排除纯模块拦不住 DLL）
+_UNUSED_BIN_KEYWORDS = (
+    "pythonnet",        # pythonnet CLR 运行时
+    "_sounddevice_data",
+    "portaudio",        # sounddevice 音频库
+    "win32evtlog",      # pywin32 残留
+    "pywintypes",
+    "win32comext",
+    "win32wnet",
+    "win32security",
+    "win32service",
+    "win32api",
+    "win32gui",
+    "win32com",
+    "werkzeug",
+    "websockets",
 )
 
 
 def _keep_qt_binary(entry):
     """返回 False 则从打包中移除该动态库。"""
     name = entry[0].lower()
-    return not any(k in name for k in _QT_UNUSED_KEYWORDS)
+    if any(k in name for k in _QT_UNUSED_KEYWORDS):
+        return False
+    if any(k in name for k in _UNUSED_BIN_KEYWORDS):
+        return False
+    return True
 
 
 a.binaries = [e for e in a.binaries if _keep_qt_binary(e)]
+
+# Qt 翻译文件与 dist-info 元数据也走 datas（excludes 拦不住），同样手动过滤：
+# - 翻译只保留中英文（项目未装 QTranslator，界面文字为硬编码中文，.qm 仅兜底）
+# - 丢弃被误收集包（werkzeug/websockets/flask/sounddevice/pythonnet）的元数据残留
+_KEEP_TRANSLATIONS = {
+    "qtbase_zh_cn.qm",
+    "qtbase_zh_tw.qm",
+    "qtbase_en.qm",
+    "qt_zh_cn.qm",
+    "qt_zh_tw.qm",
+    "qt_en.qm",
+}
+_DROP_DATA_PACKAGES = (
+    "werkzeug",
+    "websockets",
+    "flask",
+    "sounddevice",
+    "pythonnet",
+)
+
+
+def _keep_data(entry):
+    """返回 False 则从打包中移除该数据文件。"""
+    # PyInstaller 在 Windows 上 TOC 用反斜杠，统一转正斜杠再匹配
+    name = entry[0].lower().replace("\\", "/")
+    for pkg in _DROP_DATA_PACKAGES:
+        if f"{pkg}-" in name and ".dist-info" in name:
+            return False
+    if name.startswith("pythonnet/"):
+        return False
+    if "/translations/" in name and name.endswith(".qm"):
+        return name.rsplit("/", 1)[1] in _KEEP_TRANSLATIONS
+    return True
+
+
+a.datas = [e for e in a.datas if _keep_data(e)]
 
 pyz = PYZ(a.pure)
 

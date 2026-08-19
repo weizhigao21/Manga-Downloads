@@ -373,6 +373,73 @@ class TestComicsGrid:
         assert len(grid._cards) == 10
 
 
+class TestPageBar:
+    """翻页栏：跳页输入、页码同步、翻页按钮。"""
+
+    def _bar(self, qtbot):
+        from ui.widgets import PageBar
+
+        bar = PageBar()
+        qtbot.addWidget(bar)
+        bar.show()
+        return bar
+
+    def test_jump_emits_page_requested(self, qtbot):
+        """页码框输入新页码回车：发出 page_requested 并携带目标页。"""
+        from PySide6.QtCore import Qt
+
+        bar = self._bar(qtbot)
+        received: list = []
+        bar.page_requested.connect(received.append)
+        bar.set_page(3)
+        bar.page_spin.setFocus()
+        bar.page_spin.selectAll()
+        qtbot.keyClicks(bar.page_spin, "8")
+        qtbot.keyClick(bar.page_spin, Qt.Key_Return)
+        assert received == [8]
+
+    def test_jump_same_page_ignored(self, qtbot):
+        """页码未变化（回车/失焦）：不重复发出请求。"""
+        from PySide6.QtCore import Qt
+
+        bar = self._bar(qtbot)
+        received: list = []
+        bar.page_requested.connect(received.append)
+        bar.set_page(3)
+        bar.page_spin.setFocus()
+        bar.page_spin.selectAll()
+        qtbot.keyClicks(bar.page_spin, "3")
+        qtbot.keyClick(bar.page_spin, Qt.Key_Return)
+        assert received == []
+
+    def test_set_page_syncs_spinbox_and_buttons(self, qtbot):
+        """set_page 同步页码框值；第 1 页时禁用上一页。"""
+        bar = self._bar(qtbot)
+        bar.set_page(5)
+        assert bar.page_spin.value() == 5
+        assert bar.prev_btn.isEnabled()
+        bar.set_page(1)
+        assert bar.page_spin.value() == 1
+        assert not bar.prev_btn.isEnabled()
+
+    def test_set_page_clamps_min(self, qtbot):
+        bar = self._bar(qtbot)
+        bar.set_page(0)
+        assert bar.page_spin.value() == 1
+
+    def test_prev_next_buttons_emit(self, qtbot):
+        """上一页/下一页按钮：相对当前页 ±1 发出请求。"""
+        from PySide6.QtCore import Qt
+
+        bar = self._bar(qtbot)
+        received: list = []
+        bar.page_requested.connect(received.append)
+        bar.set_page(2)
+        qtbot.mouseClick(bar.prev_btn, Qt.LeftButton)
+        qtbot.mouseClick(bar.next_btn, Qt.LeftButton)
+        assert received == [1, 3]
+
+
 class TestSimilarFeature:
     """相似作品功能：卡片角标 / 右键菜单 / 网格角标批量更新。"""
 

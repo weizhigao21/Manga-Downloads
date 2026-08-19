@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from ui.download_manager import DownloadManager
 from ui.main_window import MainWindow
 from ui.settings import AppSettings
+from ui.single_instance import SINGLE_INSTANCE_KEY, SingleInstanceGuard
 from ui.threads import shutdown_all
 from ui.tray import get_tray
 from ui.version import __version__
@@ -40,6 +41,11 @@ def main():
     if icon.exists():
         app.setWindowIcon(QIcon(str(icon)))
 
+    # 单实例守护：已有实例在运行时，通知其唤起主窗口后本进程直接退出
+    guard = SingleInstanceGuard(SINGLE_INSTANCE_KEY)
+    if not guard.is_primary:
+        return 0
+
     window = MainWindow()
     if icon.exists():
         window.setWindowIcon(QIcon(str(icon)))
@@ -49,6 +55,9 @@ def main():
     # 托盘菜单「退出」才真正结束程序（见 ui/tray.py 与 main_window.closeEvent）
     tray = get_tray(str(icon) if icon.exists() else None)
     tray.attach(window)
+
+    # 二次启动/重新双击程序时：唤起已最小化到托盘的主窗口，而非多开实例
+    guard.showRequested.connect(tray.show_window)
 
     # 下载完成系统通知（可合并、可开关；走托盘气泡，无托盘时静默）
     def _on_task_finished(task, success: bool, error: str):
