@@ -720,6 +720,247 @@ class TestPageFetchError:
         assert "解析失败" in str(err)
 
 
+class TestLocalFastPath:
+    """本地读取快路径：全本地作品翻页必须零网络、零全盘扫描。
+
+    回归背景：用户反馈「本地已有全部图片，超过 12 页后还是要卡很久」。
+    根因是 fetch_page 每页都重扫目录 + 联网探测（详情页 + 列表页各一次）。
+    """
+
+    def _session(self, tmp_path, name: str, count: int, total: int):
+        from ui.reader.page_provider import ReaderSession
+
+        base = tmp_path / "Download"
+        _make_folder(base, name, count)
+        comic = {
+            "title": name,
+            "detail_url": "/photos-index-page-1-aid-555.html",
+            "image_count": total,
+        }
+        session = ReaderSession(comic, base_dir=base, index=ReaderCacheIndex(tmp_path / "r.db"))
+        session.ensure_ready()
+        return session
+
+    def test_full_local_pages_make_zero_network_calls(self, tmp_path, monkeypatch):
+        """本地已满时，翻遍所有页不得发起任何网络请求。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "全本地作品", count=30, total=30)
+
+        fetch_calls: list[str] = []
+        parse_calls: list[int] = []
+
+        def _spy_fetch(url, *a, **k):
+            fetch_calls.append(str(url))
+            raise AssertionError(f"不应联网: {url}")
+
+        def _spy_parse(url, start=1, end=None):
+            parse_calls.append(start)
+            raise AssertionError(f"不应解析: start={start}")
+
+        monkeypatch.setattr(pp, "fetch", _spy_fetch)
+        monkeypatch.setattr(pp, "parse_picture_page", _spy_parse)
+
+        for page in range(1, 31):
+            path = session.fetch_page(page)
+            assert path is not None
+        assert fetch_calls == []
+        assert parse_calls == []
+
+    def test_complete_local_short_circuits_missing_page(self, tmp_path, monkeypatch):
+        """本地张数达标（>= 声明总数）但该页缺失时，报缺页而非联网。
+
+        场景：站点声明 5 张、本地也恰有 5 个文件，但文件名跳号
+        （1,2,4,5,6 → 缺第 3 页）。此时"数量达标"不代表"页码齐全"，
+        应当直接判定该页不存在，而不是联网去补。
+        """
+        import ui.reader.page_provider as pp
+        from ui.reader.page_provider import PageFetchError
+
+        base = tmp_path / "Download"
+        folder = base / "跳号作品"
+        folder.mkdir(parents=True, exist_ok=True)
+        # 5 个文件但页码为 1,2,4,5,6 —— 缺第 3 页，数量恰好达到声明总数
+        for no in (1, 2, 4, 5, 6):
+            (folder / f"{no}.jpg").write_bytes(b"x")
+        session = pp.ReaderSession(
+            {"title": "跳号作品", "detail_url": "/x-aid-555.html", "image_count": 5},
+            base_dir=base,
+            index=ReaderCacheIndex(tmp_path / "r.db"),
+        )
+        session.ensure_ready()
+        assert session.local_count == 5
+        assert session._local_is_complete() is True
+
+        monkeypatch.setattr(
+            pp, "fetch", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不应联网"))
+        )
+        with pytest.raises(PageFetchError) as exc:
+            session.fetch_page(3)
+        assert "本地缺失" in str(exc.value) or "已缓存完整" in str(exc.value)
+
+    def test_incomplete_local_still_fetches_network(self, tmp_path, monkeypatch):
+        """本地不全时**必须**允许联网补拉（不能误判为完整而拒绝）。"""
+        from ui.reader.page_provider import PageFetchError
+
+        session = self._session(tmp_path, "本地不全", count=5, total=20)
+        assert session._local_is_complete() is False
+
+        # 拦截网络：确认确实尝试了联网（这里让它失败，只验证"走了网络"）
+        attempted = []
+
+        def _spy_reading_url():
+            attempted.append(True)
+            return None
+
+        monkeypatch.setattr(session, "_reading_url", _spy_reading_url)
+        with pytest.raises(PageFetchError):
+            session.fetch_page(10)
+        assert attempted, "本地不全时应尝试联网"
+
+    def test_no_dir_rescan_on_each_page(self, tmp_path, monkeypatch):
+        """翻页不得触发目录重扫（scan_local_images 是最昂贵的操作）。
+
+        直接统计 `scan_local_images` 的调用次数——无论是 force 还是
+        增量判定失效，只要真扫了就会被抓到。
+        """
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "扫描计数", count=20, total=20)
+
+        scans = {"n": 0}
+        original = pp.scan_local_images
+
+        def _counting_scan(folder):
+            scans["n"] += 1
+            return original(folder)
+
+        monkeypatch.setattr(pp, "scan_local_images", _counting_scan)
+
+        for page in range(1, 21):
+            session.fetch_page(page)
+        # 全本地翻页不应触发任何一次真实目录扫描
+        assert scans["n"] == 0, f"翻页触发了 {scans['n']} 次目录扫描"
+
+    def test_incremental_refresh_skips_unchanged_dir(self, tmp_path, monkeypatch):
+        """目录未变化时，重复 refresh 不得真正重扫。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "增量判定", count=10, total=10)
+
+        scans = {"n": 0}
+        original = pp.scan_local_images
+
+        def _counting_scan(folder):
+            scans["n"] += 1
+            return original(folder)
+
+        monkeypatch.setattr(pp, "scan_local_images", _counting_scan)
+        session.refresh()
+        first = scans["n"]
+        session._refresh_local_files()
+        session._refresh_local_files()
+        assert scans["n"] == first, "目录未变化却重复扫描"
+
+    def test_incremental_refresh_detects_new_file(self, tmp_path, monkeypatch):
+        """目录新增文件后，增量刷新必须感知（不能因缓存而漏掉新图）。"""
+        session = self._session(tmp_path, "增量感知", count=5, total=5)
+        assert session.local_count == 5
+        # 外部新增一张
+        (session.local_dir / "6.jpg").write_bytes(b"new")
+        session._refresh_local_files()
+        assert session.local_count == 6, "新增文件未被增量刷新感知"
+
+    def test_reading_url_extracted_only_once(self, tmp_path, monkeypatch):
+        """阅读页 URL 的提取（详情页解析）在同一会话内只发生一次。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "URL 一次", count=1, total=24)
+
+        # 记录真正执行「详情页 → 阅读页 URL」提取的次数
+        extracted = []
+
+        def _fake_extract(doc):
+            extracted.append(1)
+            return "/photos-index-page-2-aid-555.html"
+
+        monkeypatch.setattr(pp, "_extract_reading_page_url", _fake_extract)
+        monkeypatch.setattr(pp, "fetch", lambda url, *a, **k: "<html></html>")
+        monkeypatch.setattr(
+            pp, "parse_picture_page",
+            lambda url, start=1, end=None: [
+                {"link": f"http://cdn/{i}.jpg", "number": str(i)}
+                for i in range(1, 13)
+            ],
+        )
+        monkeypatch.setattr(
+            pp.ReaderSession, "_download_one", lambda self, p, pic: tmp_path / "x.jpg"
+        )
+
+        session._parse_page(13)
+        session._parse_page(14)
+        session._parse_page(15)
+        assert len(extracted) == 1, f"详情页被解析了 {len(extracted)} 次（应只 1 次）"
+
+    def test_reading_url_cache_reused_without_network(self, tmp_path, monkeypatch):
+        """缓存已填充时，_reading_url 不得发起网络请求。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "缓存读取", count=1, total=24)
+        session._reading_url_cache = "/photos-index-page-2-aid-555.html"
+
+        def _spy_fetch(url, *a, **k):
+            raise AssertionError(f"缓存命中时不应联网: {url}")
+
+        monkeypatch.setattr(pp, "fetch", _spy_fetch)
+        assert session._reading_url() == "/photos-index-page-2-aid-555.html"
+
+    def test_per_page_count_derived_without_probe(self, tmp_path, monkeypatch):
+        """已知总张数时，每页张数应由总数推导，不做探测请求。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "推导页数", count=1, total=24)
+
+        probe_calls = []
+
+        def _spy_parse(url, start=1, end=None):
+            probe_calls.append((start, end))
+            raise AssertionError("已知总数时不应探测列表页")
+
+        monkeypatch.setattr(pp, "parse_picture_page", _spy_parse)
+        # 24 张 / 2 列表页 = 每页 12 张，无需联网
+        count = session._images_per_reading_page(
+            "/photos-index-page-2-aid-555.html", 2
+        )
+        assert count == 12
+        assert probe_calls == []
+
+    def test_list_page_entries_cached(self, tmp_path, monkeypatch):
+        """同一列表页只解析一次（相邻页落在同页时复用）。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "列表页缓存", count=1, total=24)
+
+        parse_calls = []
+
+        def _fake_parse(url, start=1, end=None):
+            parse_calls.append(start)
+            base_no = (start - 1) * 12
+            return [
+                {"link": f"http://cdn/{base_no + i + 1}.jpg", "number": str(base_no + i + 1)}
+                for i in range(12)
+            ]
+
+        monkeypatch.setattr(pp, "parse_picture_page", _fake_parse)
+        monkeypatch.setattr(session, "_reading_url", lambda: "/photos-index-page-2-aid-555.html")
+
+        # 第 13/14/15 张都在列表页 2：只应解析一次
+        session._parse_page(13)
+        session._parse_page(14)
+        session._parse_page(15)
+        assert parse_calls.count(2) == 1, f"列表页 2 被重复解析: {parse_calls}"
+
+
 class TestReaderWindow:
     """阅读器窗口：本地优先加载、翻页边界、断点续读、线程收尾。"""
 

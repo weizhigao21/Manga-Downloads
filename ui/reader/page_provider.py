@@ -79,6 +79,13 @@ class ReaderSession:
         self._page_urls: dict[int, tuple[str, str]] = {}
         # 阅读页每页图片数缓存：{reading_url: 张数}（避免反复探测）
         self._per_page_cache: dict[str, int] = {}
+        # 列表页条目缓存：{列表页码: 条目列表}（相邻页同列表页时复用，免重复请求）
+        self._list_pages_cache: dict[int, list[dict]] = {}
+        # 阅读页 URL 缓存（详情页解析结果）：避免每页都联网拉详情页
+        self._reading_url_cache: str | None = None
+        # 本地目录的轻量变更指示（目录项数 + 最新 mtime）：翻页是高频操作，
+        # 全目录扫描要 10ms+，因此用便宜得多的判据决定"是否需要真正重扫"。
+        self._dir_revision_cache: tuple[int, float] | None = None
 
     # ---- 初始化 ----
 
@@ -90,8 +97,17 @@ class ReaderSession:
         """定位本地目录并加载直链索引（打开阅读器时调用一次）。"""
         with self._lock:
             self._local_dir = self._locate_or_plan_dir()
-            self._refresh_local_files()
+            self._refresh_local_files(force=True)
             self._page_urls = self.index.load_page_urls(self.aid)
+
+    def refresh(self) -> None:
+        """显式刷新本地索引（外部写入文件后调用，如下载完成）。
+
+        翻页路径不会自动重扫（性能考虑），需要感知外部新增文件时
+        由调用方显式触发。
+        """
+        with self._lock:
+            self._refresh_local_files(force=True)
 
     def _locate_or_plan_dir(self) -> Path:
         """定位现有本地目录；不存在时规划（但不创建）将使用的目录。"""
@@ -102,19 +118,80 @@ class ReaderSession:
         name = _download_folder_name(self.comic, use_label)
         return self._base_dir / name
 
-    def _refresh_local_files(self) -> None:
+    def _refresh_local_files(self, force: bool = False) -> None:
         """重新扫描本地图片（下载完成后调用可感知新文件）。
 
         同时维护两套视图：
         - `_local_files`：自然排序列表（用于计数与卡片进度）；
         - `_local_by_number`：{页码: 路径}（用于按页取图，缺页不错位）。
+
+        **增量判定**：翻页是高频操作，而 `rglob("*")` 在图片多的作品上
+        要 10ms+。先用轻量的目录项快照（`iterdir` 一层 + `stat`）比对
+        指纹，未变化时直接复用缓存结果，避免每次翻页都全盘扫描。
+
+        Args:
+            force: True 时无条件重扫（如刚下载完新文件）。
         """
-        self._local_files = (
-            scan_local_images(self._local_dir) if self._local_dir else []
-        )
-        self._local_by_number = (
-            index_local_images(self._local_dir) if self._local_dir else {}
-        )
+        if self._local_dir is None:
+            self._local_files = []
+            self._local_by_number = {}
+            return
+        revision = self._dir_revision()
+        if not force and revision == self._dir_revision_cache:
+            return
+        self._dir_revision_cache = revision
+        self._local_files = scan_local_images(self._local_dir)
+        self._local_by_number = index_local_images(self._local_dir)
+
+    @staticmethod
+    def _scan_fingerprint(folder: Path) -> dict[str, tuple[float, int]]:
+        """生成目录指纹：{相对路径: (mtime, size)}。
+
+        只遍历目录树收集条目元信息（不读文件内容、不做后缀过滤、不排序），
+        比完整的 scan_local_images（含过滤 + 排序 + 建索引）轻，用于判断
+        "是否需要真正重扫"。
+        """
+        result: dict[str, tuple[float, int]] = {}
+        try:
+            for path in folder.rglob("*"):
+                try:
+                    if not path.is_file():
+                        continue
+                    st = path.stat()
+                    result[path.relative_to(folder).as_posix()] = (
+                        st.st_mtime,
+                        st.st_size,
+                    )
+                except OSError:
+                    # 单个文件 stat 失败（权限/被删除）不影响整体判定
+                    continue
+        except OSError:
+            return {}
+        return result
+
+    def _dir_revision(self) -> tuple[int, float]:
+        """轻量目录变更指示：目录项数量 + 最新修改时间。
+
+        比逐文件 stat 的完整指纹便宜得多（一次 scandir 即可），足以捕捉
+        "新增/删除文件"这一最常见的变更；内容替换（同名改写）由写盘路径
+        显式 `refresh()` 覆盖。
+        """
+        if self._local_dir is None or not self._local_dir.is_dir():
+            return (0, 0.0)
+        count = 0
+        newest = 0.0
+        try:
+            for entry in self._local_dir.rglob("*"):
+                try:
+                    if not entry.is_file():
+                        continue
+                    count += 1
+                    newest = max(newest, entry.stat().st_mtime)
+                except OSError:
+                    continue
+        except OSError:
+            return (0, 0.0)
+        return (count, newest)
 
     @property
     def local_dir(self) -> Path | None:
@@ -154,17 +231,27 @@ class ReaderSession:
         return int(match.group(1)) if match else 1
 
     def _reading_url(self) -> str | None:
-        """从详情页提取阅读页 URL（含总页数）；失败返回 None。"""
+        """从详情页提取阅读页 URL（含总页数）；失败返回 None。
+
+        结果**进程内缓存**：原先每页都重新 fetch 详情页，翻页时平白多出
+        一次网络往返（实测 8s+）。同一会话内详情页不会变，缓存即可。
+        """
+        if self._reading_url_cache is not None:
+            return self._reading_url_cache or None
         detail_url = self.comic.get("detail_url", "")
         if not detail_url:
+            self._reading_url_cache = ""
             return None
         try:
             from lxml import html as lxml_html
 
             detail_html = fetch(G_URL + detail_url, HEADERS)
-            return _extract_reading_page_url(lxml_html.fromstring(detail_html))
+            url = _extract_reading_page_url(lxml_html.fromstring(detail_html))
+            self._reading_url_cache = url or ""
+            return url
         except Exception as exc:  # 网络/解析失败：交由上层降级
             logger.warning("提取阅读页失败: %s (%s)", detail_url, exc)
+            # 失败不写入缓存：下次仍可重试（网络抖动是暂时的）
             return None
 
     # ---- 单页获取（核心） ----
@@ -183,6 +270,14 @@ class ReaderSession:
             local = self._local_by_page(page_no)
             if local is not None:
                 return local
+            # 本地已覆盖全部页：缺页说明确实没有该页（而非"需要联网"），
+            # 直接失败，避免为一部已下载完整的作品平白发起网络请求。
+            # 注意判据是 local_count >= 总页数，且总页数可信（来自
+            # image_count 或本地推断），否则会把"本地不全"误判成"已完整"。
+            if self._local_is_complete():
+                raise PageFetchError(
+                    page_no, f"第 {page_no} 页本地缺失（该作品已缓存完整）"
+                )
 
         # 直链索引命中：直接下载该页图片。
         # 文件名必须沿用真实「页名」（网页 <span class="name"> / 压缩包内名），
@@ -223,8 +318,10 @@ class ReaderSession:
         **按文件名里的页码对齐**，而不是用排序下标——这样只缓存了
         第 1、2、3、10 页时，第 10 页就是第 10 页，不会被错当成第 4 页。
         文件名无法解析出页码时（罕见），回退为排序下标取。
+
+        注意：本方法**不做**目录刷新——刷新由 ensure_ready / 写盘后
+        显式调用，避免每次取页都触发全盘扫描（见 `_refresh_local_files`）。
         """
-        self._refresh_local_files()
         path = self._local_by_number.get(page_no)
         if path is not None:
             return path
@@ -232,6 +329,19 @@ class ReaderSession:
         if not self._local_by_number and 1 <= page_no <= len(self._local_files):
             return self._local_files[page_no - 1]
         return None
+
+    def _local_is_complete(self) -> bool:
+        """本地是否已覆盖作品全部页（用于短路网络请求）。
+
+        判据：本地图片数 >= 作品总页数。总页数优先取 `image_count`
+        （列表页的「N 張」，可信）；为 0 时退而用本地文件数——此时
+        "本地有文件"即视为完整（否则无从判断完整性，宁可让它联网）。
+        """
+        total = int(self.comic.get("image_count") or 0)
+        if total <= 0:
+            # 总数未知：只要有本地文件就认为够用，避免无谓联网
+            return self.local_count > 0
+        return self.local_count >= total
 
     def _parse_page(self, page_no: int) -> list[dict]:
         """解析出**第 page_no 张图片**的条目（含直链）。
@@ -262,12 +372,7 @@ class ReaderSession:
                 page_no,
                 f"第 {page_no} 张超出作品范围（共 {total_pages * per_page} 张）",
             )
-        try:
-            entries = parse_picture_page(
-                reading_url, start=list_page, end=list_page
-            )
-        except Exception as exc:
-            raise PageFetchError(page_no, f"解析第 {page_no} 张失败: {exc}") from exc
+        entries = self._list_page_entries(reading_url, list_page)
         if not entries:
             raise PageFetchError(page_no, f"第 {page_no} 张所在列表页未解析到图片")
         if offset >= len(entries):
@@ -278,6 +383,27 @@ class ReaderSession:
         # 返回从该张开始的条目，便于上层把相邻张一并回填索引
         return entries[offset:]
 
+    def _list_page_entries(self, reading_url: str, list_page: int) -> list[dict]:
+        """取某个列表页的图片条目，**按列表页缓存**避免重复请求。
+
+        同一部作品的相邻若干张往往落在同一个列表页（站点每页约 12 张），
+        连续翻页时若不缓存，每翻一页都要重新解析该列表页——每张图的直链
+        解析本身又是并发网络请求的集合，重复代价很高。
+        """
+        cached = self._list_pages_cache.get(list_page)
+        if cached is not None:
+            return cached
+        try:
+            entries = parse_picture_page(
+                reading_url, start=list_page, end=list_page
+            )
+        except Exception as exc:
+            raise PageFetchError(
+                list_page, f"解析列表页 {list_page} 失败: {exc}"
+            ) from exc
+        self._list_pages_cache[list_page] = entries
+        return entries
+
     @staticmethod
     def _reading_page_count(reading_url: str) -> int:
         """阅读页的列表页总数（URL 里的 page-N-aid-X）。"""
@@ -285,29 +411,35 @@ class ReaderSession:
         return int(match.group(1)) if match else 1
 
     def _images_per_reading_page(self, reading_url: str, total_pages: int) -> int:
-        """确定站点每个阅读页放多少张图（动态探测，不写死常量）。
+        """确定站点每个阅读页放多少张图（优先用总数推导，避免多余请求）。
 
-        用「第 1 个列表页的张数」作为每页张数；页面数量为 1 时即为全部。
-        结果按 URL 缓存，避免反复探测。
+        **优先用已知的总张数推导**：`每页张数 = ceil(总张数 / 列表页数)`，
+        这类信息通常已由列表页的「N 張」（`image_count`）给出，无需联网。
+        只有在总张数未知时才回退到「探测第 1 个列表页」——那是一次真实
+        网络请求，翻页路径上应尽量避免。
+
+        结果按 URL 缓存（`_per_page_cache`），同会话内不再重复计算。
         """
         cached = self._per_page_cache.get(reading_url)
         if cached:
             return cached
-        if total_pages <= 1:
-            # 只有一个列表页：解析它即可，张数就是全部
-            try:
-                entries = parse_picture_page(reading_url, start=1, end=1)
-            except Exception as exc:
-                logger.warning("探测每页张数失败: %s", exc)
-                return 0
-            count = len(entries)
-        else:
-            try:
-                first = parse_picture_page(reading_url, start=1, end=1)
-            except Exception as exc:
-                logger.warning("探测每页张数失败: %s", exc)
-                return 0
-            count = len(first)
+
+        # 路径 1：用已知总数推导（零网络请求）
+        total_images = int(self.comic.get("image_count") or 0)
+        if total_images > 0 and total_pages > 0:
+            # 向上取整：最后一页可能不满
+            count = -(-total_images // total_pages)
+            if count > 0:
+                self._per_page_cache[reading_url] = count
+                return count
+
+        # 路径 2：总数未知，退回探测列表页 1（一次网络请求）
+        try:
+            entries = parse_picture_page(reading_url, start=1, end=1)
+        except Exception as exc:
+            logger.warning("探测每页张数失败: %s", exc)
+            return 0
+        count = len(entries)
         if count <= 0:
             return 0
         self._per_page_cache[reading_url] = count
@@ -344,9 +476,11 @@ class ReaderSession:
         if name:
             target = self._local_dir / f"{name}.jpg"
             if target.is_file() and target.stat().st_size > 0:
-                self._refresh_local_files()
+                # 强制重扫：新文件已落盘，必须让索引感知到
+                self._refresh_local_files(force=True)
                 return target
         # 页名缺失或落盘名不符时，回退按排序下标取
+        self._refresh_local_files(force=True)
         return self._local_by_page(page_no)
 
     # ---- 预取 ----
