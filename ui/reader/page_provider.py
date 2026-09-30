@@ -336,12 +336,27 @@ class ReaderSession:
         判据：本地图片数 >= 作品总页数。总页数优先取 `image_count`
         （列表页的「N 張」，可信）；为 0 时退而用本地文件数——此时
         "本地有文件"即视为完整（否则无从判断完整性，宁可让它联网）。
+
+        **二次校验**：站点的 `image_count` 可能与实际张数不符（重传/
+        合并/计数偏差），若本地张数 >= 声明总数的一半以上，再检查本地
+        页码是否**连续无缺口**（最大页码 == 本地张数，即 1..N 全覆盖）。
+        连续则视为完整——宁可相信落盘的连续页码，也不为站点的错误计数
+        平白发起一轮列表页解析 + 逐张直链抓取。
         """
         total = int(self.comic.get("image_count") or 0)
+        count = self.local_count
         if total <= 0:
             # 总数未知：只要有本地文件就认为够用，避免无谓联网
-            return self.local_count > 0
-        return self.local_count >= total
+            return count > 0
+        if count >= total:
+            return True
+        # 本地明显不够，且差距过大（< 一半）：很可能确实不全，放行联网
+        if count * 2 < total:
+            return False
+        # 本地接近声明总数：用页码连续性判断（站点计数可能虚高）
+        if not self._local_by_number:
+            return False
+        return max(self._local_by_number) == count
 
     def _parse_page(self, page_no: int) -> list[dict]:
         """解析出**第 page_no 张图片**的条目（含直链）。

@@ -862,6 +862,83 @@ class TestLocalFastPath:
         session._refresh_local_files()
         assert scans["n"] == first, "目录未变化却重复扫描"
 
+    def test_inflated_image_count_still_local(self, tmp_path, monkeypatch):
+        """站点 image_count 虚高时（如声明 24 张、本地实际 13 张连续），
+        只要本地页码连续且数量过半，就必须判为完整、不走网络。
+
+        回归：站点计数常因重传/合并而不准，若仅按 local_count >= image_count
+        判断，会把一部已完整下载的作品误判为"缺失"，翻到超出范围时
+        平白发起一轮列表页解析 + 逐张直链抓取。
+        """
+        import ui.reader.page_provider as pp
+
+        base = tmp_path / "Download"
+        folder = base / "虚高计数作品"
+        folder.mkdir(parents=True, exist_ok=True)
+        # 本地 13 张连续（1..13），站点却声明 24 张
+        for no in range(1, 14):
+            (folder / f"{no}.jpg").write_bytes(b"x")
+
+        comic = {
+            "title": "虚高计数作品",
+            "detail_url": "/x-aid-666.html",
+            "image_count": 24,  # 站点虚高
+        }
+        session = pp.ReaderSession(
+            comic, base_dir=base, index=ReaderCacheIndex(tmp_path / "r.db")
+        )
+        session.ensure_ready()
+        assert session.local_count == 13
+        assert session._local_is_complete() is True, "连续 13 张 + 过半，应判为完整"
+
+        # 零网络验证
+        network_calls = []
+
+        def _spy_fetch(url, *a, **k):
+            network_calls.append(str(url))
+            raise AssertionError(f"本地已完整，不应联网: {url}")
+
+        monkeypatch.setattr(pp, "fetch", _spy_fetch)
+        # 所有本地页应零网络命中
+        for p in range(1, 14):
+            path = session.fetch_page(p)
+            assert path is not None
+        # 超出本地范围的页直接报缺失，也不联网
+        from ui.reader.page_provider import PageFetchError
+
+        with pytest.raises(PageFetchError) as exc:
+            session.fetch_page(14)
+        assert "本地缺失" in str(exc.value) or "已缓存完整" in str(exc.value)
+        assert network_calls == []
+
+    def test_genuinely_incomplete_page_triggers_network(self, tmp_path, monkeypatch):
+        """本地有真实缺页时（页码不连续），必须允许联网补拉。
+
+        与 test_inflated_image_count_still_local 互为反面：缺页作品的
+        `max(local_by_number) != count`，不能被误判为完整。
+        """
+        import ui.reader.page_provider as pp
+
+        base = tmp_path / "Download"
+        folder = base / "有缺页作品"
+        folder.mkdir(parents=True, exist_ok=True)
+        # 13 个文件但缺第 7 页（1..6, 8..14）
+        for no in (1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14):
+            (folder / f"{no}.jpg").write_bytes(b"x")
+
+        comic = {
+            "title": "有缺页作品",
+            "detail_url": "/x-aid-666.html",
+            "image_count": 14,
+        }
+        session = pp.ReaderSession(
+            comic, base_dir=base, index=ReaderCacheIndex(tmp_path / "r.db")
+        )
+        session.ensure_ready()
+        assert session.local_count == 13
+        # 缺第 7 页 → max=14 ≠ count=13 → 不连续 → 不完整
+        assert session._local_is_complete() is False
+
     def test_incremental_refresh_detects_new_file(self, tmp_path, monkeypatch):
         """目录新增文件后，增量刷新必须感知（不能因缓存而漏掉新图）。"""
         session = self._session(tmp_path, "增量感知", count=5, total=5)
