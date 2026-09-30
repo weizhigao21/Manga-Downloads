@@ -175,13 +175,15 @@ def find_local_dir(comic: dict, base_dir: Path | None = None) -> Path | None:
 
     aid = extract_aid(comic.get("detail_url", ""))
 
-    # 候选目录名：带标签 / 不带标签，各自再叠加 (aid) 变体
+    # 候选目录名：带标签 / 不带标签。**带 (aid) 后缀的优先**——同名冲突时
+    # 它是下载侧追加的作品 ID 目录，通常内容更完整（后下载的全量版本）。
+    # 若先命中不带后缀的目录，可能拿到一份更早下载的部分缓存。
     candidates: list[str] = []
     for use_label in (True, False):
         name = _download_folder_name(comic, use_label)
-        candidates.append(name)
         if aid:
             candidates.append(f"{name} ({aid})")
+        candidates.append(name)
 
     seen: set[str] = set()
     for name in candidates:

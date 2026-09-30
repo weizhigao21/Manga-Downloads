@@ -2,7 +2,7 @@
 
 > 项目地址：<https://github.com/weizhigao21/Manga-Downloads>
 >
-> 当前版本：v1.3.6（更新日志见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v1.3.7（更新日志见 [CHANGELOG.md](CHANGELOG.md)）
 
 基于 PySide6 的 wnacg.com（紳士漫畫）桌面浏览器与下载工具，支持分类浏览、关键词搜索、封面缓存、多模式下载与断点续传。
 
@@ -75,7 +75,7 @@
 │   ├── models/            # 数据模型
 │   ├── styles/            # 主题样式
 │   └── widgets/           # 漫画卡片、网格视图、翻页栏、缓存进度圈
-├── tests/                 # pytest 测试套件（278 个用例，离线运行）
+├── tests/                 # pytest 测试套件（279 个用例，离线运行）
 ├── tools/_archive/        # 开发期残留脚本归档（可安全删除）
 ├── requirements.txt       # 运行依赖
 ├── requirements-dev.txt   # 测试/开发依赖

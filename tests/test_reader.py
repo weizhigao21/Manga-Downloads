@@ -190,6 +190,26 @@ class TestFindLocalDir:
         }
         assert find_local_dir(comic, tmp_path) is None
 
+    def test_aid_suffixed_dir_preferred_over_partial(self, tmp_path):
+        """同名冲突时，带 (aid) 后缀的目录必须优先于不带后缀的目录。
+
+        回归：旧版 find_local_dir 先试不带后缀的名字，命中一个较早下载的
+        部分缓存目录（图片少）就停了，从未轮到更完整的带 (aid) 目录。
+        这正是用户遇到的「zip 已解压 123 张，阅读器却只找到 22 张」。
+        """
+        _make_folder(tmp_path, "[AI_图集] 冲突作品", 22)          # 旧的部分缓存
+        _make_folder(tmp_path, "[AI_图集] 冲突作品 (390583)", 123)  # 完整 zip 解压
+        comic = {
+            "title": "冲突作品",
+            "detail_url": "/albums-show-aid-390583.html",
+            "category_label": "AI_图集",
+        }
+        found = find_local_dir(comic, tmp_path)
+        assert found is not None
+        assert found.name == "[AI_图集] 冲突作品 (390583)", (
+            f"应优先命中带 (aid) 的完整目录，实际命中: {found.name}"
+        )
+
     def test_empty_folder_not_counted(self, tmp_path):
         """只有空目录（无图片）不算命中。"""
         (tmp_path / "[單行本] 我的作品").mkdir()
