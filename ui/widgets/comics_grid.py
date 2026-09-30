@@ -18,6 +18,8 @@ class ComicsGrid(QScrollArea):
 
     # 卡片右键「查看类似作品」转发到主窗口
     similar_requested = Signal(object)
+    # 卡片「阅读」转发到主窗口（打开阅读器窗口）
+    read_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -51,6 +53,7 @@ class ComicsGrid(QScrollArea):
 
         # 批量预计算"已下载"状态：单次遍历缓存 + 每作品一次目录检查
         from ui.database import is_comics_downloaded
+        from ui.reader.cache_index import cache_progress, find_local_dir
 
         downloaded_map = is_comics_downloaded(
             [
@@ -59,6 +62,19 @@ class ComicsGrid(QScrollArea):
             ]
         )
 
+        # 批量预计算缓存进度（每作品一次目录扫描，替代卡片各自扫盘）
+        cache_map: dict[str, tuple[int, int, int]] = {}
+        for comic in comics:
+            folder = find_local_dir(
+                {
+                    "title": comic.title,
+                    "detail_url": comic.detail_url,
+                    "category_label": comic.category_label,
+                    "translated_title": comic.translated_title,
+                }
+            )
+            cache_map[comic.detail_url] = cache_progress(folder, comic.image_count)
+
         # 按 detail_url diff：复用相同作品卡片，仅重建新增与移除的
         old = {c.comic.detail_url: c for c in self._cards}
         new_cards: list[ComicCard] = []
@@ -66,12 +82,15 @@ class ComicsGrid(QScrollArea):
             card = old.pop(comic.detail_url, None)
             if card is None:
                 card = ComicCard(comic, downloaded=downloaded_map.get(comic.detail_url))
-                # 转发右键「查看类似」信号（仅新建卡片连接，复用卡片已连接）
+                # 转发右键「查看类似」与「阅读」信号（仅新建卡片连接）
                 card.similar_requested.connect(self.similar_requested)
+                card.read_requested.connect(self.read_requested)
             else:
                 card.update_comic(
                     comic, downloaded=downloaded_map.get(comic.detail_url)
                 )
+            cached, total, percent = cache_map.get(comic.detail_url, (0, 0, 0))
+            card.set_cache_progress(percent, cached, total)
             new_cards.append(card)
         for stale in old.values():
             stale.deleteLater()

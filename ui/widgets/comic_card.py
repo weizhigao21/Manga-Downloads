@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from ui.download_manager import DownloadManager, DownloadTask
 from ui.models import ComicItem
 from ui.styles import PALETTE
+from ui.widgets.cache_ring import CacheProgressRing
 
 
 class ComicCard(QFrame):
@@ -27,6 +28,8 @@ class ComicCard(QFrame):
 
     # 右键菜单「查看类似作品」触发（emit 当前 ComicItem），由主窗口切换相似视图
     similar_requested = Signal(object)
+    # 「阅读」按钮触发（emit 当前 ComicItem），由主窗口打开阅读器窗口
+    read_requested = Signal(object)
 
     def __init__(self, comic: ComicItem, parent=None, downloaded: bool | None = None):
         super().__init__(parent)
@@ -34,6 +37,8 @@ class ComicCard(QFrame):
         # 网格批量预计算的"已下载"结果（True/False 时直接使用，避免卡片
         # 各自遍历全表与磁盘 stat）；None 表示卡片按需自查（独立使用场景）
         self._pre_downloaded: bool | None = downloaded
+        # 发布时预计算的缓存进度（percent, cached, total）；None 表示卡片自查
+        self._pre_cache: tuple[int, int, int] | None = None
         # 本地已有封面时不创建网络管理器（避免每张卡片都初始化网络栈）
         self._network: QNetworkAccessManager | None = None
         self._manager = DownloadManager.instance()
@@ -60,6 +65,8 @@ class ComicCard(QFrame):
         self.url_label.setText(self.comic.detail_url)
         self._sync_download_button()
         self._update_similar_badge()
+        # 复用卡片时缓存进度由网格重新预计算（set_cache_progress）覆盖
+        self._pre_cache = None
         # 封面来源变化时重新加载（QPixmapCache 命中则直接复用，无需网络）
         if comic.cover_path != old.cover_path or comic.cover_url != old.cover_url:
             self._load_cover()
@@ -251,10 +258,47 @@ class ComicCard(QFrame):
         info_layout.addWidget(self.url_label)
         info_layout.addStretch()
 
-        # 卡片右下角下载按钮
+        # 卡片右下角按钮区：缓存进度圈 + 阅读 + 下载
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(8)
+
+        # 缓存进度圈：显示本地已缓存百分比（灰底 + 彩色弧，只在有本地文件时可见）
+        # 28px：内圈约 22px，两位数百分比（如 75）也能完整落在圈内
+        self.cache_ring = CacheProgressRing(self, size=28, thickness=3)
+        bottom_row.addWidget(self.cache_ring, alignment=Qt.AlignVCenter)
+
         bottom_row.addStretch()
+
+        # 「阅读」按钮：打开阅读器（本地优先，缺页边看边缓存）
+        self.read_btn = QPushButton("阅读")
+        self.read_btn.setObjectName("readButton")
+        self.read_btn.setCursor(Qt.PointingHandCursor)
+        self.read_btn.setFocusPolicy(Qt.NoFocus)
+        self.read_btn.setFixedSize(76, 28)
+        self.read_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {PALETTE["surface"]};
+                color: {PALETTE["primary"]};
+                border: 1px solid {PALETTE["primary"]};
+                border-radius: 6px;
+                padding: 4px 14px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #EFF6FF;
+            }}
+            QPushButton:disabled {{
+                background-color: {PALETTE["border"]};
+                color: {PALETTE["text_secondary"]};
+                border-color: {PALETTE["border"]};
+            }}
+            """
+        )
+        self.read_btn.clicked.connect(self._on_read_clicked)
+        bottom_row.addWidget(self.read_btn)
+
         self.download_btn = QPushButton("下载")
         self.download_btn.setObjectName("downloadButton")
         self.download_btn.setCursor(Qt.PointingHandCursor)
@@ -391,6 +435,38 @@ class ComicCard(QFrame):
         self._manager.start_download(self.comic)
         self._sync_download_button()
 
+    def _on_read_clicked(self):
+        """点击阅读按钮：通知主窗口打开阅读器窗口。"""
+        if not self.comic.detail_url:
+            QMessageBox.information(self, "阅读", "该作品没有详情页链接，无法阅读。")
+            return
+        self.read_requested.emit(self.comic)
+
+    # ---- 缓存进度圈 ----
+
+    def set_cache_progress(self, percent: int, cached: int = 0, total: int = 0):
+        """设置本地缓存进度（网格批量预计算后调用，避免卡片各自扫盘）。"""
+        self._pre_cache = (int(percent), int(cached), int(total))
+        self.cache_ring.set_progress(percent, cached, total)
+
+    def refresh_cache_progress(self):
+        """按需自查缓存进度（下载/阅读完成等状态变化后调用）。"""
+        if self._pre_cache is not None:
+            self.cache_ring.set_progress(*self._pre_cache)
+            return
+        from ui.reader.cache_index import cache_progress, find_local_dir
+
+        folder = find_local_dir(
+            {
+                "title": self.comic.title,
+                "detail_url": self.comic.detail_url,
+                "category_label": self.comic.category_label,
+                "translated_title": self.comic.translated_title,
+            }
+        )
+        cached, total, percent = cache_progress(folder, self.comic.image_count)
+        self.cache_ring.set_progress(percent, cached, total)
+
     def _is_downloaded(self) -> bool:
         """判断当前作品是否已下载（任务完成、数据库标记或下载目录文件夹）。
 
@@ -483,6 +559,11 @@ class ComicCard(QFrame):
         )
         menu.addAction(
             self._menu_color_icon("#9CA3AF"), "复制作品名称", self._copy_title
+        )
+        menu.addSeparator()
+        # 「阅读作品」：本地优先；无本地缓存时在线读并边看边缓存
+        menu.addAction(
+            self._menu_color_icon("#10B981"), "阅读作品", self._on_read_clicked
         )
         menu.addSeparator()
         # 仅本地库存在相似作品时提供「查看类似」，避免无意义的空视图

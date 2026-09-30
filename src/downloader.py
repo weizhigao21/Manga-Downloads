@@ -34,6 +34,62 @@ from src.wnacg_crawler import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 7z 子进程登记表
+#
+# 7z.exe 由 subprocess.Popen 启动，是独立于本进程的后台子进程。若解压所在线程
+# 被强制终止（terminate）或应用在解压中途退出，局部变量 proc 随之丢失，7z 会
+# 变成孤儿进程继续占用文件句柄——表现为"程序关了，但 7z 还在跑"。
+#
+# 因此在进程启动时登记、结束时注销；应用退出收尾（shutdown_all）时统一
+# terminate + 限时等待 + kill，确保不留孤儿。
+# ---------------------------------------------------------------------------
+_child_procs: set[subprocess.Popen] = set()
+_child_procs_lock = threading.Lock()
+
+
+def _register_proc(proc: subprocess.Popen) -> None:
+    with _child_procs_lock:
+        _child_procs.add(proc)
+
+
+def _unregister_proc(proc: subprocess.Popen) -> None:
+    with _child_procs_lock:
+        _child_procs.discard(proc)
+
+
+def terminate_child_processes(timeout_ms: int = 1500) -> int:
+    """终止所有仍在运行的子进程（7z 等），返回实际终止的数量。
+
+    先 terminate 优雅结束，限时等待后仍未退出则 kill。重复调用安全：
+    已结束的进程立即跳过。应用退出前调用，避免留下孤儿 7z.exe。
+    """
+    with _child_procs_lock:
+        procs = list(_child_procs)
+    killed = 0
+    for proc in procs:
+        try:
+            if proc.poll() is not None:
+                _unregister_proc(proc)
+                continue
+            proc.terminate()
+        except Exception:  # noqa: BLE001 - 收尾期任何异常都不应中断流程
+            _unregister_proc(proc)
+            continue
+        try:
+            proc.wait(timeout=timeout_ms / 1000)
+        except Exception:  # noqa: BLE001 - 含 TimeoutExpired
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        _unregister_proc(proc)
+        killed += 1
+    if killed:
+        logger.info("已终止 %d 个子进程（7z 等）", killed)
+    return killed
+
+
 # 下载页 <script> 中的 const CONFIG = { WORKER_API / FILE_KEY / FILE_NAME }
 CONFIG_RE = re.compile(r"const\s+CONFIG\s*=\s*\{(?P<body>.*?)\};", re.DOTALL)
 CONFIG_FIELD_RE = re.compile(
@@ -283,6 +339,8 @@ def _extract_with_7z(
         stderr=subprocess.PIPE,
         creationflags=creationflags,
     )
+    # 登记子进程：解压线程被强杀 / 应用退出时由 terminate_child_processes 统一收尾
+    _register_proc(proc)
 
     stop_monitor = threading.Event()
 
@@ -308,6 +366,8 @@ def _extract_with_7z(
         monitor.join(timeout=2)
         if proc.poll() is None:
             proc.kill()
+            proc.wait(timeout=5)
+        _unregister_proc(proc)
     if proc.returncode != 0:
         # 中文系统 7z 输出为 GBK/cp936，按编码优先级尝试解码，失败再宽容替换
         raw_err = proc.stderr.read()

@@ -11,6 +11,8 @@
 2. 仍未结束的线程强制终止（terminate）。网络 IO 阻塞的线程可安全
    终止；下载线程的写文件为原子替换（tmp + rename），强制终止不会
    留下半截文件。
+3. 最后统一终止 7z 等子进程（terminate_child_processes），避免解压
+   线程被强杀或解压中退出时留下孤儿 7z.exe。
 
 线程生命周期与注册表：
 - register 在 worker 的 run() 中调用；登记时顺手清理已销毁（deleteLater
@@ -28,6 +30,8 @@ import threading
 import time
 
 from PySide6.QtCore import QThread
+
+from src.downloader import terminate_child_processes
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,8 @@ def shutdown_all(timeout_ms: int = 2000, terminate_grace_ms: int = 1000):
     # 只收尾仍然存活（C++ 对象未销毁）的线程
     alive = [t for t in threads if _alive(t)]
     if not alive:
+        # 线程已全部结束，仍可能有解压中的 7z 子进程需要收尾
+        terminate_child_processes(timeout_ms=terminate_grace_ms)
         return
     logger.info("等待 %d 个后台线程结束（最多 %dms）...", len(alive), timeout_ms)
     for thread in alive:
@@ -99,3 +105,5 @@ def shutdown_all(timeout_ms: int = 2000, terminate_grace_ms: int = 1000):
                 thread.wait(terminate_grace_ms)
             except RuntimeError:
                 continue
+    # 线程收尾后，统一终止其 spawn 的子进程（7z 等），避免留下孤儿
+    terminate_child_processes(timeout_ms=terminate_grace_ms)

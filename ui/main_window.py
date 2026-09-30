@@ -166,6 +166,7 @@ class MainWindow(QMainWindow):
         # 内容区（漫画网格）
         self.comics_grid = ComicsGrid()
         self.comics_grid.similar_requested.connect(self._on_view_similar)
+        self.comics_grid.read_requested.connect(self._on_open_reader)
         root_layout.addWidget(self.comics_grid)
 
         # 底部栏：统一底色（QFrame#pageBar 背景+顶边框）
@@ -642,6 +643,29 @@ class MainWindow(QMainWindow):
 
         dialog = DownloadManagerDialog(self)
         dialog.exec()
+
+    def _on_open_reader(self, comic: ComicItem):
+        """打开阅读器窗口（非模态，可多开）：本地优先，缺页边看边缓存。"""
+        from ui.reader.reader_window import ReaderWindow
+
+        comic_dict = {
+            "title": comic.title,
+            "detail_url": comic.detail_url,
+            "image_count": comic.image_count,
+            "category_label": comic.display_category_label,
+            "translated_title": comic.translated_title,
+        }
+        reader = ReaderWindow(comic_dict, parent=None)
+        # 持有引用，防止窗口被回收；关闭后自动清理
+        reader.setAttribute(Qt.WA_DeleteOnClose, True)
+        if not hasattr(self, "_readers"):
+            self._readers: list = []
+        self._readers.append(reader)
+        reader.destroyed.connect(
+            lambda *_, r=reader: self._readers.remove(r) if r in self._readers else None
+        )
+        reader.show()
+        self.set_status(f"正在阅读：{comic.display_title}")
 
     def _on_settings(self):
         """打开设置对话框，保存后刷新界面以应用繁简转换。"""

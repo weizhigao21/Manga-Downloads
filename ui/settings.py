@@ -21,6 +21,13 @@ DEFAULT_SETTINGS = {
     # 存储路径（空字符串 = 使用默认位置 Config/comics.db 与 Config/covers）
     "db_path": "",
     "covers_dir": "",
+    # 在线阅读器
+    # 默认纯按需：只在用户翻页时获取当前这一页，不主动联网拉取其他页。
+    # 三个值必须同时为"关/0/0"，避免只打开总开关就悄悄恢复自动预取。
+    "reader_prefetch_enabled": False,  # 是否后台预取相邻页（关闭则纯按需）
+    "reader_prefetch_ahead": 0,        # 向后预取页数（0-10）
+    "reader_prefetch_behind": 0,       # 向前预取页数（0-10）
+    "reader_resume": True,             # 打开时续读到上次位置
 }
 
 # 网站导航栏分类（名称 -> 分类列表页相对 URL），供设置中切换浏览分类
@@ -165,6 +172,57 @@ class AppSettings:
     @covers_dir.setter
     def covers_dir(self, value: str):
         self._settings["covers_dir"] = str(value).strip()
+
+    # ---- 在线阅读器设置 ----
+
+    @property
+    def reader_prefetch_enabled(self) -> bool:
+        """阅读时是否后台预取相邻页。
+
+        默认 **False**：只在用户翻页时获取当前页（纯按需）。开启后才
+        会提前缓存相邻页以换取更顺滑的翻页，代价是请求更密。
+        """
+        return bool(self._settings.get("reader_prefetch_enabled", False))
+
+    @reader_prefetch_enabled.setter
+    def reader_prefetch_enabled(self, value: bool):
+        self._settings["reader_prefetch_enabled"] = bool(value)
+
+    @staticmethod
+    def _clamp_pages(value, default: int) -> int:
+        """预取页数夹取到 [0, 10]（0 表示不预取该方向）。"""
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0, min(number, 10))
+
+    @property
+    def reader_prefetch_ahead(self) -> int:
+        """向后（下一页方向）预取页数（默认 0：不预取）。"""
+        return self._clamp_pages(self._settings.get("reader_prefetch_ahead", 0), 0)
+
+    @reader_prefetch_ahead.setter
+    def reader_prefetch_ahead(self, value: int):
+        self._settings["reader_prefetch_ahead"] = self._clamp_pages(value, 0)
+
+    @property
+    def reader_prefetch_behind(self) -> int:
+        """向前（上一页方向）预取页数。"""
+        return self._clamp_pages(self._settings.get("reader_prefetch_behind", 0), 0)
+
+    @reader_prefetch_behind.setter
+    def reader_prefetch_behind(self, value: int):
+        self._settings["reader_prefetch_behind"] = self._clamp_pages(value, 0)
+
+    @property
+    def reader_resume(self) -> bool:
+        """打开作品时是否续读到上次阅读位置。"""
+        return bool(self._settings.get("reader_resume", True))
+
+    @reader_resume.setter
+    def reader_resume(self, value: bool):
+        self._settings["reader_resume"] = bool(value)
 
     def convert(self, text: str) -> str:
         """根据设置将文本转换为简体（若开启）或保持原样。"""

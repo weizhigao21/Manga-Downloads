@@ -156,6 +156,51 @@ class SettingsDialog(QDialog):
         notify_hint.setWordWrap(True)
         v.addWidget(notify_hint)
 
+        # ---- 在线阅读器 ----
+        reader_heading = QLabel("在线阅读器")
+        reader_heading.setStyleSheet("font-size: 15px; font-weight: 600; margin-top: 8px;")
+        v.addWidget(reader_heading)
+
+        self.reader_prefetch_checkbox = QCheckBox("阅读时后台预取相邻页（默认关闭）")
+        self.reader_prefetch_checkbox.setChecked(self._settings.reader_prefetch_enabled)
+        v.addWidget(self.reader_prefetch_checkbox)
+
+        prefetch_hint = QLabel(
+            "默认关闭：只在点「下一页/上一页」时获取当前这一页，最省请求。"
+            "开启后会提前缓存前后几页，翻页更顺滑，但请求更密。"
+        )
+        prefetch_hint.setStyleSheet(
+            f"color: {PALETTE['text_secondary']}; font-size: 12px;"
+        )
+        prefetch_hint.setIndent(22)
+        prefetch_hint.setWordWrap(True)
+        v.addWidget(prefetch_hint)
+
+        prefetch_row = QHBoxLayout()
+        prefetch_row.setContentsMargins(22, 0, 0, 0)
+        prefetch_row.setSpacing(8)
+        prefetch_row.addWidget(QLabel("向前预取"))
+        self.reader_behind_spin = QSpinBox()
+        self.reader_behind_spin.setRange(0, 10)
+        self.reader_behind_spin.setValue(self._settings.reader_prefetch_behind)
+        self.reader_behind_spin.setSuffix(" 页")
+        self.reader_behind_spin.setFixedWidth(80)
+        prefetch_row.addWidget(self.reader_behind_spin)
+        prefetch_row.addSpacing(12)
+        prefetch_row.addWidget(QLabel("向后预取"))
+        self.reader_ahead_spin = QSpinBox()
+        self.reader_ahead_spin.setRange(0, 10)
+        self.reader_ahead_spin.setValue(self._settings.reader_prefetch_ahead)
+        self.reader_ahead_spin.setSuffix(" 页")
+        self.reader_ahead_spin.setFixedWidth(80)
+        prefetch_row.addWidget(self.reader_ahead_spin)
+        prefetch_row.addStretch()
+        v.addLayout(prefetch_row)
+
+        self.reader_resume_checkbox = QCheckBox("打开作品时续读到上次位置")
+        self.reader_resume_checkbox.setChecked(self._settings.reader_resume)
+        v.addWidget(self.reader_resume_checkbox)
+
         v.addStretch()
         return page
 
@@ -402,6 +447,13 @@ class SettingsDialog(QDialog):
         )
         self._settings.auto_fetch_on_startup = self.auto_fetch_checkbox.isChecked()
         self._settings.notify_on_download_done = self.notify_checkbox.isChecked()
+        # 在线阅读器设置
+        self._settings.reader_prefetch_enabled = (
+            self.reader_prefetch_checkbox.isChecked()
+        )
+        self._settings.reader_prefetch_behind = self.reader_behind_spin.value()
+        self._settings.reader_prefetch_ahead = self.reader_ahead_spin.value()
+        self._settings.reader_resume = self.reader_resume_checkbox.isChecked()
         self._settings.save()
 
         # 保存项目配置

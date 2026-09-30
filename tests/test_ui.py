@@ -478,14 +478,17 @@ class TestSimilarFeature:
         assert "#F97316" in card.similar_badge.styleSheet()
 
     def test_menu_items_have_color_icons(self, qtbot):
-        """右键菜单项均带固定颜色圆点图标（复制/查看类似/翻译）。"""
+        """右键菜单项均带固定颜色圆点图标（复制/阅读/查看类似/翻译）。"""
         card = ComicCard(self._make_comic())
         qtbot.addWidget(card)
         card.set_similar_count(1)
-        actions = [a for a in card._build_context_menu().actions() if a.text()]
-        assert len(actions) == 3
+        menu = card._build_context_menu()
+        actions = [a for a in menu.actions() if a.text()]
+        assert len(actions) == 4
         assert all(not a.icon().isNull() for a in actions)
         assert not card._menu_color_icon("#DC2626").isNull()
+        # 阅读入口必须在场（本地优先阅读 / 压缩包作品同源可读）
+        assert "阅读作品" in [a.text() for a in actions]
 
     def test_download_button_fixed_width(self, qtbot):
         """下载按钮固定宽度：文本切换（下载→下载中...）时宽度不膨胀。"""
@@ -738,6 +741,67 @@ class TestThreadRegistry:
         shiboken6.delete(worker)  # 模拟真实环境销毁
         # 收尾不应抛异常（TypeError: unhashable list / RuntimeError）
         threads.shutdown_all(timeout_ms=100, terminate_grace_ms=50)
+
+    def test_shutdown_all_terminates_child_processes(self, qtbot, monkeypatch):
+        """退出收尾必须终止 7z 等子进程（防孤儿残留）。
+
+        回归：解压线程被强杀或解压中退出时，局部变量 proc 丢失，
+        7z.exe 会变成孤儿进程继续占用文件句柄。
+        """
+        import sys
+
+        from src import downloader
+        from ui import threads
+
+        proc = __import__("subprocess").Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            creationflags=getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0),
+        )
+        downloader._register_proc(proc)
+        try:
+            threads.shutdown_all(timeout_ms=100, terminate_grace_ms=500)
+            assert proc.poll() is not None, "shutdown_all 后子进程仍未退出"
+            with downloader._child_procs_lock:
+                assert proc not in downloader._child_procs, "子进程未从登记表注销"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_shutdown_all_terminates_child_processes_even_without_threads(self):
+        """无存活线程时也要收尾子进程（早返回分支回归）。"""
+        import sys
+
+        from src import downloader
+        from ui import threads
+
+        proc = __import__("subprocess").Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            creationflags=getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0),
+        )
+        downloader._register_proc(proc)
+        try:
+            threads.shutdown_all(timeout_ms=100, terminate_grace_ms=500)
+            assert proc.poll() is not None, "无线程时子进程未被收尾"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_terminate_child_processes_skips_finished(self, monkeypatch):
+        """已结束的子进程直接跳过并注销，不重复处理。"""
+        import sys
+
+        from src import downloader
+
+        proc = __import__("subprocess").Popen(
+            [sys.executable, "-c", "pass"],
+            creationflags=getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0),
+        )
+        proc.wait(timeout=10)
+        downloader._register_proc(proc)
+        killed = downloader.terminate_child_processes(timeout_ms=200)
+        assert killed == 0, "已结束的进程不应计入终止数"
+        with downloader._child_procs_lock:
+            assert proc not in downloader._child_procs
 
 
 class TestDownloadManagerDialog:
