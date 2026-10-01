@@ -23,17 +23,21 @@ class FetchWorker(QThread):
     done = Signal(list)
     error = Signal(str)
 
-    def __init__(self, url: str | None = None, page: int = 1, keyword: str = ""):
+    def __init__(
+        self, url: str | None = None, page: int = 1,
+        keyword: str = "", category: str | None = None,
+    ):
         super().__init__()
         self.url = url
         self.page = page
         self.keyword = keyword
+        self.category = category
 
     def run(self):
         register(self)
         try:
             if self.keyword:
-                comics = search_comics(self.keyword, self.page)
+                comics = search_comics(self.keyword, self.page, self.category)
             else:
                 comics = fetch_page(self.page, self.url)
             self.done.emit(comics)

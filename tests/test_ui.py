@@ -7,6 +7,8 @@
 - ComicsGrid 响应式列数计算
 - 对话框模块可导入
 """
+from threading import Event
+
 import pytest
 
 import ui.download_manager as dm
@@ -140,6 +142,53 @@ class TestDownloadManager:
         assert second.status == DownloadTask.WAITING  # 已重置为等待
         assert second.error == ""
         qtbot.waitUntil(lambda: second.status == DownloadTask.DONE, timeout=5000)
+
+    def test_retry_keeps_new_worker_when_old_thread_finishes(
+        self, fresh_manager, qtbot, monkeypatch
+    ):
+        """旧线程发出失败信号后尚未退出，重试不得让旧清理移除新线程。"""
+        old_release = Event()
+        new_release = Event()
+        started = []
+
+        def slow_run(worker):
+            started.append(worker)
+            if len(started) == 1:
+                worker.done.emit(worker.task, False, "网络错误")
+                old_release.wait(5)
+            else:
+                new_release.wait(5)
+
+        monkeypatch.setattr(dm.DownloadWorker, "run", slow_run)
+        task = fresh_manager.start_download(_comic())
+        old_worker = fresh_manager._workers[task]
+        try:
+            qtbot.waitUntil(lambda: task.status == DownloadTask.FAILED, timeout=5000)
+            assert old_worker.isRunning()
+            assert fresh_manager.retry_task(task) is task
+            new_worker = fresh_manager._workers[task]
+            qtbot.waitUntil(lambda: new_worker.isRunning(), timeout=5000)
+            assert old_worker in fresh_manager._retired_workers
+
+            old_release.set()
+            qtbot.waitUntil(
+                lambda: old_worker not in fresh_manager._retired_workers,
+                timeout=5000,
+            )
+            assert fresh_manager._workers[task] is new_worker
+            assert new_worker.isRunning()
+        finally:
+            old_release.set()
+            new_release.set()
+            try:
+                old_worker.wait(5000)
+            except RuntimeError:
+                pass  # finished 后 deleteLater 已销毁 C++ 对象
+            if "new_worker" in locals():
+                try:
+                    new_worker.wait(5000)
+                except RuntimeError:
+                    pass
 
     def test_retry_task_uses_stored_comic(self, fresh_manager, qtbot, monkeypatch):
         """重试使用任务自带的作品数据（task.comic）。"""
@@ -338,7 +387,273 @@ class TestTaskPersistence:
         assert fresh_manager._load_tasks() == []
 
 
+class TestFetchThreadLifetime:
+    def test_search_passes_selected_category_to_worker(self, qtbot, monkeypatch):
+        import ui.fetch_worker as fetch_mod
+        import ui.main_window as mw_mod
+
+        captured = []
+        monkeypatch.setattr(
+            fetch_mod, "search_comics",
+            lambda keyword, page, category: captured.append(
+                (keyword, page, category)
+            ) or [],
+        )
+        monkeypatch.setattr(mw_mod.MainWindow, "_load_initial_data", lambda self: None)
+        window = mw_mod.MainWindow()
+        qtbot.addWidget(window)
+        monkeypatch.setattr(window, "_current_category_filter", lambda: "cate-37")
+
+        window.search_edit.setText("测试")
+        window._on_search_submit()
+        qtbot.waitUntil(lambda: bool(captured), timeout=5000)
+        assert captured == [("测试", 1, "cate-37")]
+        qtbot.waitUntil(lambda: window._worker is None, timeout=5000)
+        window.close()
+
+    def test_category_change_discards_pending_search_result(self, qtbot, monkeypatch):
+        """搜索未结束就切分类时，旧搜索结果不能写入列表缓存。"""
+        import ui.main_window as mw_mod
+        from ui.fetch_worker import FetchWorker
+
+        started = Event()
+        release_search = Event()
+        saved = []
+
+        def slow_run(worker):
+            if worker.keyword:
+                started.set()
+                release_search.wait(5)
+                worker.done.emit([{"title": "旧搜索结果", "detail_url": "/photos-index-aid-1.html"}])
+            else:
+                worker.done.emit([])
+
+        monkeypatch.setattr(FetchWorker, "run", slow_run)
+        monkeypatch.setattr(mw_mod.MainWindow, "_load_initial_data", lambda self: None)
+        monkeypatch.setattr(mw_mod, "save_cache", lambda comics: saved.append(comics))
+        window = mw_mod.MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window.search_edit.setText("测试")
+            window._on_search_submit()
+            qtbot.waitUntil(started.is_set, timeout=5000)
+            window._search_keyword = ""
+            window._start_fetch(page=1)
+            assert window._pending_request is not None
+            release_search.set()
+            qtbot.waitUntil(
+                lambda: window._worker is None and bool(saved), timeout=5000
+            )
+            assert saved == [[]]
+        finally:
+            release_search.set()
+            window.close()
+
+    def test_quick_page_change_keeps_previous_fetch_alive(self, qtbot, monkeypatch):
+        """列表页回调先于底层线程退出时，下一页不能销毁上一页的线程。"""
+        import ui.main_window as mw_mod
+        from ui.fetch_worker import FetchWorker
+        from ui.threads import _registry
+
+        release_second = Event()
+        release_third = Event()
+
+        def slow_run(worker):
+            worker.done.emit([])
+            (release_second if worker.page == 2 else release_third).wait(10)
+
+        monkeypatch.setattr(FetchWorker, "run", slow_run)
+        monkeypatch.setattr(mw_mod.MainWindow, "_load_initial_data", lambda self: None)
+        monkeypatch.setattr(mw_mod, "save_cache", lambda raw: None)
+        window = mw_mod.MainWindow()
+        qtbot.addWidget(window)
+        first = second = None
+        try:
+            window._start_fetch(page=2)
+            first = window._worker
+            qtbot.waitUntil(lambda: window._worker is None, timeout=5000)
+            assert first.isRunning()
+
+            window._start_fetch(page=3)
+            second = window._worker
+            assert second is not first
+            qtbot.waitUntil(lambda: second.isRunning(), timeout=5000)
+            assert first in _registry
+            assert second in _registry
+
+            release_second.set()
+            assert window._worker is second
+            release_third.set()
+            qtbot.waitUntil(lambda: window._worker is None, timeout=5000)
+        finally:
+            release_second.set()
+            release_third.set()
+            for worker in (first, second):
+                if worker is not None:
+                    try:
+                        worker.wait(5000)
+                    except RuntimeError:
+                        pass
+            window.close()
+
+
+class TestFavoritesAndAuthor:
+    def test_collection_card_shows_saved_chapter_count(self, qtbot, monkeypatch, tmp_path):
+        import ui.database as db
+        from ui.main_window import MainWindow
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "chapters.db")
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        monkeypatch.setattr(MainWindow, "_load_initial_data", lambda self: None)
+        comic = {
+            "title": "[作者] 合集",
+            "detail_url": "/photos-index-aid-503.html",
+            "image_count": 0,
+            "chapter_count": 2,
+        }
+        db.DatabaseManager.instance().save_comics([comic])
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            # 旧缓存尚无章节字段时，从数据库补齐并正确显示。
+            window.set_comics_from_raw([{k: v for k, v in comic.items() if k != "chapter_count"}])
+            assert window.comics_grid._cards[0].count_label.text() == "章节: 2 话"
+        finally:
+            window.close()
+            db.DatabaseManager._instance = None
+            db._invalidate_records_cache()
+
+    def test_author_button_never_becomes_a_top_level_window(self, qtbot):
+        from PySide6.QtCore import QEvent, QObject
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        class WindowShowWatcher(QObject):
+            def __init__(self):
+                super().__init__()
+                self.unexpected_windows = []
+
+            def eventFilter(self, obj, event):
+                if (event.type() == QEvent.Show
+                        and isinstance(obj, QWidget)
+                        and obj.isWindow()):
+                    self.unexpected_windows.append((type(obj).__name__, obj.objectName()))
+                return False
+
+        watcher = WindowShowWatcher()
+        QApplication.instance().installEventFilter(watcher)
+        comic = ComicItem(
+            title="[kelingkl屋] 测试作品",
+            image_count=8,
+            upload_date="2026-10-01",
+            detail_url="/photos-index-aid-502.html",
+        )
+        try:
+            host = QWidget()
+            qtbot.addWidget(host)
+            card = ComicCard(comic, parent=host)
+            assert card.author_btn.parentWidget() is card
+            assert not card.author_btn.isWindow()
+            assert watcher.unexpected_windows == []
+        finally:
+            QApplication.instance().removeEventFilter(watcher)
+
+    def test_star_persists_and_favorites_view_updates(self, qtbot, monkeypatch, tmp_path):
+        import ui.database as db
+        from ui.main_window import MainWindow
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "favorites.db")
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        monkeypatch.setattr(MainWindow, "_load_initial_data", lambda self: None)
+        comic = {
+            "title": "[kelingkl屋] 测试作品 [AI绘图]",
+            "detail_url": "/photos-index-aid-500.html",
+            "date": "2026-10-01",
+            "image_count": 8,
+            "category": "cate-37",
+            "category_label": "AI&圖集",
+        }
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window.set_comics_from_raw([comic])
+            assert not window.category_combo.itemIcon(
+                window.category_combo.findText("我的收藏")
+            ).isNull()
+            card = window.comics_grid._cards[0]
+            assert card.favorite_btn.text() == "☆"
+            card.favorite_btn.click()
+            assert card.favorite_btn.text() == "★"
+            assert "#FACC15" in card.favorite_btn.styleSheet()
+            assert len(db.DatabaseManager.instance().load_favorites()) == 1
+
+            window.category_combo.setCurrentText("我的收藏")
+            assert window._favorite_mode
+            assert len(window.comics_grid._cards) == 1
+            assert not window.page_bar.isVisible()
+            window.comics_grid._cards[0].favorite_btn.click()
+            assert db.DatabaseManager.instance().load_favorites() == []
+            assert window.comics_grid._cards == []
+        finally:
+            window.close()
+            db.DatabaseManager._instance = None
+            db._invalidate_records_cache()
+
+    def test_author_button_searches_from_favorites(self, qtbot, monkeypatch, tmp_path):
+        import ui.database as db
+        from ui.main_window import MainWindow
+        from ui.settings import ProjectConfig
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "authors.db")
+        db.DatabaseManager._instance = None
+        db._invalidate_records_cache()
+        monkeypatch.setattr(MainWindow, "_load_initial_data", lambda self: None)
+        monkeypatch.setattr(ProjectConfig, "save", lambda self: None)
+        searches = []
+        monkeypatch.setattr(MainWindow, "_start_fetch", lambda self, **kw: searches.append(
+            (self._search_keyword, self.category_combo.currentText(), kw)
+        ))
+        db.DatabaseManager.instance().set_favorite({
+            "title": "[kelingkl屋] 作品 [AI绘图]",
+            "detail_url": "/photos-index-aid-501.html",
+        }, True)
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window.category_combo.setCurrentText("我的收藏")
+            card = window.comics_grid._cards[0]
+            assert card.author_btn.text() == "作者：kelingkl屋"
+            card.author_btn.click()
+            assert window.search_edit.text() == "kelingkl屋"
+            assert searches == [("kelingkl屋", "全部更新", {"page": 1})]
+            assert not window._favorite_mode
+            window._go_back()
+            assert window._favorite_mode
+            assert window.category_combo.currentText() == "我的收藏"
+            assert window.search_edit.text() == ""
+            assert len(window._comics) == 1
+        finally:
+            window.close()
+            db.DatabaseManager._instance = None
+            db._invalidate_records_cache()
+
+
 class TestComicItemDisplay:
+    def test_old_cached_title_highlight_is_cleaned(self):
+        item = ComicItem(
+            title="[<em>殿様</em><em>ペン</em><em>ギン</em>☆] 作品",
+            image_count=1, upload_date="",
+        )
+        assert item.title == "[殿様ペンギン☆] 作品"
+        assert item.display_title == "[殿様ペンギン☆] 作品"
+
+    def test_collection_and_unknown_counts_are_labeled(self):
+        collection = ComicItem(title="合集", image_count=0, chapter_count=2, upload_date="")
+        unknown = ComicItem(title="未知", image_count=0, upload_date="")
+        assert collection.count_label_text == "章节: 2 话"
+        assert unknown.count_label_text == "图片: 未知"
+
     def test_translated_title_priority(self):
         item = ComicItem(
             title="オリジナル", image_count=1, upload_date="", translated_title="原创标题"
@@ -371,6 +686,29 @@ class TestComicsGrid:
         ]
         grid.render(items)
         assert len(grid._cards) == 10
+
+    def test_main_window_opens_wide_enough_for_three_cards(self, qtbot, monkeypatch):
+        from ui.main_window import MainWindow
+
+        monkeypatch.setattr(MainWindow, "_load_initial_data", lambda self: None)
+        window = MainWindow()
+        qtbot.addWidget(window)
+        comics = [
+            ComicItem(
+                title=f"作品{i}", image_count=1, upload_date="",
+                detail_url=f"/photos-index-aid-{8000 + i}.html",
+            )
+            for i in range(9)
+        ]
+        window.set_comics(comics)
+        window.show()
+        qtbot.wait(20)
+
+        target = window.comics_grid.width_for_columns(3)
+        if window.screen().availableGeometry().width() >= target:
+            assert window.width() >= target
+            assert window.comics_grid._columns == 3
+        assert window.comics_grid._columns <= 3
 
 
 class TestPageBar:
@@ -453,6 +791,30 @@ class TestSimilarFeature:
             category="",
             category_label="",
         )
+
+    def test_card_title_and_buttons_stay_in_info_column(self, qtbot):
+        """长标题不侵入封面，两枚操作按钮留出间隔。"""
+        card = ComicCard(self._make_comic(title="很长的作品名称" * 12))
+        qtbot.addWidget(card)
+        card.show()
+        qtbot.wait(20)
+
+        cover_right = card.cover_container.mapTo(
+            card, card.cover_container.rect().topRight()
+        ).x()
+        title_left = card.title_label.mapTo(card, card.title_label.rect().topLeft()).x()
+        read_right = card.read_btn.mapTo(card, card.read_btn.rect().topRight()).x()
+        download_left = card.download_btn.mapTo(
+            card, card.download_btn.rect().topLeft()
+        ).x()
+        download_right = card.download_btn.mapTo(
+            card, card.download_btn.rect().topRight()
+        ).x()
+
+        assert title_left >= cover_right + 12
+        assert card.title_label.width() <= card.CARD_WIDTH - title_left - 16
+        assert download_left - read_right >= 12
+        assert download_right < card.CARD_WIDTH - 16
 
     def test_badge_visibility_and_text(self, qtbot):
         """左下角相似角标：similar_count > 0 时显示 ≈N，为 0 时隐藏。"""
@@ -560,8 +922,10 @@ class TestSimilarFeature:
         assert grid._cards[0].comic.similar_count == 1
         assert grid._cards[1].comic.similar_count == 0
 
-        width = max(grid.viewport().width(), ComicsGrid.MIN_COLUMN_WIDTH)
-        expected = max(1, width // ComicsGrid.MIN_COLUMN_WIDTH)
+        margins = grid._grid.contentsMargins()
+        spacing = grid._grid.horizontalSpacing()
+        usable = grid.viewport().width() - margins.left() - margins.right()
+        expected = max(1, (usable + spacing) // (ComicCard.CARD_WIDTH + spacing))
         assert grid._columns == expected
         grid.reflow()  # 列数未变时应安全跳过
 
@@ -1182,6 +1546,175 @@ class TestTrayController:
         mw_mod.MainWindow.closeEvent(window, event)
 
         assert event.isAccepted() is True  # 放行退出
+
+
+def test_back_restores_scroll_position(qtbot, monkeypatch):
+    from ui.main_window import MainWindow
+    from ui.settings import ProjectConfig
+
+    monkeypatch.setattr(MainWindow, "_load_initial_data", lambda self: None)
+    monkeypatch.setattr(ProjectConfig, "save", lambda self: None)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    try:
+        window.set_comics([
+            ComicItem(title=f"作品{i}", image_count=1, upload_date="",
+                      detail_url=f"/photos-index-aid-{i + 500}.html")
+            for i in range(24)
+        ])
+        window.show()
+        qtbot.waitUntil(lambda: window.comics_grid.verticalScrollBar().maximum() > 0)
+        bar = window.comics_grid.verticalScrollBar()
+        position = bar.maximum() // 2
+        bar.setValue(position)
+        window._push_history()
+        window.set_comics([ComicItem(title="新列表", image_count=1, upload_date="",
+                                     detail_url="/photos-index-aid-999.html")])
+        window._go_back()
+        qtbot.waitUntil(lambda: bar.value() == position)
+    finally:
+        window.close()
+
+
+def test_back_tracks_category_page_and_author_search(qtbot, monkeypatch):
+    from ui.main_window import MainWindow
+    from ui.settings import BASE_URL, CATEGORIES, ProjectConfig
+
+    monkeypatch.setattr(MainWindow, "_load_initial_data", lambda self: None)
+    monkeypatch.setattr(ProjectConfig, "save", lambda self: None)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    start = ComicItem(title="起点", image_count=1, upload_date="", detail_url="/photos-index-aid-1.html")
+    window.category_combo.blockSignals(True)
+    window.category_combo.setCurrentText("全部更新")
+    window.category_combo.blockSignals(False)
+    window._current_category_name = "全部更新"
+    window._project_config.list_url = f"{BASE_URL}/{CATEGORIES['全部更新']}"
+    window._current_page = 3
+    window.page_bar.set_page(3)
+    window.set_comics([start])
+
+    serial = [1]
+
+    def fake_fetch(*, silent=False, page=None):
+        if page is not None:
+            window._current_page = page
+            window.page_bar.set_page(page)
+        serial[0] += 1
+        title = window._search_keyword or window._current_category_name
+        window.set_comics([ComicItem(
+            title=title, image_count=1, upload_date="",
+            detail_url=f"/photos-index-aid-{serial[0]}.html",
+        )])
+
+    monkeypatch.setattr(window, "_start_fetch", fake_fetch)
+    try:
+        window.category_combo.setCurrentText("同人誌／AI圖集")
+        assert window._current_page == 1
+        window._on_page_requested(2)
+        window._on_author_requested("殿様ペンギン☆")
+        assert window._search_keyword == "殿様ペンギン☆"
+        assert window.search_edit.text() == "殿様ペンギン☆"
+        assert len(window._history) == 3
+
+        window.back_btn.click()
+        assert window._search_keyword == ""
+        assert window.search_edit.text() == ""
+        assert window._current_page == 2
+        assert window._comics[0].title == "同人誌／AI圖集"
+        window.back_btn.click()
+        assert window._current_page == 1
+        window.back_btn.click()
+        assert window._current_page == 3
+        assert window.category_combo.currentText() == "全部更新"
+        assert window._comics[0] is start
+        assert not window.back_btn.isEnabled()
+    finally:
+        window.close()
+
+
+def test_chapter_reader_back_reopens_chapter_choice(qtbot, monkeypatch):
+    from PySide6.QtCore import Signal
+    from PySide6.QtWidgets import QPushButton, QWidget
+
+    import ui.main_window as mw
+    import ui.reader.reader_window as reader_module
+
+    class FakeReader(QWidget):
+        cache_progress_changed = Signal(int, int)
+        reader_closed = Signal()
+        back_requested = Signal()
+
+        def __init__(self, comic, parent=None):
+            super().__init__(parent)
+            self.back_btn = QPushButton(self)
+
+        def closeEvent(self, event):
+            self.reader_closed.emit()
+            super().closeEvent(event)
+
+    monkeypatch.setattr(mw.MainWindow, "_load_initial_data", lambda self: None)
+    monkeypatch.setattr(reader_module, "ReaderWindow", FakeReader)
+    window = mw.MainWindow()
+    qtbot.addWidget(window)
+    source = "/photos-index-aid-999.html"
+    parent = {"title": "合集", "detail_url": source}
+    chapter = {"title": "第1话", "detail_url": "/photos-index-aid-101.html", "image_count": 5}
+    window._chapter_cache[source] = [chapter]
+    chosen = []
+    monkeypatch.setattr(window, "_choose_chapter", lambda data, items: chosen.append((data, items)))
+    try:
+        window._show_reader(chapter, source, parent)
+        reader = window._readers[-1]
+        assert reader.back_btn.text() == "← 返回章节"
+        reader.back_requested.emit()
+        reader.close()
+        qtbot.waitUntil(lambda: len(chosen) == 1)
+        assert chosen == [(parent, [chapter])]
+    finally:
+        window.close()
+
+
+def test_collection_read_opens_selected_chapter(qtbot, monkeypatch):
+    import ui.main_window as mw
+    from ui.reader.chapter_worker import ChapterListWorker
+
+    monkeypatch.setattr(mw.MainWindow, "_load_initial_data", lambda self: None)
+    chapters = [
+        {"title": "第1話 第一章", "detail_url": "/photos-index-aid-101.html", "image_count": 33},
+        {"title": "第2話 第二章", "detail_url": "/photos-index-aid-102.html", "image_count": 42},
+    ]
+    fetched = []
+
+    def fake_run(worker):
+        fetched.append(worker.detail_url)
+        worker.done.emit(chapters)
+
+    monkeypatch.setattr(ChapterListWorker, "run", fake_run)
+    monkeypatch.setattr(
+        mw.QInputDialog, "getItem", lambda *args: (args[3][1], True)
+    )
+    window = mw.MainWindow()
+    qtbot.addWidget(window)
+    opened = []
+    monkeypatch.setattr(window, "_show_reader", lambda data, source, parent=None: opened.append((data, source)))
+    comic = ComicItem(
+        title="合集", image_count=0, chapter_count=2, upload_date="",
+        detail_url="/photos-index-aid-999.html",
+    )
+    try:
+        window._on_open_reader(comic)
+        qtbot.waitUntil(lambda: len(opened) == 1, timeout=5000)
+        assert fetched == [comic.detail_url]
+        assert opened[0][0]["detail_url"] == "/photos-index-aid-102.html"
+        assert opened[0][0]["image_count"] == 42
+        assert opened[0][1] == comic.detail_url
+        qtbot.waitUntil(lambda: not window._chapter_workers, timeout=5000)
+        window._on_open_reader(comic)
+        assert len(opened) == 2
+        assert fetched == [comic.detail_url]
+    finally:
+        window.close()
 
 
 def test_notify_setting_default_enabled():

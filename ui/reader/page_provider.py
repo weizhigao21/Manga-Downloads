@@ -24,6 +24,7 @@ from src.utils import safe_filename
 from src.wnacg_crawler import (
     G_URL,
     HEADERS,
+    _fetch_picture_link,
     download_pictures,
     parse_picture_page,
 )
@@ -81,6 +82,10 @@ class ReaderSession:
         self._per_page_cache: dict[str, int] = {}
         # 列表页条目缓存：{列表页码: 条目列表}（相邻页同列表页时复用，免重复请求）
         self._list_pages_cache: dict[int, list[dict]] = {}
+        # 每个列表页一把细粒度锁：预解析线程与翻页线程并发请求同页时，
+        # 后到者等先到者解析完直接用缓存，避免双 miss 双请求（见
+        # `_list_page_entries` 的并发守卫说明）
+        self._list_page_locks: dict[int, threading.Lock] = {}
         # 阅读页 URL 缓存（详情页解析结果）：避免每页都联网拉详情页
         self._reading_url_cache: str | None = None
         # 本地目录的轻量变更指示（目录项数 + 最新 mtime）：翻页是高频操作，
@@ -296,8 +301,8 @@ class ReaderSession:
         pages = self._parse_page(page_no)
         if not pages:
             raise PageFetchError(page_no, f"第 {page_no} 页未解析到图片")
-        # 该页解析出的条目依次对应 page_no, page_no+1, ...（用于相邻页预填）
-        # 同时记录网页给出的真实页名，供索引路径下载时沿用
+        # 当前页直链及真实页名写入索引。列表页其他条目仍保持轻量元数据，
+        # 翻到对应图片时再解析，避免首次打开就等待整页的详情请求。
         discovered: dict[int, tuple[str, str]] = {}
         for i, entry in enumerate(pages):
             no = page_no + i
@@ -333,30 +338,12 @@ class ReaderSession:
     def _local_is_complete(self) -> bool:
         """本地是否已覆盖作品全部页（用于短路网络请求）。
 
-        判据：本地图片数 >= 作品总页数。总页数优先取 `image_count`
-        （列表页的「N 張」，可信）；为 0 时退而用本地文件数——此时
-        "本地有文件"即视为完整（否则无从判断完整性，宁可让它联网）。
-
-        **二次校验**：站点的 `image_count` 可能与实际张数不符（重传/
-        合并/计数偏差），若本地张数 >= 声明总数的一半以上，再检查本地
-        页码是否**连续无缺口**（最大页码 == 本地张数，即 1..N 全覆盖）。
-        连续则视为完整——宁可相信落盘的连续页码，也不为站点的错误计数
-        平白发起一轮列表页解析 + 逐张直链抓取。
+        只有已知总数且本地确实覆盖全部页时，才能阻止联网补拉。
+        连续缓存了前半部并不能证明作品已完整：24 张作品下载到第 12 张
+        时，旧的「过半且连续」判断会使第 13 张直接失败。
         """
         total = int(self.comic.get("image_count") or 0)
-        count = self.local_count
-        if total <= 0:
-            # 总数未知：只要有本地文件就认为够用，避免无谓联网
-            return count > 0
-        if count >= total:
-            return True
-        # 本地明显不够，且差距过大（< 一半）：很可能确实不全，放行联网
-        if count * 2 < total:
-            return False
-        # 本地接近声明总数：用页码连续性判断（站点计数可能虚高）
-        if not self._local_by_number:
-            return False
-        return max(self._local_by_number) == count
+        return total > 0 and self.local_count >= total
 
     def _parse_page(self, page_no: int) -> list[dict]:
         """解析出**第 page_no 张图片**的条目（含直链）。
@@ -374,10 +361,11 @@ class ReaderSession:
         if not reading_url:
             raise PageFetchError(page_no, "无法获取阅读页链接（详情页解析失败）")
 
-        total_pages = self._reading_page_count(reading_url)
-        per_page = self._images_per_reading_page(reading_url, total_pages)
+        url_pages = self._reading_page_count(reading_url)
+        per_page = self._images_per_reading_page(reading_url, url_pages)
         if per_page <= 0:
             raise PageFetchError(page_no, "无法确定阅读页每页图片数量")
+        total_pages = self._expected_list_pages(reading_url, per_page)
 
         # 图片序号 → 列表页码（第 1..per_page 张在第 1 个列表页，依此类推）
         list_page = (page_no - 1) // per_page + 1
@@ -395,63 +383,75 @@ class ReaderSession:
                 page_no,
                 f"第 {page_no} 张超出列表页范围（该页仅 {len(entries)} 张）",
             )
-        # 返回从该张开始的条目，便于上层把相邻张一并回填索引
-        return entries[offset:]
+        entry = entries[offset]
+        if "link" in entry:
+            return [entry]
+        link = _fetch_picture_link(entry["detail_link"])
+        if not link:
+            raise PageFetchError(page_no, f"第 {page_no} 张图片直链解析失败")
+        return [{"link": link, "number": entry["number"]}]
 
     def _list_page_entries(self, reading_url: str, list_page: int) -> list[dict]:
         """取某个列表页的图片条目，**按列表页缓存**避免重复请求。
 
         同一部作品的相邻若干张往往落在同一个列表页（站点每页约 12 张），
-        连续翻页时若不缓存，每翻一页都要重新解析该列表页——每张图的直链
-        解析本身又是并发网络请求的集合，重复代价很高。
+        连续翻页时若不缓存，每翻一页都要重新请求该列表页。这里仅缓存
+        图片详情页地址，翻到某张图时才解析该图的直链。
+
+        并发安全：「查缓存 → 网络请求 → 写缓存」曾是裸露的 check-then-act，
+        预取线程与翻页线程同时请求同一列表页会双 miss、双请求（用户日志
+        中同一页 1 秒内被解析两次即此竞态）。修复：每个列表页一把细粒度锁，
+        **只挡同页并发、不挡其他页**；持锁期间做网络请求，后到线程在锁外
+        等待，进来后二次查缓存直接命中，不再重复解析。
         """
         cached = self._list_pages_cache.get(list_page)
         if cached is not None:
             return cached
-        try:
-            entries = parse_picture_page(
-                reading_url, start=list_page, end=list_page
-            )
-        except Exception as exc:
-            raise PageFetchError(
-                list_page, f"解析列表页 {list_page} 失败: {exc}"
-            ) from exc
-        self._list_pages_cache[list_page] = entries
-        return entries
+        with self._lock:
+            page_lock = self._list_page_locks.setdefault(list_page, threading.Lock())
+        with page_lock:
+            # 等待期间可能已被其他线程解析并写入缓存
+            cached = self._list_pages_cache.get(list_page)
+            if cached is not None:
+                return cached
+            try:
+                entries = parse_picture_page(
+                    reading_url, start=list_page, end=list_page, resolve_links=False
+                )
+            except Exception as exc:
+                raise PageFetchError(
+                    list_page, f"解析列表页 {list_page} 失败: {exc}"
+                ) from exc
+            self._list_pages_cache[list_page] = entries
+            return entries
 
     @staticmethod
     def _reading_page_count(reading_url: str) -> int:
-        """阅读页的列表页总数（URL 里的 page-N-aid-X）。"""
+        """阅读 URL 的 page-N 数字；链接可能只指向第 1 页。"""
         match = _PAGE_AID_RE.search(reading_url)
         return int(match.group(1)) if match else 1
 
+    def _expected_list_pages(self, reading_url: str, per_page: int) -> int:
+        """用作品张数补足 URL 中可能低估的列表页数。"""
+        url_pages = self._reading_page_count(reading_url)
+        total_images = int(self.comic.get("image_count") or 0)
+        if total_images > 0 and per_page > 0:
+            return max(url_pages, -(-total_images // per_page))
+        return url_pages
+
     def _images_per_reading_page(self, reading_url: str, total_pages: int) -> int:
-        """确定站点每个阅读页放多少张图（优先用总数推导，避免多余请求）。
+        """从第一个列表页确定容量，并在会话内复用解析结果。
 
-        **优先用已知的总张数推导**：`每页张数 = ceil(总张数 / 列表页数)`，
-        这类信息通常已由列表页的「N 張」（`image_count`）给出，无需联网。
-        只有在总张数未知时才回退到「探测第 1 个列表页」——那是一次真实
-        网络请求，翻页路径上应尽量避免。
-
-        结果按 URL 缓存（`_per_page_cache`），同会话内不再重复计算。
+        总张数除以列表页数无法推导容量：13 张分两页通常是 12+1，
+        ceil(13/2)=7 会将第 8 张错映射到第二个列表页。
         """
         cached = self._per_page_cache.get(reading_url)
         if cached:
             return cached
 
-        # 路径 1：用已知总数推导（零网络请求）
-        total_images = int(self.comic.get("image_count") or 0)
-        if total_images > 0 and total_pages > 0:
-            # 向上取整：最后一页可能不满
-            count = -(-total_images // total_pages)
-            if count > 0:
-                self._per_page_cache[reading_url] = count
-                return count
-
-        # 路径 2：总数未知，退回探测列表页 1（一次网络请求）
         try:
-            entries = parse_picture_page(reading_url, start=1, end=1)
-        except Exception as exc:
+            entries = self._list_page_entries(reading_url, 1)
+        except PageFetchError as exc:
             logger.warning("探测每页张数失败: %s", exc)
             return 0
         count = len(entries)
@@ -499,6 +499,72 @@ class ReaderSession:
         return self._local_by_page(page_no)
 
     # ---- 预取 ----
+
+    def prefetch_all_links(
+        self, cancel_check: Callable[[], bool] | None = None
+    ) -> dict[int, tuple[str, str]]:
+        """按显式调用预解析整部作品的图片直链（不下载图片）。
+
+        将解析结果写入内存 `_page_urls` 与 SQLite 索引。阅读器启动时
+        不调用此方法，避免用户等待整部作品的详情页请求。
+
+        - 本地已完整的作品不需要任何网络，直接返回空表；
+        - 直链索引已覆盖的列表页（如上次阅读已解析、重开阅读器）自动
+          跳过，不重复请求。
+
+        Args:
+            cancel_check: 返回 True 时中止（用户已关闭窗口）。
+
+        Returns:
+            {页码: (直链, 真实页名)}——**本次新解析到**的直链。
+        """
+        if (cancel_check and cancel_check()) or self._local_is_complete():
+            return {}
+        total_images = int(self.comic.get("image_count") or 0)
+        if total_images > 0:
+            with self._lock:
+                if all(no in self._page_urls for no in range(1, total_images + 1)):
+                    return {}
+        reading_url = self._reading_url()
+        if not reading_url:
+            return {}
+        url_pages = self._reading_page_count(reading_url)
+        per_page = self._images_per_reading_page(reading_url, url_pages)
+        if per_page <= 0:
+            return {}
+        total_pages = self._expected_list_pages(reading_url, per_page)
+        discovered: dict[int, tuple[str, str]] = {}
+        for list_page in range(1, total_pages + 1):
+            if cancel_check and cancel_check():
+                break
+            base_no = (list_page - 1) * per_page
+            # 该列表页的直链已全在索引里：跳过，免重复解析
+            span_end = min(base_no + per_page, total_images) if total_images > 0 else base_no + per_page
+            with self._lock:
+                have_all = all(
+                    no in self._page_urls for no in range(base_no + 1, span_end + 1)
+                )
+            if have_all:
+                continue
+            try:
+                entries = self._list_page_entries(reading_url, list_page)
+            except PageFetchError as exc:
+                logger.info("预解析直链跳过列表页 %d: %s", list_page, exc)
+                continue
+            for i, entry in enumerate(entries):
+                no = base_no + i + 1
+                if no in self._page_urls:
+                    continue
+                link = entry.get("link") or _fetch_picture_link(entry["detail_link"])
+                if not link:
+                    continue
+                name = str(entry.get("number") or "").strip() or str(no)
+                discovered[no] = (link, name)
+        if discovered:
+            with self._lock:
+                self._page_urls.update(discovered)
+            self.index.save_page_urls(self.aid, discovered)
+        return discovered
 
     def prefetch_around(
         self,

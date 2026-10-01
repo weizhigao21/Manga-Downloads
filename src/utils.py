@@ -2,6 +2,7 @@
 
 import re
 import sys
+from html import unescape
 from pathlib import Path
 
 # Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9，含 "CON.txt" 这类带扩展名变体）
@@ -10,6 +11,15 @@ _WINDOWS_RESERVED_NAMES = frozenset(
     | {f"COM{i}" for i in range(1, 10)}
     | {f"LPT{i}" for i in range(1, 10)}
 )
+
+_HIGHLIGHT_TAG_RE = re.compile(
+    r"</?(?:em|mark|strong|b|span)\b[^>]*>", re.IGNORECASE
+)
+
+
+def clean_title_markup(title: str) -> str:
+    """去掉搜索结果混入标题的 HTML 高亮标签，保留真实文字和符号。"""
+    return _HIGHLIGHT_TAG_RE.sub("", unescape(title or "")).strip()
 
 
 def safe_filename(name: str) -> str:

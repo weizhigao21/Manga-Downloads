@@ -60,6 +60,10 @@ def _make_cover(db, aid: int, variant: str):
 
 
 class TestExtractAuthor:
+    def test_old_highlight_markup_is_removed_but_symbols_are_preserved(self, _isolated_db):
+        title = "[<em>殿様</em><em>ペン</em><em>ギン</em>☆] 作品"
+        assert _isolated_db.extract_author(title) == "殿様ペンギン☆"
+
     def test_first_bracket_is_author(self, _isolated_db):
         assert _isolated_db.extract_author("[社团A] 作品名") == "社团A"
 
@@ -74,6 +78,69 @@ class TestExtractAuthor:
 
     def test_no_bracket_returns_empty(self, _isolated_db):
         assert _isolated_db.extract_author("没有括号的标题") == ""
+
+    def test_skips_ai_drawing_tag(self, _isolated_db):
+        assert _isolated_db.extract_author("[AI绘图] [kelingkl屋] 作品") == "kelingkl屋"
+
+
+class TestFavorites:
+    def test_search_result_can_be_favorited_and_survives_refresh(self, _isolated_db):
+        dbm = _isolated_db.DatabaseManager.instance()
+        comic = {
+            "detail_url": "/photos-index-aid-42.html",
+            "title": "[kelingkl屋] 测试作品 [AI绘图]",
+            "date": "2026-10-01",
+            "image_count": 12,
+            "cover_url": "cover.jpg",
+            "category": "cate-37",
+            "category_label": "AI&圖集",
+        }
+        dbm.set_favorite(comic, True)
+        assert [row["detail_url"] for row in dbm.load_favorites()] == [comic["detail_url"]]
+        assert dbm.load_favorites()[0]["author"] == "kelingkl屋"
+
+        # 抓取列表再次写入时不能把收藏标记覆盖成 0。
+        dbm.save_comics([comic])
+        assert dbm.load_favorites()[0]["favorite"] == 1
+        assert next(r for r in _isolated_db._cached_records()
+                    if r["detail_url"] == comic["detail_url"])["favorite"] == 1
+
+        dbm.set_favorite(comic, False)
+        assert dbm.load_favorites() == []
+
+    def test_old_database_adds_favorite_column(self, _isolated_db):
+        import sqlite3
+
+        with sqlite3.connect(_isolated_db.DB_PATH) as conn:
+            conn.execute(
+                "CREATE TABLE comics (detail_url TEXT PRIMARY KEY, title TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO comics (detail_url, title) VALUES (?, ?)",
+                ("/photos-index-aid-1.html", "旧作品"),
+            )
+        dbm = _isolated_db.DatabaseManager.instance()
+        with dbm._connect() as conn:
+            row = conn.execute("SELECT favorite, chapter_count FROM comics").fetchone()
+        assert row["favorite"] == 0
+        assert row["chapter_count"] == 0
+
+
+class TestCollectionCounts:
+    def test_unknown_count_preserves_known_values_and_chapters_persist(self, _isolated_db):
+        dbm = _isolated_db.DatabaseManager.instance()
+        comic = {"detail_url": "/photos-index-aid-42.html", "title": "合集"}
+        dbm.save_comics([{**comic, "image_count": 42}])
+        dbm.save_comics([{**comic, "image_count": 0}])
+        assert dbm.load_comics()[0]["image_count"] == 42
+        assert _isolated_db._cached_records()[0]["image_count"] == 42
+
+        dbm.save_comics([{**comic, "image_count": 0, "chapter_count": 2}])
+        row = dbm.load_comics()[0]
+        assert (row["image_count"], row["chapter_count"]) == (0, 2)
+        dbm.save_comics([{**comic, "image_count": 0}])
+        assert dbm.load_comics()[0]["chapter_count"] == 2
+        assert _isolated_db._cached_records()[0]["chapter_count"] == 2
 
 
 # ---- 名称归一化 ----

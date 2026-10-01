@@ -15,7 +15,8 @@
    线程被强杀或解压中退出时留下孤儿 7z.exe。
 
 线程生命周期与注册表：
-- register 在 worker 的 run() 中调用；登记时顺手清理已销毁（deleteLater
+- 创建者在 start() 前调用 register，worker 的 run() 也会重复登记；登记时
+  顺手清理已销毁（deleteLater
   后 C++ 对象失效）的线程，避免注册表长期累积。不使用 finished/
   destroyed 信号做自动注销：若子类曾用自定义信号遮蔽内置 finished
   （历史版本 FetchWorker/TranslateWorker 的 `finished = Signal(list/str)`），
@@ -49,7 +50,7 @@ def _alive(thread: QThread) -> bool:
 
 
 def register(thread: QThread):
-    """登记一个运行中的后台线程（run 中调用，持锁保证跨线程安全）。
+    """持有后台线程至退出（启动前或 run 中调用，持锁保证跨线程安全）。
 
     登记时惰性清理已销毁（C++ 对象被 deleteLater 移除）的线程对象，
     避免注册表长期累积；已结束但对象仍存活的线程留待下次清理，

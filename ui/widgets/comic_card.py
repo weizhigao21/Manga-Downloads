@@ -11,18 +11,21 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
 )
 
 from ui.download_manager import DownloadManager, DownloadTask
 from ui.models import ComicItem
 from ui.styles import PALETTE
+from ui.threads import register
 from ui.widgets.cache_ring import CacheProgressRing
 
 
 class ComicCard(QFrame):
     """漫画条目卡片组件。"""
 
+    CARD_WIDTH = 440
     COVER_WIDTH = 160
     COVER_HEIGHT = 220
 
@@ -30,6 +33,8 @@ class ComicCard(QFrame):
     similar_requested = Signal(object)
     # 「阅读」按钮触发（emit 当前 ComicItem），由主窗口打开阅读器窗口
     read_requested = Signal(object)
+    favorite_changed = Signal(object, bool)
+    author_requested = Signal(str)
 
     def __init__(self, comic: ComicItem, parent=None, downloaded: bool | None = None):
         super().__init__(parent)
@@ -60,10 +65,14 @@ class ComicCard(QFrame):
         if downloaded is not None:
             self._pre_downloaded = downloaded
         self._update_title_label()
-        self.count_label.setText(f"图片: {self.comic.count_text}")
+        self._update_author_button()
+        self._update_favorite_button()
+        self.count_label.setText(self.comic.count_label_text)
         self.date_label.setText(f"上传: {self.comic.formatted_date}")
         self.url_label.setText(self.comic.detail_url)
         self._sync_download_button()
+        self.downloaded_badge.setVisible(self._is_downloaded())
+        self._position_cover_badges()
         self._update_similar_badge()
         # 复用卡片时缓存进度由网格重新预计算（set_cache_progress）覆盖
         self._pre_cache = None
@@ -75,6 +84,9 @@ class ComicCard(QFrame):
         """下载任务变化回调：只响应本作品的任务（O(1) 过滤，免遍历任务列表）。"""
         if task.task_id and task.task_id == self._task_id:
             self._sync_download_button(task)
+            if task.status == DownloadTask.DONE:
+                self._pre_cache = None
+                self.refresh_cache_progress()
 
     def _on_task_deleted(self, task):
         """任务被删除回调：本作品任务被移除后，按钮重新自查（回到未下载状态）。"""
@@ -126,7 +138,7 @@ class ComicCard(QFrame):
     def _setup_ui(self):
         self.setObjectName("comicCard")
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(320, 262)
+        self.setFixedSize(self.CARD_WIDTH, 262)
 
         # 卡片整体布局
         layout = QHBoxLayout(self)
@@ -134,7 +146,7 @@ class ComicCard(QFrame):
         layout.setSpacing(16)
 
         # 封面容器（用于承载封面图与右上角角标）
-        self.cover_container = QFrame()
+        self.cover_container = QFrame(self)
         self.cover_container.setFixedSize(self.COVER_WIDTH, self.COVER_HEIGHT)
         self.cover_container.setStyleSheet(
             "QFrame { background-color: transparent; border-radius: 8px; }"
@@ -170,6 +182,7 @@ class ComicCard(QFrame):
             """
         )
         self.downloaded_badge.adjustSize()
+        self.downloaded_badge.setFixedHeight(32)
         # 定位到左上角，留出 8px 边距
         self.downloaded_badge.move(8, 8)
         self.downloaded_badge.setVisible(self._is_downloaded())
@@ -207,6 +220,11 @@ class ComicCard(QFrame):
         else:
             self.category_badge.setVisible(False)
 
+        self.cache_ring = CacheProgressRing(
+            self.cover_container, size=self.downloaded_badge.height(), thickness=3
+        )
+        self._position_cover_badges()
+
         # 左下角"相似"角标（本地库存在相似作品时显示 ≈N；
         # 相似记录中有已下载时数字变红提示，否则橙色）
         self.similar_badge = QLabel(self.cover_container)
@@ -216,6 +234,18 @@ class ComicCard(QFrame):
         self._update_similar_badge()
         self.similar_badge.setVisible(self.comic.similar_count > 0)
 
+        self.favorite_btn = QPushButton(self.cover_container)
+        self.favorite_btn.setObjectName("favoriteButton")
+        self.favorite_btn.setFixedSize(34, 34)
+        self.favorite_btn.move(
+            self.COVER_WIDTH - self.favorite_btn.width() - 8,
+            self.COVER_HEIGHT - self.favorite_btn.height() - 8,
+        )
+        self.favorite_btn.setCursor(Qt.PointingHandCursor)
+        self.favorite_btn.setFocusPolicy(Qt.NoFocus)
+        self.favorite_btn.clicked.connect(self._toggle_favorite)
+        self._update_favorite_button()
+
         layout.addWidget(self.cover_container)
 
         # 右侧信息
@@ -223,8 +253,11 @@ class ComicCard(QFrame):
         info_layout.setSpacing(8)
         info_layout.setAlignment(Qt.AlignTop)
 
-        self.title_label = QLabel()
+        self.title_label = QLabel(self)
         self.title_label.setWordWrap(True)
+        self.title_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.title_label.setStyleSheet(
             f"""
             QLabel {{
@@ -236,45 +269,67 @@ class ComicCard(QFrame):
         )
         self._update_title_label()
 
-        self.count_label = QLabel(f"图片: {self.comic.count_text}")
+        # 作者按钮可能在加入布局前就被设为可见；必须先指定父控件，
+        # 否则 Qt 会把它短暂显示成桌面上的独立小窗口。
+        self.author_btn = QPushButton(self)
+        self.author_btn.setObjectName("authorButton")
+        self.author_btn.setCursor(Qt.PointingHandCursor)
+        self.author_btn.setFocusPolicy(Qt.NoFocus)
+        self.author_btn.setFixedHeight(24)
+        self.author_btn.setMaximumWidth(205)
+        self.author_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                color: {PALETTE['primary']};
+                background-color: #EFF6FF;
+                border: 1px solid #BFDBFE;
+                border-radius: 5px;
+                padding: 2px 6px;
+                text-align: left;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ background-color: #DBEAFE; }}
+            """
+        )
+        self.author_btn.clicked.connect(self._on_author_clicked)
+        self._update_author_button()
+
+        self.count_label = QLabel(self.comic.count_label_text, self)
         self.count_label.setStyleSheet(
             f"color: {PALETTE['text_secondary']}; font-size: 13px;"
         )
 
-        self.date_label = QLabel(f"上传: {self.comic.formatted_date}")
+        self.date_label = QLabel(f"上传: {self.comic.formatted_date}", self)
         self.date_label.setStyleSheet(
             f"color: {PALETTE['text_secondary']}; font-size: 13px;"
         )
 
-        self.url_label = QLabel(self.comic.detail_url)
+        self.url_label = QLabel(self.comic.detail_url, self)
         self.url_label.setWordWrap(True)
+        self.url_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.url_label.setStyleSheet(
             f"color: {PALETTE['primary']}; font-size: 12px;"
         )
 
         info_layout.addWidget(self.title_label)
+        info_layout.addWidget(self.author_btn)
         info_layout.addWidget(self.count_label)
         info_layout.addWidget(self.date_label)
         info_layout.addWidget(self.url_label)
         info_layout.addStretch()
 
-        # 卡片右下角按钮区：缓存进度圈 + 阅读 + 下载
+        # 卡片右下角按钮区：阅读 + 下载
         bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(8)
-
-        # 缓存进度圈：显示本地已缓存百分比（灰底 + 彩色弧，只在有本地文件时可见）
-        # 28px：内圈约 22px，两位数百分比（如 75）也能完整落在圈内
-        self.cache_ring = CacheProgressRing(self, size=28, thickness=3)
-        bottom_row.addWidget(self.cache_ring, alignment=Qt.AlignVCenter)
-
-        bottom_row.addStretch()
+        bottom_row.setSpacing(12)
 
         # 「阅读」按钮：打开阅读器（本地优先，缺页边看边缓存）
-        self.read_btn = QPushButton("阅读")
+        self.read_btn = QPushButton("阅读", self)
         self.read_btn.setObjectName("readButton")
         self.read_btn.setCursor(Qt.PointingHandCursor)
         self.read_btn.setFocusPolicy(Qt.NoFocus)
-        self.read_btn.setFixedSize(76, 28)
+        self.read_btn.setFixedSize(104, 32)
         self.read_btn.setStyleSheet(
             f"""
             QPushButton {{
@@ -298,8 +353,9 @@ class ComicCard(QFrame):
         )
         self.read_btn.clicked.connect(self._on_read_clicked)
         bottom_row.addWidget(self.read_btn)
+        bottom_row.addStretch(1)
 
-        self.download_btn = QPushButton("下载")
+        self.download_btn = QPushButton("下载", self)
         self.download_btn.setObjectName("downloadButton")
         self.download_btn.setCursor(Qt.PointingHandCursor)
         # 点击不抢焦点：按钮状态切换（下载→下载中/翻译中→已下载/重试）会
@@ -309,7 +365,7 @@ class ComicCard(QFrame):
         self.download_btn.setFocusPolicy(Qt.NoFocus)
         # 固定宽度：文本在「下载/下载中.../已下载/重试/翻译中...」间切换时
         # 宽度保持稳定，避免按钮膨胀导致卡片内布局重排、界面视觉跳动
-        self.download_btn.setFixedSize(104, 28)
+        self.download_btn.setFixedSize(104, 32)
         self.download_btn.setStyleSheet(
             f"""
             QPushButton {{
@@ -442,17 +498,75 @@ class ComicCard(QFrame):
             return
         self.read_requested.emit(self.comic)
 
+    def _update_favorite_button(self):
+        favored = bool(self.comic.favorite)
+        self.favorite_btn.setText("★" if favored else "☆")
+        self.favorite_btn.setToolTip("取消收藏" if favored else "收藏作品")
+        self.favorite_btn.setStyleSheet(
+            "QPushButton { background: rgba(20, 24, 31, 0.72); border: none; "
+            f"border-radius: 17px; color: {'#FACC15' if favored else '#FFFFFF'}; "
+            "font-size: 26px; padding: 0; }"
+            "QPushButton:hover { background: rgba(20, 24, 31, 0.9); }"
+        )
+
+    def _toggle_favorite(self):
+        from ui.database import DatabaseManager
+
+        target = not self.comic.favorite
+        record = {
+            "title": self.comic.title,
+            "detail_url": self.comic.detail_url,
+            "date": self.comic.upload_date,
+            "image_count": self.comic.image_count,
+            "chapter_count": self.comic.chapter_count,
+            "cover_url": self.comic.cover_url,
+            "category": self.comic.category,
+            "category_label": self.comic.category_label,
+            "translated_title": self.comic.translated_title,
+        }
+        try:
+            DatabaseManager.instance().set_favorite(record, target)
+        except Exception as exc:
+            QMessageBox.warning(self, "收藏失败", str(exc))
+            return
+        self.comic.favorite = target
+        self._update_favorite_button()
+        self.favorite_changed.emit(self.comic, target)
+
     # ---- 缓存进度圈 ----
+
+    def set_downloaded_state(self, downloaded: bool):
+        """同步当前作品的已下载角标及其关联的缓存进度环。"""
+        self._pre_downloaded = bool(downloaded)
+        self.downloaded_badge.setVisible(self._pre_downloaded)
+        self._position_cover_badges()
+
+    def _position_cover_badges(self):
+        """仅在已下载角标出现时显示等高进度环，并避开分类角标。"""
+        downloaded = not self.downloaded_badge.isHidden()
+        self.cache_ring.setVisible(downloaded)
+        ring_x = self.downloaded_badge.x() + self.downloaded_badge.width() + 6
+        ring_y = self.downloaded_badge.y() + (
+            self.downloaded_badge.height() - self.cache_ring.height()
+        ) // 2
+        self.cache_ring.move(ring_x, ring_y)
+        if not self.category_badge.isHidden():
+            overlaps = downloaded and ring_x + self.cache_ring.width() + 4 > self.category_badge.x()
+            self.category_badge.move(
+                self.category_badge.x(), self.downloaded_badge.height() + 16 if overlaps else 8
+            )
 
     def set_cache_progress(self, percent: int, cached: int = 0, total: int = 0):
         """设置本地缓存进度（网格批量预计算后调用，避免卡片各自扫盘）。"""
         self._pre_cache = (int(percent), int(cached), int(total))
         self.cache_ring.set_progress(percent, cached, total)
+        self._position_cover_badges()
 
     def refresh_cache_progress(self):
         """按需自查缓存进度（下载/阅读完成等状态变化后调用）。"""
         if self._pre_cache is not None:
             self.cache_ring.set_progress(*self._pre_cache)
+            self._position_cover_badges()
             return
         from ui.reader.cache_index import cache_progress, find_local_dir
 
@@ -460,12 +574,14 @@ class ComicCard(QFrame):
             {
                 "title": self.comic.title,
                 "detail_url": self.comic.detail_url,
-                "category_label": self.comic.category_label,
+                "category_label": self.comic.display_category_label,
+                "original_category_label": self.comic.category_label,
                 "translated_title": self.comic.translated_title,
             }
         )
         cached, total, percent = cache_progress(folder, self.comic.image_count)
         self.cache_ring.set_progress(percent, cached, total)
+        self._position_cover_badges()
 
     def _is_downloaded(self) -> bool:
         """判断当前作品是否已下载（任务完成、数据库标记或下载目录文件夹）。
@@ -501,6 +617,7 @@ class ComicCard(QFrame):
             self.download_btn.setEnabled(True)
             self.download_btn.setText("已下载")
             self.downloaded_badge.setVisible(True)
+            self._position_cover_badges()
         elif task.status == DownloadTask.FAILED:
             self.download_btn.setEnabled(True)
             self.download_btn.setText("重试")
@@ -597,6 +714,21 @@ class ComicCard(QFrame):
         self.title_label.setText(shown_title)
         self.title_label.setToolTip(full_title if shown_title != full_title else "")
 
+    def _update_author_button(self):
+        from ui.database import extract_author
+
+        self._author = extract_author(self.comic.title)
+        if self._author:
+            text = f"作者：{self._author}"
+            shown = self.author_btn.fontMetrics().elidedText(text, Qt.ElideRight, 205)
+            self.author_btn.setText(shown)
+            self.author_btn.setToolTip(f"搜索作者：{self._author}")
+        self.author_btn.setVisible(bool(self._author))
+
+    def _on_author_clicked(self):
+        if self._author:
+            self.author_requested.emit(self._author)
+
     def _show_status(self, text: str):
         """在左下角状态栏显示提示（经由主窗口 set_status，超长截断）。"""
         window = self.window()
@@ -635,6 +767,7 @@ class ComicCard(QFrame):
         # 返回前 emit，若连 deleteLater 会在底层线程仍在运行时销毁 QThread，
         # 触发 "QThread: Destroyed while thread is still running" 闪退
         worker.finished.connect(worker.deleteLater)
+        register(worker)
         worker.start()
 
     def _on_translate_done(self, result: str):

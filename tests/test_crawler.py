@@ -6,8 +6,67 @@ from src.wnacg_crawler import (
     _extract_image_url,
     _normalize_image_url,
     _page_url,
+    parse_collection_chapters,
     parse_comics,
 )
+
+
+def test_parse_collection_chapters_skips_start_link_and_keeps_page_counts():
+    page = """<a id="reader-btn" href="/photos-slide-aid-258605-sid-390979.html">开始阅读</a>
+    <div class="sr_compact">
+      <a class="tagshow" href="/photos-slide-aid-258605-sid-390979.html"
+         title="第1話《第一章》 33P 2024-07-17">第1話 第一章</a>
+      <a class="tagshow" href="/photos-slide-aid-366617-sid-390979.html"
+         title="第2話《第二章》 42P 2026-06-23">第2話 第二章</a>
+    </div>"""
+    assert parse_collection_chapters(page) == [
+        {"title": "第1話 第一章", "detail_url": "/photos-index-aid-258605.html", "image_count": 33},
+        {"title": "第2話 第二章", "detail_url": "/photos-index-aid-366617.html", "image_count": 42},
+    ]
+
+
+def test_explicit_picture_page_range_can_exceed_link_page_number(monkeypatch):
+    """page-1 阅读链接不应裁掉显式请求的第二个列表页。"""
+    import src.wnacg_crawler as crawler
+
+    requested = []
+
+    def _fake_fetch(url, headers):
+        requested.append(url)
+        return """<div id="bodywrap"><ul><li class="gallary_item">
+            <div class="pic_box"><a href="/photos-view-id-25.html">图片</a></div>
+            <div class="info"><span class="name">25</span></div>
+        </li></ul></div>"""
+
+    monkeypatch.setattr(crawler, "fetch_with_retry", _fake_fetch)
+    monkeypatch.setattr(crawler, "_fetch_picture_link", lambda link: "http://cdn/25.jpg")
+    pictures = crawler.parse_picture_page(
+        "/photos-index-page-1-aid-42.html", start=2, end=2
+    )
+    assert requested == ["https://www.wnacg.com/photos-index-page-2-aid-42.html"]
+    assert pictures == [{"link": "http://cdn/25.jpg", "number": "25"}]
+
+
+def test_list_page_only_does_not_fetch_every_picture_detail(monkeypatch):
+    """阅读器只取列表条目时，不逐张请求大图直链。"""
+    import src.wnacg_crawler as crawler
+
+    page_html = "<div id='bodywrap'><ul>" + "".join(
+        f"<li class='gallary_item'><div class='pic_box'><a href='/view-{i}.html'>图</a></div>"
+        f"<div class='info'><span class='name'>{i}</span></div></li>"
+        for i in range(1, 25)
+    ) + "</ul></div>"
+    monkeypatch.setattr(crawler, "fetch_with_retry", lambda url, headers: page_html)
+    detail_calls = []
+    monkeypatch.setattr(
+        crawler, "_fetch_picture_link", lambda link: detail_calls.append(link)
+    )
+    entries = crawler.parse_picture_page(
+        "/photos-index-page-1-aid-42.html", start=1, end=1, resolve_links=False
+    )
+    assert len(entries) == 24
+    assert entries[0] == {"detail_link": "/view-1.html", "number": "1"}
+    assert detail_calls == []
 
 # 与真实 wnacg 列表页一致的结构：ul > li.gallary_item
 LIST_HTML = """
@@ -56,6 +115,26 @@ SEARCH_HTML = """
 
 
 class TestParseComics:
+    def test_search_highlight_tags_are_removed_from_title(self):
+        page = """<ul><li class="gallary_item">
+          <div class="pic_box cate-5"><a href="/photos-index-aid-7.html"
+          title="[&lt;em&gt;殿様&lt;/em&gt;&lt;em&gt;ペン&lt;/em&gt;&lt;em&gt;ギン&lt;/em&gt;] 作品★"></a></div>
+          <div class="info"><div class="meta">12張</div></div>
+        </li></ul>"""
+        assert parse_comics(page)[0]["title"] == "[殿様ペンギン] 作品★"
+
+    def test_collection_metadata_is_chapters_not_zero_images(self):
+        html = """<ul><li class="gallary_item">
+          <div class="pic_box cate-1"><a href="/photos-index-aid-390979.html"
+          title="合集作品"><img src="//img.wnacg.com/390979.jpg"></a></div>
+          <div class="info"><div class="title">合集作品</div>
+          <div class="meta"><span>2話</span>， 更新於2026-10-01</div></div>
+        </li></ul>"""
+        comic = parse_comics(html)[0]
+        assert comic["image_count"] == 0
+        assert comic["chapter_count"] == 2
+        assert comic["date"] == "2026-10-01"
+
     def test_parse_list_page(self):
         comics = parse_comics(LIST_HTML)
         assert len(comics) == 2
@@ -112,6 +191,36 @@ class TestPageUrl:
         assert _page_url("https://www.wnacg.com/albums.html", 0) == (
             "https://www.wnacg.com/albums.html"
         )
+
+
+class TestCategorySearch:
+    def test_selected_category_filters_search_results(self, monkeypatch):
+        import src.wnacg_crawler as crawler
+
+        categories = ("cate-37", "cate-1", "cate-9", "cate-38")
+        mixed_html = "<ul class='cc'>" + "".join(
+            f"<li class='li gallary_item'><div class='pic_box {category}'>"
+            f"<a href='/photos-index-aid-{i}.html' title='作品{i}'>"
+            f"<img src='//example.com/{i}.jpg'></a></div></li>"
+            for i, category in enumerate(categories, 1)
+        ) + "</ul>"
+        requested = []
+        monkeypatch.setattr(
+            crawler, "fetch_with_retry",
+            lambda url, headers: requested.append(url) or mixed_html,
+        )
+
+        assert [c["category"] for c in crawler.search_comics("测试", category="cate-37")] == [
+            "cate-37"
+        ]
+        assert [c["category"] for c in crawler.search_comics("测试", category="cate-5")] == [
+            "cate-37", "cate-1"
+        ]
+        assert [c["category"] for c in crawler.search_comics("测试", category="cate-19")] == [
+            "cate-38"
+        ]
+        assert [c["category"] for c in crawler.search_comics("测试")] == list(categories)
+        assert all("f=_all" in url for url in requested)
 
 
 class TestNormalizeImageUrl:

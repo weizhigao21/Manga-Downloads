@@ -136,8 +136,7 @@ def cache_progress(folder: Path, expected_total: int) -> tuple[int, int, int]:
     Args:
         folder: 作品目录。
         expected_total: 期望图片总数（通常来自 ComicItem.image_count）。
-            为 0 或未知时，百分比按「有图片即视为未知进度」处理：
-            有图返回 100（无法判断完整性，避免误报"部分缓存"），无图返回 0。
+            为 0 或未知时仅报告缓存数量，不误报 100%。
 
     Returns:
         (cached, total, percent)。cached 可能大于 total（站点计数与实际
@@ -146,7 +145,7 @@ def cache_progress(folder: Path, expected_total: int) -> tuple[int, int, int]:
     cached = count_local_images(folder) if folder else 0
     total = int(expected_total or 0)
     if total <= 0:
-        return cached, total, (100 if cached else 0)
+        return cached, total, 0
     if cached <= 0:
         return cached, total, 0
     percent = min(100, int(cached * 100 / total))
@@ -160,8 +159,9 @@ def find_local_dir(comic: dict, base_dir: Path | None = None) -> Path | None:
     并兼容历史/冲突命名（追加 ` (aid)`），逐个检查是否存在且含图片。
 
     Args:
-        comic: 作品数据字典，需含 title/detail_url，可选
-            category_label / translated_title。
+        comic: 作品数据字典，需含 title/detail_url，可选 category_label /
+            original_category_label / translated_title；原始分类标签用于兼容
+            繁简转换设置变更前创建的目录。
         base_dir: 下载根目录；None 时读取 Config.json 的 Download 配置。
 
     Returns:
@@ -178,12 +178,14 @@ def find_local_dir(comic: dict, base_dir: Path | None = None) -> Path | None:
     # 候选目录名：带标签 / 不带标签。**带 (aid) 后缀的优先**——同名冲突时
     # 它是下载侧追加的作品 ID 目录，通常内容更完整（后下载的全量版本）。
     # 若先命中不带后缀的目录，可能拿到一份更早下载的部分缓存。
-    candidates: list[str] = []
-    for use_label in (True, False):
-        name = _download_folder_name(comic, use_label)
-        if aid:
-            candidates.append(f"{name} ({aid})")
-        candidates.append(name)
+    names: list[str] = []
+    labels = dict.fromkeys(
+        (comic.get("category_label", ""), comic.get("original_category_label", ""))
+    )
+    for label in labels:
+        names.append(_download_folder_name({**comic, "category_label": label}, True))
+    names.append(_download_folder_name(comic, False))
+    candidates = ([f"{name} ({aid})" for name in names] if aid else []) + names
 
     seen: set[str] = set()
     for name in candidates:

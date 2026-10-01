@@ -142,10 +142,10 @@ class TestCacheProgress:
         folder = _make_folder(tmp_path, "comic", 12)
         assert cache_progress(folder, 10) == (12, 10, 100)
 
-    def test_unknown_total_with_images_is_100(self, tmp_path):
-        """总数未知（0）时，有图视为完整，避免误报"部分缓存"。"""
+    def test_unknown_total_reports_count_without_false_completion(self, tmp_path):
+        """总数未知时可显示缓存数量，但不能把部分缓存报成 100%。"""
         folder = _make_folder(tmp_path, "comic", 3)
-        assert cache_progress(folder, 0) == (3, 0, 100)
+        assert cache_progress(folder, 0) == (3, 0, 0)
 
 
 class TestFindLocalDir:
@@ -659,7 +659,7 @@ class TestReaderPageNumberMapping:
 
         calls: list[tuple[int, int]] = []
 
-        def _fake_parse(reading_url, start=1, end=None):
+        def _fake_parse(reading_url, start=1, end=None, resolve_links=True):
             calls.append((start, end))
             # 模拟站点：每个列表页固定 12 张
             base_no = (start - 1) * 12
@@ -687,6 +687,73 @@ class TestReaderPageNumberMapping:
         assert 2 in requested_pages
         assert 13 not in requested_pages
 
+    def test_short_last_list_page_keeps_twelve_page_boundary(self, tmp_path, monkeypatch):
+        """13 张分成 12+1 时，第 12 张仍在列表页 1，第 13 张在列表页 2。"""
+        session = self._session(tmp_path, "/photos-index-page-2-aid-390582.html")
+        session.comic["image_count"] = 13
+        calls = []
+
+        def _fake_parse(reading_url, start=1, end=None, resolve_links=True):
+            calls.append(start)
+            first = (start - 1) * 12 + 1
+            size = 12 if start == 1 else 1
+            return [
+                {"link": f"http://cdn/{no}.jpg", "number": str(no)}
+                for no in range(first, first + size)
+            ]
+
+        monkeypatch.setattr("ui.reader.page_provider.parse_picture_page", _fake_parse)
+        assert session._parse_page(12)[0]["number"] == "12"
+        assert session._parse_page(13)[0]["number"] == "13"
+        assert calls == [1, 2]
+
+    def test_page_twenty_five_when_reading_link_points_to_first_page(self, tmp_path, monkeypatch):
+        """73 张作品的阅读链接为 page-1 时，第 25 张仍应解析列表页 2。"""
+        session = self._session(tmp_path, "/photos-index-page-1-aid-390582.html")
+        session.comic["image_count"] = 73
+        calls = []
+
+        def _fake_parse(reading_url, start=1, end=None, resolve_links=True):
+            calls.append(start)
+            first = (start - 1) * 24 + 1
+            return [
+                {"link": f"http://cdn/{no}.jpg", "number": str(no)}
+                for no in range(first, first + 24)
+            ]
+
+        monkeypatch.setattr("ui.reader.page_provider.parse_picture_page", _fake_parse)
+        assert session._parse_page(25)[0]["number"] == "25"
+        assert calls == [1, 2]
+
+    def test_opening_first_image_resolves_only_its_detail_link(self, tmp_path, monkeypatch):
+        """第一页含 24 张时，打开阅读只解析当前一张的直链。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "/photos-index-page-1-aid-390582.html")
+        session.comic["image_count"] = 24
+        list_calls = []
+        detail_calls = []
+
+        def _fake_parse(url, start=1, end=None, resolve_links=True):
+            list_calls.append((start, resolve_links))
+            return [
+                {"detail_link": f"/view-{no}.html", "number": str(no)}
+                for no in range(1, 25)
+            ]
+
+        def _fake_detail(link):
+            detail_calls.append(link)
+            return "http://cdn" + link.replace("/view-", "/").replace(".html", ".jpg")
+
+        monkeypatch.setattr(pp, "parse_picture_page", _fake_parse)
+        monkeypatch.setattr(pp, "_fetch_picture_link", _fake_detail)
+        assert session._parse_page(1) == [{"link": "http://cdn/1.jpg", "number": "1"}]
+        assert list_calls == [(1, False)]
+        assert detail_calls == ["/view-1.html"]
+        assert session._parse_page(2)[0]["number"] == "2"
+        assert list_calls == [(1, False)]
+        assert detail_calls == ["/view-1.html", "/view-2.html"]
+
     def test_beyond_total_raises(self, tmp_path, monkeypatch):
         """超出作品总张数时给出明确错误，而不是静默空结果。"""
         from ui.reader.page_provider import PageFetchError
@@ -696,7 +763,7 @@ class TestReaderPageNumberMapping:
         )
         monkeypatch.setattr(
             "ui.reader.page_provider.parse_picture_page",
-            lambda url, start=1, end=None: [
+            lambda url, start=1, end=None, resolve_links=True: [
                 {"link": f"http://cdn/{i}.jpg", "number": str(i)}
                 for i in range(1, 13)
             ],
@@ -712,7 +779,7 @@ class TestReaderPageNumberMapping:
         )
         calls: list[int] = []
 
-        def _fake_parse(reading_url, start=1, end=None):
+        def _fake_parse(reading_url, start=1, end=None, resolve_links=True):
             calls.append(start)
             return [
                 {"link": f"http://cdn/{i}.jpg", "number": str(i)}
@@ -774,7 +841,7 @@ class TestLocalFastPath:
             fetch_calls.append(str(url))
             raise AssertionError(f"不应联网: {url}")
 
-        def _spy_parse(url, start=1, end=None):
+        def _spy_parse(url, start=1, end=None, resolve_links=True):
             parse_calls.append(start)
             raise AssertionError(f"不应解析: start={start}")
 
@@ -838,6 +905,31 @@ class TestLocalFastPath:
             session.fetch_page(10)
         assert attempted, "本地不全时应尝试联网"
 
+    def test_twelve_cached_pages_do_not_block_page_thirteen(self, tmp_path, monkeypatch):
+        """24 张作品前 12 张连续落盘后，第 13 张仍要走网络补拉。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, "跨页补拉", count=12, total=24)
+        assert session._local_is_complete() is False
+        monkeypatch.setattr(
+            session, "_reading_url", lambda: "/photos-index-page-2-aid-555.html"
+        )
+        calls = []
+
+        def _fake_parse(url, start=1, end=None, resolve_links=True):
+            calls.append(start)
+            first = (start - 1) * 12 + 1
+            return [
+                {"link": f"http://cdn/{no}.jpg", "number": str(no)}
+                for no in range(first, first + 12)
+            ]
+
+        monkeypatch.setattr(pp, "parse_picture_page", _fake_parse)
+        target = tmp_path / "13.jpg"
+        monkeypatch.setattr(session, "_download_one", lambda page_no, picture: target)
+        assert session.fetch_page(13) == target
+        assert calls == [1, 2]
+
     def test_no_dir_rescan_on_each_page(self, tmp_path, monkeypatch):
         """翻页不得触发目录重扫（scan_local_images 是最昂贵的操作）。
 
@@ -882,14 +974,8 @@ class TestLocalFastPath:
         session._refresh_local_files()
         assert scans["n"] == first, "目录未变化却重复扫描"
 
-    def test_inflated_image_count_still_local(self, tmp_path, monkeypatch):
-        """站点 image_count 虚高时（如声明 24 张、本地实际 13 张连续），
-        只要本地页码连续且数量过半，就必须判为完整、不走网络。
-
-        回归：站点计数常因重传/合并而不准，若仅按 local_count >= image_count
-        判断，会把一部已完整下载的作品误判为"缺失"，翻到超出范围时
-        平白发起一轮列表页解析 + 逐张直链抓取。
-        """
+    def test_partial_contiguous_cache_still_fetches_network(self, tmp_path, monkeypatch):
+        """连续缓存 13/24 张也不能推断作品已完整；第 14 张须联网。"""
         import ui.reader.page_provider as pp
 
         base = tmp_path / "Download"
@@ -902,34 +988,34 @@ class TestLocalFastPath:
         comic = {
             "title": "虚高计数作品",
             "detail_url": "/x-aid-666.html",
-            "image_count": 24,  # 站点虚高
+            "image_count": 24,
         }
         session = pp.ReaderSession(
             comic, base_dir=base, index=ReaderCacheIndex(tmp_path / "r.db")
         )
         session.ensure_ready()
         assert session.local_count == 13
-        assert session._local_is_complete() is True, "连续 13 张 + 过半，应判为完整"
+        assert session._local_is_complete() is False
 
         # 零网络验证
         network_calls = []
 
         def _spy_fetch(url, *a, **k):
             network_calls.append(str(url))
-            raise AssertionError(f"本地已完整，不应联网: {url}")
+            raise RuntimeError("模拟网络不可用")
 
         monkeypatch.setattr(pp, "fetch", _spy_fetch)
         # 所有本地页应零网络命中
         for p in range(1, 14):
             path = session.fetch_page(p)
             assert path is not None
-        # 超出本地范围的页直接报缺失，也不联网
+        # 第 14 张不存在本地时，必须尝试网络获取
         from ui.reader.page_provider import PageFetchError
 
         with pytest.raises(PageFetchError) as exc:
             session.fetch_page(14)
-        assert "本地缺失" in str(exc.value) or "已缓存完整" in str(exc.value)
-        assert network_calls == []
+        assert "阅读页" in str(exc.value)
+        assert network_calls
 
     def test_genuinely_incomplete_page_triggers_network(self, tmp_path, monkeypatch):
         """本地有真实缺页时（页码不连续），必须允许联网补拉。
@@ -985,7 +1071,7 @@ class TestLocalFastPath:
         monkeypatch.setattr(pp, "fetch", lambda url, *a, **k: "<html></html>")
         monkeypatch.setattr(
             pp, "parse_picture_page",
-            lambda url, start=1, end=None: [
+            lambda url, start=1, end=None, resolve_links=True: [
                 {"link": f"http://cdn/{i}.jpg", "number": str(i)}
                 for i in range(1, 13)
             ],
@@ -1012,25 +1098,27 @@ class TestLocalFastPath:
         monkeypatch.setattr(pp, "fetch", _spy_fetch)
         assert session._reading_url() == "/photos-index-page-2-aid-555.html"
 
-    def test_per_page_count_derived_without_probe(self, tmp_path, monkeypatch):
-        """已知总张数时，每页张数应由总数推导，不做探测请求。"""
+    def test_per_page_count_uses_first_list_page(self, tmp_path, monkeypatch):
+        """列表页容量取实际第一页，不能用总张数除列表页数推测。"""
         import ui.reader.page_provider as pp
 
         session = self._session(tmp_path, "推导页数", count=1, total=24)
 
         probe_calls = []
 
-        def _spy_parse(url, start=1, end=None):
+        def _spy_parse(url, start=1, end=None, resolve_links=True):
             probe_calls.append((start, end))
-            raise AssertionError("已知总数时不应探测列表页")
+            return [{"link": f"http://cdn/{i}.jpg", "number": str(i)} for i in range(1, 13)]
 
         monkeypatch.setattr(pp, "parse_picture_page", _spy_parse)
-        # 24 张 / 2 列表页 = 每页 12 张，无需联网
+        # 首个列表页的解析结果同时进入缓存，后续页不再重复请求它
         count = session._images_per_reading_page(
             "/photos-index-page-2-aid-555.html", 2
         )
         assert count == 12
-        assert probe_calls == []
+        assert probe_calls == [(1, 1)]
+        session._images_per_reading_page("/photos-index-page-2-aid-555.html", 2)
+        assert probe_calls == [(1, 1)]
 
     def test_list_page_entries_cached(self, tmp_path, monkeypatch):
         """同一列表页只解析一次（相邻页落在同页时复用）。"""
@@ -1040,7 +1128,7 @@ class TestLocalFastPath:
 
         parse_calls = []
 
-        def _fake_parse(url, start=1, end=None):
+        def _fake_parse(url, start=1, end=None, resolve_links=True):
             parse_calls.append(start)
             base_no = (start - 1) * 12
             return [
@@ -1056,6 +1144,315 @@ class TestLocalFastPath:
         session._parse_page(14)
         session._parse_page(15)
         assert parse_calls.count(2) == 1, f"列表页 2 被重复解析: {parse_calls}"
+
+
+class TestListPageConcurrentGuard:
+    """列表页解析的并发守卫：预解析线程与翻页线程同页并发只解析一次。
+
+    回归背景：用户日志中同一列表页 1 秒内被解析两次（21:02:08 / 21:02:09），
+    即「查缓存 → 网络请求 → 写缓存」是裸露的 check-then-act，双线程同页
+    并发时双 miss、双请求。
+    """
+
+    def _session(self, tmp_path):
+        from ui.reader.page_provider import ReaderSession
+
+        base = tmp_path / "Download"
+        base.mkdir(exist_ok=True)
+        session = ReaderSession(
+            {
+                "title": "并发作品",
+                "detail_url": "/photos-index-page-2-aid-390582.html",
+                "image_count": 24,
+            },
+            base_dir=base,
+            index=ReaderCacheIndex(tmp_path / "r.db"),
+        )
+        session.ensure_ready()
+        session._reading_url = lambda: "/photos-index-page-2-aid-390582.html"
+        return session
+
+    @staticmethod
+    def _fake_parse_factory(parse_calls):
+        import time
+
+        def _fake_parse(url, start=1, end=None, resolve_links=True):
+            parse_calls.append(start)
+            time.sleep(0.5)  # 放大 miss 窗口：无锁时两线程都会走进来
+            base_no = (start - 1) * 12
+            return [
+                {"link": f"http://cdn/{base_no + i + 1}.jpg", "number": str(base_no + i + 1)}
+                for i in range(12)
+            ]
+
+        return _fake_parse
+
+    def test_concurrent_same_list_page_parses_once(self, tmp_path, monkeypatch):
+        import threading
+
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path)
+        parse_calls: list[int] = []
+        monkeypatch.setattr(
+            pp, "parse_picture_page", self._fake_parse_factory(parse_calls)
+        )
+
+        barrier = threading.Barrier(3)  # 两工作线程 + 主线程同时放行
+        results: list[list[dict]] = []
+
+        def _worker():
+            barrier.wait()
+            results.append(session._list_page_entries("/photos-index-page-2-aid-390582.html", 2))
+
+        t1 = threading.Thread(target=_worker)
+        t2 = threading.Thread(target=_worker)
+        t1.start()
+        t2.start()
+        barrier.wait()
+        t1.join(10)
+        t2.join(10)
+
+        assert not t1.is_alive() and not t2.is_alive(), "并发用例线程未结束"
+        # 关键断言：同页并发只允许一次真实解析
+        assert parse_calls.count(2) == 1, f"列表页 2 被并发重复解析: {parse_calls}"
+        # 两线程拿到的结果一致（后到者用缓存）
+        assert len(results) == 2
+        assert [len(r) for r in results] == [12, 12]
+
+    def test_sequential_same_list_page_still_parses_once(self, tmp_path, monkeypatch):
+        """串行重复请求同页（翻页常态）依旧只解析一次——锁不破坏原缓存语义。"""
+        import time
+
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path)
+        parse_calls: list[int] = []
+
+        def _fake_parse(url, start=1, end=None, resolve_links=True):
+            parse_calls.append(start)
+            time.sleep(0.05)
+            base_no = (start - 1) * 12
+            return [
+                {"link": f"http://cdn/{base_no + i + 1}.jpg", "number": str(base_no + i + 1)}
+                for i in range(12)
+            ]
+
+        monkeypatch.setattr(pp, "parse_picture_page", _fake_parse)
+        session._list_page_entries("/r", 1)
+        session._list_page_entries("/r", 1)
+        assert parse_calls.count(1) == 1
+
+
+class TestPrefetchAllLinks:
+    """打开阅读器预解析全部直链：翻页只剩下载图片，不再逐页解析列表页。
+
+    回归背景：用户反馈在线阅读「每次下页就卡在解析上，动都动不了」——
+    旧流程翻到第 N 页才解析第 N 页所在列表页（单页约 14 秒）。
+    """
+
+    def _session(self, tmp_path, total: int = 24, count: int = 0, name: str = "预解析作品"):
+        from ui.reader.page_provider import ReaderSession
+
+        base = tmp_path / "Download"
+        if count:
+            _make_folder(base, name, count)
+        else:
+            base.mkdir(exist_ok=True)
+        session = ReaderSession(
+            {
+                "title": name,
+                "detail_url": "/photos-index-page-2-aid-390582.html",
+                "image_count": total,
+            },
+            base_dir=base,
+            index=ReaderCacheIndex(tmp_path / "r.db"),
+        )
+        session.ensure_ready()
+        session._reading_url = lambda: "/photos-index-page-2-aid-390582.html"
+        return session
+
+    @staticmethod
+    def _fake_parse(parse_calls):
+        def _parse(url, start=1, end=None, resolve_links=True):
+            parse_calls.append(start)
+            base_no = (start - 1) * 12
+            return [
+                {"link": f"http://cdn/{base_no + i + 1}.jpg", "number": str(base_no + i + 1)}
+                for i in range(12)
+            ]
+
+        return _parse
+
+    def test_prefetch_parses_all_list_pages_and_saves_index(self, tmp_path, monkeypatch):
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path)
+        parse_calls: list[int] = []
+        monkeypatch.setattr(pp, "parse_picture_page", self._fake_parse(parse_calls))
+
+        links = session.prefetch_all_links()
+
+        # 两个列表页各解析一次，24 张直链全部到手
+        assert sorted(parse_calls) == [1, 2]
+        assert len(links) == 24
+        assert links[13] == ("http://cdn/13.jpg", "13")
+        assert session._page_urls[24] == ("http://cdn/24.jpg", "24")
+        # 持久化：重开阅读器（新 session）可直接命中 SQLite 索引
+        assert len(session.index.load_page_urls("390582")) == 24
+
+    def test_prefetch_indexes_short_last_list_page(self, tmp_path, monkeypatch):
+        """13 张分为 12+1 时，预解析必须把尾页记为第 13 张。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, total=13)
+        calls = []
+
+        def _fake_parse(url, start=1, end=None, resolve_links=True):
+            calls.append(start)
+            first = (start - 1) * 12 + 1
+            size = 12 if start == 1 else 1
+            return [
+                {"link": f"http://cdn/{no}.jpg", "number": str(no)}
+                for no in range(first, first + size)
+            ]
+
+        monkeypatch.setattr(pp, "parse_picture_page", _fake_parse)
+        links = session.prefetch_all_links()
+        assert calls == [1, 2]
+        assert len(links) == 13
+        assert links[13] == ("http://cdn/13.jpg", "13")
+
+    def test_prefetch_continues_past_page_one_link(self, tmp_path, monkeypatch):
+        """详情页只提供 page-1 链接时，73 张作品仍需预解析 4 个列表页。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, total=73)
+        session._reading_url = lambda: "/photos-index-page-1-aid-390582.html"
+        calls = []
+
+        def _fake_parse(url, start=1, end=None, resolve_links=True):
+            calls.append(start)
+            first = (start - 1) * 24 + 1
+            size = 1 if start == 4 else 24
+            return [
+                {"link": f"http://cdn/{no}.jpg", "number": str(no)}
+                for no in range(first, first + size)
+            ]
+
+        monkeypatch.setattr(pp, "parse_picture_page", _fake_parse)
+        links = session.prefetch_all_links()
+        assert calls == [1, 2, 3, 4]
+        assert len(links) == 73
+        assert links[25] == ("http://cdn/25.jpg", "25")
+        assert links[73] == ("http://cdn/73.jpg", "73")
+
+    def test_prefetch_skips_when_local_complete(self, tmp_path, monkeypatch):
+        """本地已完整的作品：预解析完全不走网络。
+
+        断言口径是**最底层动作**（parse_picture_page 调用次数）而非返回值：
+        spy 里 raise 会被 _list_page_entries 包装成 PageFetchError 吞掉，
+        即使破坏后 prefetch 返回 {} 也照样有调用记录——只有计数能精准暴露。
+        """
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path, total=24, count=24)
+
+        parse_calls: list[int] = []
+
+        def _spy_parse(url, start=1, end=None, resolve_links=True):
+            parse_calls.append(start)
+            raise AssertionError(f"本地完整不应解析: start={start}")
+
+        monkeypatch.setattr(pp, "parse_picture_page", _spy_parse)
+        assert session.prefetch_all_links() == {}
+        assert parse_calls == [], f"本地完整仍发起了解析: {parse_calls}"
+
+    def test_prefetch_respects_cancel(self, tmp_path, monkeypatch):
+        """取消检查命中后立即中止：一个列表页都不解析。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path)
+
+        parse_calls: list[int] = []
+
+        def _spy_parse(url, start=1, end=None, resolve_links=True):
+            parse_calls.append(start)
+            raise AssertionError("取消后不应再解析")
+
+        monkeypatch.setattr(pp, "parse_picture_page", _spy_parse)
+        assert session.prefetch_all_links(cancel_check=lambda: True) == {}
+        assert parse_calls == [], f"取消后仍发起了解析: {parse_calls}"
+
+    def test_prefetch_skips_list_pages_already_indexed(self, tmp_path, monkeypatch):
+        """直链索引已覆盖全部列表页（如重开阅读器）时不重复请求。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path)
+        with session._lock:
+            for no in range(1, 25):
+                session._page_urls[no] = (f"http://cdn/{no}.jpg", str(no))
+
+        parse_calls: list[int] = []
+
+        def _spy_parse(url, start=1, end=None, resolve_links=True):
+            parse_calls.append(start)
+            raise AssertionError(f"已索引不应再解析: start={start}")
+
+        monkeypatch.setattr(pp, "parse_picture_page", _spy_parse)
+        assert session.prefetch_all_links() == {}
+        assert parse_calls == [], f"已索引仍发起了解析: {parse_calls}"
+
+    def test_prefetch_parses_only_missing_list_pages(self, tmp_path, monkeypatch):
+        """部分索引：先确认列表页容量，再补齐缺失直链。"""
+        import ui.reader.page_provider as pp
+
+        session = self._session(tmp_path)
+        with session._lock:
+            for no in range(1, 13):  # 列表页 1（第 1~12 张）已索引
+                session._page_urls[no] = (f"http://cdn/{no}.jpg", str(no))
+
+        parse_calls: list[int] = []
+        monkeypatch.setattr(pp, "parse_picture_page", self._fake_parse(parse_calls))
+
+        links = session.prefetch_all_links()
+        assert parse_calls == [1, 2]
+        assert len(links) == 12
+        assert links[24] == ("http://cdn/24.jpg", "24")
+        assert session._page_urls[13] == ("http://cdn/13.jpg", "13")
+
+
+class TestReaderStartupRequests:
+    """打开阅读器时只加载当前页，不扫描整部作品直链。"""
+
+    def test_even_with_prefetch_enabled_no_whole_album_link_scan(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        from ui.reader import reader_window as rw
+        from ui.reader.page_provider import ReaderSession
+        from ui.settings import AppSettings
+
+        monkeypatch.setattr(
+            AppSettings, "reader_prefetch_enabled", property(lambda self: True)
+        )
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        base = tmp_path / "Download"
+        base.mkdir()
+        comic = {
+            "title": "按需阅读作品",
+            "detail_url": "/photos-index-page-1-aid-88.html",
+            "image_count": 73,
+        }
+        session = ReaderSession(
+            comic, base_dir=base, index=ReaderCacheIndex(tmp_path / "reader.db")
+        )
+        calls = []
+        monkeypatch.setattr(
+            session, "prefetch_all_links", lambda cancel_check=None: calls.append(True)
+        )
+        window = rw.ReaderWindow(comic, session=session)
+        assert calls == []
+        window.close()
 
 
 class TestReaderWindow:
@@ -1091,6 +1488,121 @@ class TestReaderWindow:
         assert window._total == 12
         assert window._page == 1
         assert window.page_label.text() == "1 / 12"
+        window.close()
+
+    def test_back_button_closes_reader(self, qapp, tmp_path):
+        from ui.reader.reader_window import ReaderWindow
+
+        session, _ = self._session(tmp_path)
+        window = ReaderWindow(self._comic(), session=session)
+        closed = []
+        back = []
+        window.reader_closed.connect(lambda: closed.append(True))
+        window.back_requested.connect(lambda: back.append(True))
+        window.show()
+        window.back_btn.click()
+        assert back == [True]
+        assert closed == [True]
+        assert not window.isVisible()
+
+    def test_window_centers_at_screen_top_after_each_image_fit(
+        self, qapp, tmp_path
+    ):
+        from PySide6.QtGui import QPixmap
+
+        from ui.reader.reader_window import ReaderWindow
+
+        session, _ = self._session(tmp_path, count=1)
+        window = ReaderWindow(self._comic(1), session=session)
+        window.show()
+        qapp.processEvents()
+        available = window.screen().availableGeometry()
+
+        def assert_centered():
+            frame = window.frameGeometry()
+            assert frame.top() == available.top()
+            assert abs(frame.center().x() - available.center().x()) <= 1
+
+        assert_centered()
+        for width, height in ((600, 900), (1200, 600)):
+            # 模拟窗口先前停在屏幕左侧；新图片调整尺寸后应重新居中。
+            window.move(available.left(), available.top())
+            window._fit_window_to_image(QPixmap(width, height))
+            qapp.processEvents()
+            assert_centered()
+        window.close()
+
+    def test_close_notifies_list_after_worker_shutdown(self, qapp, tmp_path):
+        from ui.reader.reader_window import ReaderWindow
+
+        session, _ = self._session(tmp_path, count=1)
+        window = ReaderWindow(self._comic(1), session=session)
+        observed = []
+        window.reader_closed.connect(
+            lambda: observed.append(all(not w.isRunning() for w in window._active_workers))
+        )
+        window.close()
+        assert observed == [True]
+
+    def test_window_fits_each_image_without_wide_side_margins(self, qapp, tmp_path, monkeypatch):
+        """竖图收窄窗口，翻到横图时再放宽；尺寸始终留在屏幕内。"""
+        from PySide6.QtGui import QImage
+
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=2)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        comic = self._comic(2)
+        comic["title"] = "很长的漫画标题" * 15
+        window = rw.ReaderWindow(comic, session=session)
+        window.show()
+        _drain_events(qapp)
+
+        portrait = tmp_path / "portrait.jpg"
+        landscape = tmp_path / "landscape.jpg"
+        for path, width, height in ((portrait, 480, 1200), (landscape, 1200, 400)):
+            image = QImage(width, height, QImage.Format_RGB32)
+            image.fill(0x00FF00)
+            assert image.save(str(path))
+
+        window._on_page_loaded(window._load_seq, 1, portrait)
+        _drain_events(qapp)
+        portrait_width = window.width()
+        assert portrait_width < 500
+        assert window.height() <= window.screen().availableGeometry().height()
+        assert window.image_area.pixmap() is not None
+
+        window._page = 2
+        window._load_seq += 1
+        window._on_page_loaded(window._load_seq, 2, landscape)
+        _drain_events(qapp)
+        assert window.width() > portrait_width
+        assert window.width() <= window.screen().availableGeometry().width()
+        window.close()
+
+    def test_fullscreen_does_not_auto_shrink_on_page_load(self, qapp, tmp_path, monkeypatch):
+        """全屏阅读时翻页保持全屏，退出后恢复图片适配窗口。"""
+        from PySide6.QtGui import QImage, QPixmap
+
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=1)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        window = rw.ReaderWindow(self._comic(1), session=session)
+        window.show()
+        image = QImage(480, 1200, QImage.Format_RGB32)
+        image.fill(0x00FF00)
+        pixmap = QPixmap.fromImage(image)
+        window.showFullScreen()
+        _drain_events(qapp)
+        full_size = window.size()
+        window._fit_window_to_image(pixmap)
+        assert window.size() == full_size
+        window.image_area.set_source(pixmap)
+        window.toggle_fullscreen()
+        _drain_events(qapp)
+        assert not window.isFullScreen()
+        assert window.width() < full_size.width()
         window.close()
 
     def test_prev_disabled_at_first_page(self, qapp, tmp_path):
@@ -1151,11 +1663,13 @@ class TestReaderWindow:
         window.close()
 
     def test_nav_buttons_parent_is_bottom_bar(self, qapp, tmp_path):
-        """翻页按钮的父容器必须是底部工具条（top 只放标题与窗口操作）。
+        """翻页和图片播放按钮同在底部，顶部工具条已移除。
 
         用父容器归属判定，比坐标断言更稳：不依赖窗口尺寸、字体与平台
         差异，布局一旦回退到顶部会立即失败。
         """
+        from PySide6.QtWidgets import QFrame
+
         from ui.reader.reader_window import ReaderWindow
 
         session, _ = self._session(tmp_path, real_image=True)
@@ -1163,20 +1677,21 @@ class TestReaderWindow:
 
         def _frame_name(widget) -> str:
             parent = widget.parentWidget()
-            # 向上找到带 objectName 的 QFrame（top / bottom）
+            # 向上找到带 objectName 的 QFrame
             while parent is not None and not parent.objectName():
                 parent = parent.parentWidget()
             return parent.objectName() if parent is not None else ""
 
         assert _frame_name(window.prev_btn) == "readerBottom"
         assert _frame_name(window.next_btn) == "readerBottom"
-        assert _frame_name(window.title_label) == "readerTop"
+        assert _frame_name(window.play_btn) == "readerBottom"
+        assert window.findChild(QFrame, "readerTop") is None
         window.close()
 
     def test_nav_buttons_both_at_bottom(self, qapp, tmp_path):
         """翻页按钮必须都在图片区下方（用户要求，别改回上下夹图）。
 
-        顶部只保留标题与窗口操作；上一页/下一页同处底部工具条。
+        上一页、图片播放、下一页同处底部工具条。
         """
         from ui.reader.reader_window import ReaderWindow
 
@@ -1194,14 +1709,65 @@ class TestReaderWindow:
         next_y = window.next_btn.mapTo(
             window, window.next_btn.rect().topLeft()
         ).y()
+        play_y = window.play_btn.mapTo(
+            window, window.play_btn.rect().topLeft()
+        ).y()
 
         assert prev_y > area_bottom, "「上一页」必须在图片下方"
         assert next_y > area_bottom, "「下一页」必须在图片下方"
+        assert play_y > area_bottom, "「图片播放」必须在图片下方"
         assert abs(prev_y - next_y) <= 4, "两个翻页按钮应在同一行"
+        assert abs(prev_y - play_y) <= 4, "图片播放按钮应与翻页按钮同一行"
+        window.close()
+
+    def test_slideshow_waits_for_loaded_image_and_stops_at_end(self, qapp, tmp_path, monkeypatch):
+        """每张图显示完再计时；翻到末页后自动停止。"""
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=3, real_image=True)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        monkeypatch.setattr(rw.QInputDialog, "getInt", lambda *args: (2, True))
+        window = rw.ReaderWindow(self._comic(3), session=session)
+        window.play_btn.click()
+        assert window._slideshow_playing
+        assert not window._slideshow_timer.isActive()
+
+        pages = session.local_pages()
+        window._on_page_loaded(window._load_seq, 1, pages[0])
+        assert window._slideshow_timer.isActive()
+        assert window._slideshow_timer.interval() == 2000
+        window._advance_slideshow()
+        assert window._page == 2
+        assert not window._slideshow_timer.isActive()
+
+        window._on_page_loaded(window._load_seq, 2, pages[1])
+        assert window._slideshow_timer.isActive()
+        window.go_last()
+        window._on_page_loaded(window._load_seq, 3, pages[2])
+        assert not window._slideshow_playing
+        assert not window._slideshow_timer.isActive()
+        assert window.play_btn.text() == "▶ 图片播放"
+        window.close()
+
+    def test_slideshow_cancel_and_load_failure(self, qapp, tmp_path, monkeypatch):
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=2, real_image=True)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        window = rw.ReaderWindow(self._comic(2), session=session)
+        monkeypatch.setattr(rw.QInputDialog, "getInt", lambda *args: (5, False))
+        window.play_btn.click()
+        assert not window._slideshow_playing
+
+        monkeypatch.setattr(rw.QInputDialog, "getInt", lambda *args: (5, True))
+        window.play_btn.click()
+        window._on_page_failed(window._load_seq, 1, "测试错误")
+        assert not window._slideshow_playing
+        assert not window._slideshow_timer.isActive()
         window.close()
 
     def test_top_bar_has_no_nav_buttons(self, qapp, tmp_path):
-        """顶部工具条不得再出现翻页按钮（防止布局回退）。"""
+        """图片区上方没有自绘工具条或翻页按钮。"""
         from ui.reader.reader_window import ReaderWindow
 
         session, _ = self._session(tmp_path, real_image=True)
@@ -1309,7 +1875,14 @@ class TestReaderWindow:
         window.close()
 
     def _emit_loaded(self, window, page_no, path):
-        """模拟当前请求的加载完成回调（seq/page 与窗口状态保持一致）。"""
+        """模拟当前请求的加载完成回调，只验证预取调度。"""
+        # 首页加载线程可能仍在读盘；先等它结束，避免测试手动回调与真实
+        # 工作线程并发操作同一个未显示的 Qt 窗口。
+        worker = window._load_worker
+        if worker is not None and worker.isRunning():
+            assert worker.wait(5000)
+        # 尺寸适配有独立测试；这些隐藏窗口无需访问 Qt 屏幕句柄。
+        window._fit_window_to_image = lambda pixmap: None
         window._page = page_no
         window._on_page_loaded(window._load_seq, page_no, path)
 
@@ -1552,12 +2125,13 @@ class TestCacheProgressRing:
         ring.set_progress(-5)
         assert ring.percent == 0
 
-    def test_zero_percent_hidden(self, qapp):
+    def test_zero_percent_shown_when_total_is_known(self, qapp):
         from ui.widgets.cache_ring import CacheProgressRing
 
         ring = CacheProgressRing()
         ring.set_progress(0, 0, 10)
-        assert ring.isVisible() is False
+        assert ring.isVisible() is True
+        assert "0%" in ring.toolTip()
 
     def test_nonzero_percent_visible(self, qapp):
         from ui.widgets.cache_ring import CacheProgressRing
@@ -1660,6 +2234,43 @@ class TestComicCardReaderEntry:
         card.set_cache_progress(50, 5, 10)
         assert card.cache_ring.percent == 50
 
+    def test_progress_ring_sits_beside_downloaded_badge(self, qapp):
+        from ui.models import ComicItem
+        from ui.widgets.comic_card import ComicCard
+
+        comic = ComicItem(
+            title="进度作品",
+            image_count=10,
+            upload_date="2026-10-01",
+            detail_url="/photos-index-page-1-aid-500.html",
+            category_label="單行本",
+        )
+        card = ComicCard(comic, downloaded=True)
+        card.set_cache_progress(100, 10, 10)
+        card.show()
+        qapp.processEvents()
+        assert card.cache_ring.parentWidget() is card.cover_container
+        assert card.cache_ring.x() >= card.downloaded_badge.geometry().right()
+        assert card.cache_ring.width() == card.downloaded_badge.height()
+        assert card.cache_ring.height() == card.downloaded_badge.height()
+        assert card.cache_ring.y() == card.downloaded_badge.y()
+        assert card.cache_ring.isVisible()
+        assert "100%" in card.cache_ring.toolTip()
+        card.close()
+
+    def test_progress_ring_requires_downloaded_badge(self, qapp):
+        card = self._card(qapp)
+        card.downloaded_badge.hide()
+        card.set_cache_progress(50, 5, 10)
+        card.show()
+        qapp.processEvents()
+        assert not card.cache_ring.isVisible()
+
+        card.downloaded_badge.show()
+        card._position_cover_badges()
+        assert card.cache_ring.isVisible()
+        card.close()
+
     def test_context_menu_contains_read_action(self, qapp):
         card = self._card(qapp)
         menu = card._build_context_menu()
@@ -1678,6 +2289,38 @@ class TestComicCardReaderEntry:
 
 class TestGridCacheProgress:
     """网格批量预计算缓存进度并下发给卡片。"""
+
+    def test_render_finds_download_folder_with_display_category(self, qapp, tmp_path, monkeypatch):
+        from ui.models import ComicItem
+        from ui.widgets.comics_grid import ComicsGrid
+
+        base = tmp_path / "Download"
+        _make_folder(base, "[单行本] 作品甲", 5)
+        monkeypatch.setattr(
+            "src.config.ProjectConfig.download_dir",
+            property(lambda self: str(base)),
+        )
+        comic = ComicItem(
+            title="作品甲",
+            image_count=10,
+            upload_date="2026-09-30",
+            detail_url="/photos-index-page-1-aid-10.html",
+            category_label="單行本",
+        )
+        monkeypatch.setattr(
+            comic._settings, "convert",
+            lambda text: "单行本" if text == "單行本" else text,
+        )
+
+        grid = ComicsGrid()
+        grid.render([comic])
+        card = grid._cards[0]
+        grid.show()
+        qapp.processEvents()
+        assert card.cache_ring.percent == 50
+        assert card.cache_ring.isVisible()
+        assert "5 / 10" in card.cache_ring.toolTip()
+        grid.close()
 
     def test_render_sets_ring_from_local_dir(self, qapp, tmp_path, monkeypatch):
         from ui.models import ComicItem
@@ -1706,3 +2349,50 @@ class TestGridCacheProgress:
         ]
         grid.render(comics)
         assert grid._cards[0].cache_ring.percent == 50
+        assert not grid._cards[0].downloaded_badge.isHidden()
+        grid.update_cache_progress(comics[0].detail_url, 10, 10)
+        assert grid._cards[0].cache_ring.percent == 100
+        assert "10 / 10" in grid._cards[0].cache_ring.toolTip()
+
+    def test_reader_progress_and_close_refresh_downloaded_badge(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        from ui.models import ComicItem
+        from ui.widgets.comics_grid import ComicsGrid
+
+        base = tmp_path / "Download"
+        base.mkdir()
+        monkeypatch.setattr(
+            "src.config.ProjectConfig.download_dir",
+            property(lambda self: str(base)),
+        )
+        monkeypatch.setattr(
+            "ui.database.is_comics_downloaded",
+            lambda items: {item[0]: False for item in items},
+        )
+        comic = ComicItem(
+            title="窗口测试作品",
+            image_count=3,
+            upload_date="2026-10-01",
+            detail_url="/photos-index-page-1-aid-77.html",
+            category_label="單行本",
+        )
+        grid = ComicsGrid()
+        grid.render([comic])
+        grid.show()
+        qapp.processEvents()
+        card = grid._cards[0]
+        assert card.downloaded_badge.isHidden()
+
+        # 阅读过程中一张图片落盘，角标应立即出现。
+        grid.update_cache_progress(comic.detail_url, 1, 3)
+        assert not card.downloaded_badge.isHidden()
+        assert card.cache_ring.percent == 33
+
+        # 窗口关闭时重新核对实际文件，补上最后完成的缓存数量。
+        _make_folder(base, "[單行本] 窗口测试作品", 3)
+        grid.refresh_comic_status(comic.detail_url)
+        assert not card.downloaded_badge.isHidden()
+        assert card.cache_ring.percent == 100
+        assert "3 / 3" in card.cache_ring.toolTip()
+        grid.close()

@@ -14,12 +14,14 @@ class ComicsGrid(QScrollArea):
     """漫画卡片网格视图。"""
 
     # 每列最小宽度（px），窗口变宽时列数自动增加
-    MIN_COLUMN_WIDTH = 340
+    MIN_COLUMN_WIDTH = ComicCard.CARD_WIDTH + 20
 
     # 卡片右键「查看类似作品」转发到主窗口
     similar_requested = Signal(object)
     # 卡片「阅读」转发到主窗口（打开阅读器窗口）
     read_requested = Signal(object)
+    favorite_changed = Signal(object, bool)
+    author_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -69,11 +71,15 @@ class ComicsGrid(QScrollArea):
                 {
                     "title": comic.title,
                     "detail_url": comic.detail_url,
-                    "category_label": comic.category_label,
+                    "category_label": comic.display_category_label,
+                    "original_category_label": comic.category_label,
                     "translated_title": comic.translated_title,
                 }
             )
-            cache_map[comic.detail_url] = cache_progress(folder, comic.image_count)
+            progress = cache_progress(folder, comic.image_count)
+            cache_map[comic.detail_url] = progress
+            if progress[0] > 0:
+                downloaded_map[comic.detail_url] = True
 
         # 按 detail_url diff：复用相同作品卡片，仅重建新增与移除的
         old = {c.comic.detail_url: c for c in self._cards}
@@ -81,10 +87,15 @@ class ComicsGrid(QScrollArea):
         for comic in comics:
             card = old.pop(comic.detail_url, None)
             if card is None:
-                card = ComicCard(comic, downloaded=downloaded_map.get(comic.detail_url))
+                card = ComicCard(
+                    comic, parent=self._content,
+                    downloaded=downloaded_map.get(comic.detail_url),
+                )
                 # 转发右键「查看类似」与「阅读」信号（仅新建卡片连接）
                 card.similar_requested.connect(self.similar_requested)
                 card.read_requested.connect(self.read_requested)
+                card.favorite_changed.connect(self.favorite_changed)
+                card.author_requested.connect(self.author_requested)
             else:
                 card.update_comic(
                     comic, downloaded=downloaded_map.get(comic.detail_url)
@@ -110,11 +121,65 @@ class ComicsGrid(QScrollArea):
 
         self._reflow()
 
+    def update_cache_progress(self, detail_url: str, cached: int, total: int):
+        """阅读器缓存新图片时更新对应卡片的角标与进度环。"""
+        percent = min(100, int(cached * 100 / total)) if total > 0 else 0
+        for card in self._cards:
+            if card.comic.detail_url == detail_url:
+                if cached > 0:
+                    card.set_downloaded_state(True)
+                card.set_cache_progress(percent, cached, total)
+                break
+
+    def refresh_comic_status(self, detail_url: str):
+        """阅读窗口关闭后，重新核对该作品的本地图片与下载标记。"""
+        for card in self._cards:
+            comic = card.comic
+            if comic.detail_url != detail_url:
+                continue
+
+            from ui.database import is_comics_downloaded
+            from ui.reader.cache_index import cache_progress, find_local_dir
+
+            folder = find_local_dir(
+                {
+                    "title": comic.title,
+                    "detail_url": comic.detail_url,
+                    "category_label": comic.display_category_label,
+                    "original_category_label": comic.category_label,
+                    "translated_title": comic.translated_title,
+                }
+            )
+            cached, total, percent = cache_progress(folder, comic.image_count)
+            downloaded = is_comics_downloaded(
+                [(
+                    comic.detail_url, comic.title,
+                    comic.translated_title, comic.display_category_label,
+                )]
+            ).get(detail_url, False)
+            card.set_downloaded_state(downloaded or cached > 0)
+            card.set_cache_progress(percent, cached, total)
+            break
+
     def reflow(self):
         """窗口大小变化后按需重排：列数未变时不重建任何控件。"""
         if not self._cards:
             return
         self._reflow()
+
+    def width_for_columns(self, columns: int) -> int:
+        """容纳指定列数所需的滚动区宽度，预留垂直滚动条。"""
+        columns = max(1, int(columns))
+        margins = self._grid.contentsMargins()
+        spacing = self._grid.horizontalSpacing()
+        return (
+            columns * ComicCard.CARD_WIDTH
+            + (columns - 1) * spacing
+            + margins.left()
+            + margins.right()
+            + 2 * self.frameWidth()
+            + self.verticalScrollBar().sizeHint().width()
+        )
 
     def apply_similar_map(self, similar_map: dict[str, list]):
         """后台相似扫描完成后批量更新卡片左下角 ≈N 角标（不重建卡片）。
@@ -137,8 +202,10 @@ class ComicsGrid(QScrollArea):
         列数变化时仅移动卡片在网格中的位置（不重建控件、不重载封面、
         不查数据库），避免窗口缩放时反复销毁/重建大量卡片导致卡顿。
         """
-        width = max(self.viewport().width(), self.MIN_COLUMN_WIDTH)
-        columns = max(1, width // self.MIN_COLUMN_WIDTH)
+        margins = self._grid.contentsMargins()
+        spacing = self._grid.horizontalSpacing()
+        usable = self.viewport().width() - margins.left() - margins.right()
+        columns = max(1, (usable + spacing) // (ComicCard.CARD_WIDTH + spacing))
         if columns == self._columns:
             return
         self._columns = columns

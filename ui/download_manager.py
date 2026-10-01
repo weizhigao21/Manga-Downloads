@@ -130,6 +130,9 @@ class DownloadManager(QObject):
         super().__init__()
         self.tasks: list[DownloadTask] = self._load_tasks()
         self._workers: dict[DownloadTask, DownloadWorker] = {}
+        # 重试可能发生在旧线程发出 done 之后、原生 finished 之前。
+        # 旧线程移出 _workers 后仍须持有，直到它真正退出。
+        self._retired_workers: set[DownloadWorker] = set()
         # 进度更新时持久化节流（避免高频磁盘写入卡顿 UI）
         self._last_save = 0.0
 
@@ -263,8 +266,9 @@ class DownloadManager(QObject):
             task.comic = {"title": task.title, "detail_url": task.detail_url}
         if not task.comic.get("detail_url"):
             return None
-        # 清理可能残留的旧线程关联
-        self._workers.pop(task, None)
+        old_worker = self._workers.pop(task, None)
+        if old_worker is not None:
+            self._retired_workers.add(old_worker)
         # 补全最新翻译名（覆盖旧快照/持久化时尚未翻译的情况）
         task.comic = self._fill_translation(task.comic)
         task.status = DownloadTask.WAITING
@@ -283,12 +287,14 @@ class DownloadManager(QObject):
         重新自查并回到未下载状态。
         """
         worker = self._workers.pop(task, None)
-        if worker is not None and worker.isRunning():
-            worker.requestInterruption()
-            worker.wait(1500)
+        if worker is not None:
+            self._retired_workers.add(worker)
             if worker.isRunning():
-                worker.terminate()
-                worker.wait(500)
+                worker.requestInterruption()
+                worker.wait(1500)
+                if worker.isRunning():
+                    worker.terminate()
+                    worker.wait(500)
         if task in self.tasks:
             self.tasks.remove(task)
         self._save_tasks()
@@ -310,12 +316,18 @@ class DownloadManager(QObject):
         #    running" 崩溃闪退；实测多任务下载 + 翻译时高频复现）；
         # 2) deleteLater 销毁 C++ 对象。
         # 注意：业务信号 done 在 run() 返回前 emit，不能把清理挂在它上面。
-        worker.finished.connect(lambda: self._workers.pop(task, None))
+        worker.finished.connect(lambda w=worker, t=task: self._clear_worker(t, w))
         worker.finished.connect(worker.deleteLater)
         self.task_changed.emit(task)
         self.task_updated.emit()
         self._save_tasks()
         worker.start()
+
+    def _clear_worker(self, task: DownloadTask, worker: DownloadWorker):
+        """只清理本次线程，避免旧线程结束时移除重试启动的新线程。"""
+        if self._workers.get(task) is worker:
+            self._workers.pop(task, None)
+        self._retired_workers.discard(worker)
 
     def _on_progress(self, task: DownloadTask, current: int, total: int):
         # 终态保护：任务已完成/失败后，迟到的工作线程进度信号（如 7z 解压
@@ -379,7 +391,7 @@ class DownloadManager(QObject):
         实际收尾等待由应用退出流程（aboutToQuit → shutdown）统一完成，
         避免关闭窗口时同步阻塞等待。
         """
-        for worker in self._workers.values():
+        for worker in set(self._workers.values()) | self._retired_workers:
             if worker.isRunning():
                 worker.requestInterruption()
 
@@ -391,7 +403,10 @@ class DownloadManager(QObject):
         限时等待后仍未结束的线程强制终止，保证退出不卡顿。
         重复调用安全：已结束的线程 wait 立即返回。
         """
-        workers = [w for w in self._workers.values() if w.isRunning()]
+        workers = [
+            w for w in set(self._workers.values()) | self._retired_workers
+            if w.isRunning()
+        ]
         if not workers:
             return
         logging.getLogger(__name__).info(

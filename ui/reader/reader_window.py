@@ -2,7 +2,7 @@
 
 设计要点：
 - **独立非模态窗口**，可同时打开多部作品对比翻阅；
-- 顶部工具条 + 中央图片区 + 底部状态条三层结构；
+- 中央图片区 + 底部翻页与播放控制条；
 - 图片**优先读本地缓存**（ReaderSession 本地优先），未命中才联网补拉；
 - **纯按需加载**：只在用户点「下一页/上一页」时获取该页，不主动预取
   （如需更顺滑的翻页，可在设置里显式开启"后台预取相邻页"）；
@@ -16,11 +16,12 @@
 import logging
 import time
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QPushButton,
     QSizePolicy,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 from ui.reader.page_provider import ReaderSession
 from ui.reader.prefetch_worker import PageLoadWorker, PrefetchWorker
 from ui.styles import PALETTE
+from ui.threads import register
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,8 @@ class ReaderWindow(QWidget):
 
     # 缓存进度变化（缓存张数, 期望总数），供卡片进度圈等外部订阅
     cache_progress_changed = Signal(int, int)
+    reader_closed = Signal()
+    back_requested = Signal()
 
     def __init__(self, comic: dict, parent=None, session: ReaderSession | None = None):
         super().__init__(parent)
@@ -92,14 +96,24 @@ class ReaderWindow(QWidget):
         self._total = 0
         self._load_worker: PageLoadWorker | None = None
         self._prefetch_worker: PrefetchWorker | None = None
+        # 快速翻页时旧加载线程可能仍在收尾；保留它们直到 finished，
+        # 防止引用被新线程覆盖后 QThread 在运行中析构。
+        self._active_workers: list = []
         self._loaded_page: int | None = None
+        self._loaded_seq = -1
         # 加载请求序号：每次发起加载自增，回调据此丢弃过期结果
         self._load_seq = 0
+        self._slideshow_seconds = 5
+        self._slideshow_playing = False
+        self._slideshow_timer = QTimer(self)
+        self._slideshow_timer.setSingleShot(True)
+        self._slideshow_timer.timeout.connect(self._advance_slideshow)
+        self._initial_top_placed = False
 
         title = self.comic.get("translated_title") or self.comic.get("title") or "阅读"
         self.setWindowTitle(f"阅读 - {title}")
-        self.setMinimumSize(720, 540)
-        self.resize(1080, 800)
+        self.setMinimumSize(330, 220)
+        self.resize(640, 720)
         self.setStyleSheet(_READER_QSS)
 
         self._build_ui()
@@ -113,80 +127,73 @@ class ReaderWindow(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 顶部工具条：仅标题与窗口操作，翻页统一放到底部
-        top = QFrame()
-        top.setObjectName("readerTop")
-        top_layout = QHBoxLayout(top)
-        top_layout.setContentsMargins(16, 10, 16, 10)
-        top_layout.setSpacing(12)
-
-        self.title_label = QLabel(self.windowTitle().removeprefix("阅读 - "))
-        self.title_label.setObjectName("readerTitle")
-        self.title_label.setAlignment(Qt.AlignCenter)
-        top_layout.addWidget(self.title_label, stretch=1)
-
-        self.fit_btn = QPushButton("全屏")
-        self.fit_btn.setObjectName("readerToolButton")
-        self.fit_btn.setCursor(Qt.PointingHandCursor)
-        self.fit_btn.setFocusPolicy(Qt.NoFocus)
-        self.fit_btn.setToolTip("全屏切换（F）")
-        self.fit_btn.clicked.connect(self.toggle_fullscreen)
-        top_layout.addWidget(self.fit_btn)
-
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("readerCloseButton")
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setFocusPolicy(Qt.NoFocus)
-        close_btn.setToolTip("关闭（Esc）")
-        close_btn.clicked.connect(self.close)
-        top_layout.addWidget(close_btn)
-
-        root.addWidget(top)
-
         # 中央图片区
         self.image_area = _ImageArea()
         self.image_area.clicked_left.connect(self.go_prev)
         self.image_area.clicked_right.connect(self.go_next)
         root.addWidget(self.image_area, stretch=1)
 
-        # 底部工具条：上一页 | 状态/缓存/页码 | 下一页
+        # 底部工具条分两行，避免状态文字把竖图窗口撑得过宽
         bottom = QFrame()
         bottom.setObjectName("readerBottom")
-        bottom_layout = QHBoxLayout(bottom)
-        bottom_layout.setContentsMargins(16, 10, 16, 10)
-        bottom_layout.setSpacing(12)
+        bottom_layout = QVBoxLayout(bottom)
+        bottom_layout.setContentsMargins(12, 6, 12, 6)
+        bottom_layout.setSpacing(2)
+        info_layout = QHBoxLayout()
+        info_layout.setSpacing(8)
+        nav_layout = QHBoxLayout()
+        nav_layout.setSpacing(8)
+
+        self.back_btn = QPushButton("← 返回列表")
+        self.back_btn.setObjectName("readerNavButton")
+        self.back_btn.setCursor(Qt.PointingHandCursor)
+        self.back_btn.setFocusPolicy(Qt.NoFocus)
+        self.back_btn.clicked.connect(self._on_back_requested)
+        info_layout.addWidget(self.back_btn)
 
         self.prev_btn = QPushButton("‹ 上一页")
         self.prev_btn.setObjectName("readerNavButton")
         self.prev_btn.setCursor(Qt.PointingHandCursor)
         self.prev_btn.setFocusPolicy(Qt.NoFocus)
-        self.prev_btn.setMinimumWidth(96)
+        self.prev_btn.setMinimumWidth(82)
         self.prev_btn.clicked.connect(self.go_prev)
-        bottom_layout.addWidget(self.prev_btn)
+        nav_layout.addWidget(self.prev_btn)
 
         self.status_label = QLabel("准备中…")
         self.status_label.setObjectName("readerStatus")
-        bottom_layout.addStretch()
+        info_layout.addWidget(self.status_label)
+        info_layout.addStretch()
 
         self.cache_label = QLabel("")
         self.cache_label.setObjectName("readerCache")
-        bottom_layout.addWidget(self.cache_label)
 
         self.page_label = QLabel("1 / ?")
         self.page_label.setObjectName("readerPage")
         self.page_label.setAlignment(Qt.AlignCenter)
-        bottom_layout.addWidget(self.page_label)
+        info_layout.addWidget(self.page_label)
+        info_layout.addStretch()
+        info_layout.addWidget(self.cache_label)
 
-        bottom_layout.addWidget(self.status_label)
-        bottom_layout.addStretch()
+        self.play_btn = QPushButton("▶ 图片播放")
+        self.play_btn.setObjectName("readerPlayButton")
+        self.play_btn.setCursor(Qt.PointingHandCursor)
+        self.play_btn.setFocusPolicy(Qt.NoFocus)
+        self.play_btn.setFixedWidth(100)
+        self.play_btn.clicked.connect(self.toggle_slideshow)
+        nav_layout.addStretch()
+        nav_layout.addWidget(self.play_btn)
+        nav_layout.addStretch()
 
         self.next_btn = QPushButton("下一页 ›")
         self.next_btn.setObjectName("readerNavButton")
         self.next_btn.setCursor(Qt.PointingHandCursor)
         self.next_btn.setFocusPolicy(Qt.NoFocus)
-        self.next_btn.setMinimumWidth(96)
+        self.next_btn.setMinimumWidth(82)
         self.next_btn.clicked.connect(self.go_next)
-        bottom_layout.addWidget(self.next_btn)
+        nav_layout.addWidget(self.next_btn)
+
+        bottom_layout.addLayout(info_layout)
+        bottom_layout.addLayout(nav_layout)
 
         root.addWidget(bottom)
 
@@ -210,6 +217,10 @@ class ReaderWindow(QWidget):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.activated.connect(handler)
             self._shortcuts.append(shortcut)
+
+    def _on_back_requested(self):
+        self.back_requested.emit()
+        self.close()
 
     # ---- 启动流程 ----
 
@@ -243,6 +254,7 @@ class ReaderWindow(QWidget):
 
     def load_page(self, page_no: int):
         """加载指定页：本地命中的同步路径由工作线程统一处理。"""
+        self._slideshow_timer.stop()
         page_no = max(1, min(int(page_no), self._total))
         self._page = page_no
         self._update_page_ui()
@@ -276,6 +288,7 @@ class ReaderWindow(QWidget):
         self.status_label.setText(f"加载第 {page_no} 页…")
         worker = PageLoadWorker(self.session, page_no, seq=seq, parent=None)
         self._load_worker = worker
+        self._active_workers.append(worker)
         worker.loaded.connect(self._on_page_loaded)
         worker.failed.connect(self._on_page_failed)
         # 清理：先清引用（避免界面后续访问已销毁的 C++ 对象），
@@ -284,12 +297,15 @@ class ReaderWindow(QWidget):
         # "QThread: Destroyed while thread is still running" 崩溃。
         worker.finished.connect(lambda w=worker: self._clear_worker("_load_worker", w))
         worker.finished.connect(worker.deleteLater)
+        register(worker)
         worker.start()
 
     def _clear_worker(self, attr: str, worker):
         """线程结束后清空引用（仅当仍是当前 worker 时，避免误清新线程）。"""
         if getattr(self, attr, None) is worker:
             setattr(self, attr, None)
+        if worker in self._active_workers:
+            self._active_workers.remove(worker)
 
     def _is_stale(self, seq: int, page_no: int) -> bool:
         """该结果是否已过期（用户已翻到别的页 / 又发起了更新请求）。"""
@@ -302,17 +318,81 @@ class ReaderWindow(QWidget):
             logger.debug("丢弃过期加载结果: seq=%s page=%s", seq, page_no)
             return
         self._loaded_page = page_no
+        self._loaded_seq = seq
         pixmap = QPixmap(str(path))
         if pixmap.isNull():
             self._on_page_failed(seq, page_no, "图片无法解码")
             return
-        self.image_area.set_source(pixmap)
-        self.status_label.setText(f"第 {page_no} 页")
+        # 图片与窗口尺寸一起提交，避免先在旧尺寸绘制新图、随后又缩放和
+        # 移动顶层窗口。快速翻页时这些中间帧会表现为短暂的白色小窗闪动。
+        self.setUpdatesEnabled(False)
+        try:
+            self._fit_window_to_image(pixmap)
+            self.image_area.set_source(pixmap)
+            self.status_label.setText(f"第 {page_no} 页")
+        finally:
+            self.setUpdatesEnabled(True)
+        self.update()
         self._update_cache_label()
+        self.cache_progress_changed.emit(self.session.local_count, self._total)
         self._save_progress()
         # 默认不做任何预取：只有用户真正翻页时才去取那一页。
         # 若用户在设置里显式开启了预取，才在页显示完成后补拉相邻窗口。
         self._maybe_prefetch(page_no)
+        if self._slideshow_playing:
+            if page_no >= self._total:
+                self._stop_slideshow()
+            else:
+                self._slideshow_timer.start(self._slideshow_seconds * 1000)
+
+    def _fit_window_to_image(self, pixmap: QPixmap):
+        """按图片比例收紧普通窗口，保留底部控制条并限制在屏幕内。"""
+        if pixmap.isNull() or self.isFullScreen() or self.isMaximized():
+            return
+        # 未显示的窗口尚未绑定稳定的屏幕；此时直接用主屏幕，避免
+        # 离屏/快速打开关闭场景访问无效的 Qt window handle。
+        screen = (self.screen() if self.isVisible() else None) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        frame_width = max(0, self.frameGeometry().width() - self.width())
+        frame_height = max(32, self.frameGeometry().height() - self.height())
+        max_width = max(1, available.width() - frame_width - 24)
+        max_height = max(1, available.height() - frame_height - 24)
+        layout = self.layout()
+        toolbar_height = layout.itemAt(1).widget().sizeHint().height()
+        padding = 16
+        image_width = pixmap.width() / pixmap.devicePixelRatioF()
+        image_height = pixmap.height() / pixmap.devicePixelRatioF()
+        scale = min(
+            1.0,
+            max(1, max_width - padding) / image_width,
+            max(1, max_height - toolbar_height - padding) / image_height,
+        )
+        min_width = max(self.minimumWidth(), layout.minimumSize().width())
+        target_width = min(max_width, max(min_width, round(image_width * scale) + padding))
+        target_height = min(
+            max_height,
+            max(self.minimumHeight(), round(image_height * scale) + toolbar_height + padding),
+        )
+        if not self.isVisible():
+            if self.size().width() != target_width or self.size().height() != target_height:
+                self.resize(target_width, target_height)
+            return
+
+        # setGeometry 一次完成尺寸和位置变化，避免 resize + move 让 Windows
+        # 先显示居中的临时窗口，再把它移到屏幕顶部。
+        frame = self.frameGeometry()
+        client = self.geometry()
+        left_margin = client.left() - frame.left()
+        top_margin = client.top() - frame.top()
+        outer_width = target_width + frame.width() - client.width()
+        frame_left = available.left() + max(0, (available.width() - outer_width) // 2)
+        target = (frame_left + left_margin, available.top() + top_margin,
+                  target_width, target_height)
+        if (client.x(), client.y(), client.width(), client.height()) != target:
+            self.setGeometry(*target)
 
     def _on_page_failed(self, seq: int, page_no: int, message: str):
         # 过期请求（用户已翻页）的错误不覆盖当前页提示
@@ -321,9 +401,45 @@ class ReaderWindow(QWidget):
         self.status_label.setText(f"第 {page_no} 页加载失败：{message}")
         self.image_area.set_source(None)
         self.image_area.setText("加载失败\n\n点击重试")
+        self._stop_slideshow()
 
     def retry_current_page(self):
         self.load_page(self._page)
+
+    # ---- 图片播放 ----
+
+    def toggle_slideshow(self):
+        """设置每张图片停留时间，或停止正在进行的自动翻页。"""
+        if self._slideshow_playing:
+            self._stop_slideshow()
+            return
+        seconds, accepted = QInputDialog.getInt(
+            self, "图片播放", "每张图片显示几秒后自动翻页：",
+            self._slideshow_seconds, 1, 3600, 1,
+        )
+        if not accepted:
+            return
+        self._slideshow_seconds = seconds
+        self._slideshow_playing = True
+        self.play_btn.setText("■ 停止播放")
+        self._update_page_ui()
+        if self._loaded_seq == self._load_seq:
+            self._slideshow_timer.start(seconds * 1000)
+
+    def _stop_slideshow(self):
+        self._slideshow_timer.stop()
+        self._slideshow_playing = False
+        self.play_btn.setText("▶ 图片播放")
+        self._update_page_ui()
+
+    def _advance_slideshow(self):
+        """只在当前图片完整显示后翻页；下一次计时由加载成功回调启动。"""
+        if not self._slideshow_playing or self._loaded_seq != self._load_seq:
+            return
+        if self._page >= self._total:
+            self._stop_slideshow()
+            return
+        self.go_next()
 
     # ---- 预取（默认关闭；仅当用户在设置中显式开启时才生效） ----
 
@@ -357,6 +473,7 @@ class ReaderWindow(QWidget):
             parent=None,
         )
         self._prefetch_worker = worker
+        self._active_workers.append(worker)
         worker.page_ready.connect(self._on_prefetch_page_ready)
         worker.progress.connect(self._on_prefetch_progress)
         # 先清引用再 deleteLater（同 _start_load 的清理约定）
@@ -364,6 +481,7 @@ class ReaderWindow(QWidget):
             lambda w=worker: self._clear_worker("_prefetch_worker", w)
         )
         worker.finished.connect(worker.deleteLater)
+        register(worker)
         worker.start()
 
     def _on_prefetch_page_ready(self, page_no: int):
@@ -383,6 +501,7 @@ class ReaderWindow(QWidget):
         self.page_label.setText(f"{self._page} / {self._total}")
         self.prev_btn.setEnabled(self._page > 1)
         self.next_btn.setEnabled(self._page < self._total)
+        self.play_btn.setEnabled(self._slideshow_playing or self._page < self._total)
 
     def _update_cache_label(self, cached: int | None = None, total: int | None = None):
         if cached is None:
@@ -403,13 +522,31 @@ class ReaderWindow(QWidget):
 
     # ---- 全屏 ----
 
+    def _center_at_screen_top(self, screen):
+        """按窗口外框居中，并将外框顶部对齐屏幕可用区域。"""
+        available = screen.availableGeometry()
+        frame_width = self.frameGeometry().width()
+        left = available.left() + max(0, (available.width() - frame_width) // 2)
+        self.move(left, available.top())
+
+    def showEvent(self, event):
+        """首次显示时将窗口置于屏幕顶部中央。"""
+        super().showEvent(event)
+        if self._initial_top_placed or self.isFullScreen():
+            return
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        self._center_at_screen_top(screen)
+        self._initial_top_placed = True
+
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
-            self.fit_btn.setText("全屏")
+            if self.image_area._source is not None:
+                self._fit_window_to_image(self.image_area._source)
         else:
             self.showFullScreen()
-            self.fit_btn.setText("退出全屏")
 
     # ---- 关闭收尾 ----
 
@@ -421,8 +558,10 @@ class ReaderWindow(QWidget):
         running" 直接 abort。无事件循环的场景（如离屏测试、程序退出）尤其
         明显——deleteLater 不会被执行，只能在此限时 join。
         """
+        self._stop_slideshow()
         self._save_progress()
         self._shutdown_workers()
+        self.reader_closed.emit()
         super().closeEvent(event)
 
     def _shutdown_workers(self, timeout_ms: int = 2500):
@@ -431,11 +570,10 @@ class ReaderWindow(QWidget):
         单页加载线程的粒度是一张图（可能正在网络 IO），因此给予有限等待；
         超时后强制 terminate，保证关闭不卡死、也不留下运行中的 QThread。
         """
-        workers = [
-            w
-            for w in (self._load_worker, self._prefetch_worker)
-            if w is not None
-        ]
+        workers = list(self._active_workers)
+        for worker in (self._load_worker, self._prefetch_worker):
+            if worker is not None and worker not in workers:
+                workers.append(worker)
         if not workers:
             return
         for worker in workers:
@@ -467,18 +605,9 @@ QWidget {{
     background-color: #1B1D21;
     font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI", sans-serif;
 }}
-QFrame#readerTop {{
-    background-color: #23262B;
-    border-bottom: 1px solid #34383F;
-}}
 QFrame#readerBottom {{
     background-color: #23262B;
     border-top: 1px solid #34383F;
-}}
-QLabel#readerTitle {{
-    color: #F3F4F6;
-    font-size: 15px;
-    font-weight: 600;
 }}
 QLabel#readerStatus {{
     color: #9CA3AF;
@@ -492,7 +621,7 @@ QLabel#readerPage {{
     color: #F3F4F6;
     font-size: 14px;
     font-weight: 600;
-    min-width: 96px;
+    min-width: 60px;
 }}
 QPushButton#readerNavButton {{
     background-color: {PALETTE["primary"]};
@@ -510,28 +639,30 @@ QPushButton#readerNavButton:disabled {{
     background-color: #3A3F47;
     color: #6B7280;
 }}
-QPushButton#readerToolButton {{
-    background-color: #34383F;
-    color: #E5E7EB;
+QPushButton#readerPlayButton {{
+    background-color: #059669;
+    color: white;
     border: none;
     border-radius: 6px;
-    padding: 6px 12px;
+    padding: 6px 8px;
     font-size: 13px;
 }}
-QPushButton#readerToolButton:hover {{
-    background-color: #40454E;
+QPushButton#readerPlayButton:hover {{
+    background-color: #047857;
 }}
-QPushButton#readerCloseButton {{
-    background-color: transparent;
-    color: #E5E7EB;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 15px;
+QPushButton#readerPlayButton:disabled {{
+    background-color: #3A3F47;
+    color: #6B7280;
 }}
-QPushButton#readerCloseButton:hover {{
-    background-color: #B91C1C;
-    color: white;
+QInputDialog QSpinBox {{
+    background-color: #F9FAFB;
+    color: #111827;
+    padding: 4px;
+}}
+QInputDialog QPushButton {{
+    background-color: #34383F;
+    color: #F3F4F6;
+    padding: 5px 12px;
 }}
 QLabel {{
     color: #D1D5DB;

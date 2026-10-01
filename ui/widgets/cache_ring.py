@@ -4,12 +4,13 @@
 - 先画一整圈**灰色底环**（未完成部分）；
 - 再在其上叠加一段**彩色圆弧**，弧长 = 百分比 × 360°，
   从 12 点方向顺时针增长 —— 50% 时正好是半圈彩色 + 半圈灰底；
-- 圆心/中央显示百分比数字（0-99），100% 时显示 ✓ 并把整圈变绿。
+- 圆心/中央显示百分比数字；总数未知时显示本地图片张数。
 
 颜色语义：
 - 进行中/部分缓存：橙色（#F97316）
 - 已缓存完整：绿色（#16A34A）
 - 底环：浅灰（#E5E7EB）
+- 圆心：深色半透明底 + 白色粗体数字，避免被封面颜色淹没
 """
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
@@ -19,7 +20,8 @@ from PySide6.QtWidgets import QWidget
 COLOR_PROGRESS = "#F97316"
 COLOR_COMPLETE = "#16A34A"
 COLOR_TRACK = "#E5E7EB"
-COLOR_TEXT = "#6B7280"
+COLOR_TEXT = "#FFFFFF"
+COLOR_CENTER = QColor(15, 23, 42, 220)
 
 
 class CacheProgressRing(QWidget):
@@ -48,7 +50,8 @@ class CacheProgressRing(QWidget):
         self._cached = 0           # 已缓存张数（tooltip 用）
         self._total = 0            # 期望总数（tooltip 用）
         self.setFixedSize(self._size, self._size)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setVisible(False)
         self._refresh_tooltip()
 
     # ---- 状态设置 ----
@@ -71,7 +74,7 @@ class CacheProgressRing(QWidget):
         self._cached = int(cached)
         self._total = int(total)
         self._refresh_tooltip()
-        self.setVisible(percent > 0)
+        self.setVisible(self._total > 0 or self._cached > 0)
         self.update()
 
     @property
@@ -82,7 +85,7 @@ class CacheProgressRing(QWidget):
         if self._total > 0:
             self.setToolTip(f"已缓存 {self._cached} / {self._total} 张（{self._percent}%）")
         else:
-            self.setToolTip(f"已缓存 {self._cached} 张")
+            self.setToolTip(f"已缓存 {self._cached} 张（总数未知）")
 
     # ---- 绘制 ----
 
@@ -93,6 +96,18 @@ class CacheProgressRing(QWidget):
         # 圆环矩形：留出线宽的一半，避免边缘被裁切
         inset = self._thickness / 2 + 1
         rect = self.rect().adjusted(inset, inset, -inset, -inset)
+
+        # 深色圆心隔开封面纹理，留出边距以免盖住进度弧。
+        center_rect = rect.adjusted(
+            self._thickness / 2 + 1,
+            self._thickness / 2 + 1,
+            -self._thickness / 2 - 1,
+            -self._thickness / 2 - 1,
+        )
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(COLOR_CENTER)
+        painter.drawEllipse(center_rect)
+        painter.setBrush(Qt.NoBrush)
 
         # 1) 灰色底环（整圈）
         track_pen = QPen(QColor(COLOR_TRACK), self._thickness)
@@ -110,7 +125,7 @@ class CacheProgressRing(QWidget):
             span = -int(360 * 16 * self._percent / 100)
             painter.drawArc(rect, 90 * 16, span)
 
-        # 3) 中央文字：100% 显示对勾，否则显示百分比数字。
+        # 3) 圆心直接显示百分比，包括 0% 和 100%。
         #    字号按实际文字宽度自适应收缩，确保数字落在内圈之内；
         #    收缩到可读下限仍放不下时只画圆环（弧长本身已表达百分比）。
         if not self._show_text:
@@ -120,15 +135,11 @@ class CacheProgressRing(QWidget):
         if inner < 12:
             painter.end()
             return
-        if self._percent >= 100:
-            text = "✓"
-        elif self._percent > 0:
-            text = f"{self._percent}"
-        else:
-            text = ""
+        text = f"{self._percent}%" if self._total > 0 else str(self._cached)
         if text:
             font = QFont(self.font())
-            font.setBold(True)
+            font.setWeight(QFont.Weight.ExtraBold)
+            font.setStretch(75)
             # 从内圈的 0.68 起，逐步缩小直到文字宽度（含 2px 边距）落入内圈
             available = inner - 2
             pixel = max(8, int(inner * 0.68))
@@ -137,7 +148,7 @@ class CacheProgressRing(QWidget):
                 pixel -= 1
                 font.setPixelSize(pixel)
             painter.setFont(font)
-            painter.setPen(QColor(COLOR_COMPLETE if self._percent >= 100 else COLOR_TEXT))
+            painter.setPen(QColor(COLOR_TEXT))
             painter.drawText(self.rect(), Qt.AlignCenter, text)
 
         painter.end()

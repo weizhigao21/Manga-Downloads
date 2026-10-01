@@ -202,11 +202,14 @@ class DedupeDialog(QDialog):
         self.summary.setText("正在扫描…")
         self.progress_bar.setValue(0)
         self._set_busy(True)
-        self._worker = DedupeWorker(self)
+        # 扫描可能在对话框关闭后继续收尾，线程不能作为对话框的子对象。
+        self._worker = DedupeWorker()
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_ok.connect(self._on_scan_done)
         self._worker.error.connect(self._on_scan_error)
         self._worker.finished.connect(lambda: self._set_busy(False))
+        self._worker.finished.connect(self._worker.deleteLater)
+        register(self._worker)
         self._worker.start()
 
     def _set_busy(self, busy: bool):

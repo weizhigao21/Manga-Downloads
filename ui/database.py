@@ -9,7 +9,13 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from src.utils import BRACKET_RE, data_root, display_title_for_comic, safe_filename
+from src.utils import (
+    BRACKET_RE,
+    clean_title_markup,
+    data_root,
+    display_title_for_comic,
+    safe_filename,
+)
 
 ROOT_DIR = data_root()
 
@@ -133,7 +139,8 @@ _NON_AUTHOR_BRACKETS = frozenset(
     {
         "漢化", "汉化", "中文", "日文", "英文", "中文版", "日文版", "英文版",
         "繁體", "简体", "簡體", "無修正", "无修正", "修正", "DL版", "DL",
-        "AI", "AI圖集", "AI畫集", "CG", "CG畫集", "差分", "高解像度",
+        "AI", "AI圖集", "AI畫集", "AI绘图", "AI繪圖", "AI绘画",
+        "CG", "CG畫集", "差分", "高解像度",
         "全年齢", "成人向け", "例のアレ", "彩頁", "全彩", "單行本", "雜誌",
         "短篇", "連載", "完結", "上卷", "下卷", "第一卷", "第1話",
     }
@@ -168,7 +175,7 @@ def extract_author(title: str) -> str:
     Returns:
         作者/社团名（已去除方括号）；无法识别时返回空串。
     """
-    for block in BRACKET_RE.findall(title or ""):
+    for block in BRACKET_RE.findall(clean_title_markup(title)):
         name = block[1:-1].strip()
         if not name or name in _NON_AUTHOR_BRACKETS:
             continue
@@ -392,6 +399,8 @@ def _update_records_cache(records: list[dict]):
             )
             merged.setdefault("downloaded", prev["downloaded"] if prev else 0)
             merged.setdefault("downloaded_at", prev["downloaded_at"] if prev else "")
+            merged.setdefault("favorite", prev["favorite"] if prev else 0)
+            _merge_count_fields(merged, prev)
             _comics_records.append(merged)
         # SQL 中其余记录（本次未抓取的，如仅翻译过的最小记录）一并纳入
         known = {r["detail_url"] for r in _comics_records}
@@ -428,8 +437,23 @@ def _update_records_cache(records: list[dict]):
         merged_rec.setdefault(
             "downloaded_at", prev.get("downloaded_at", "") if prev else ""
         )
+        merged_rec.setdefault("favorite", prev.get("favorite", 0) if prev else 0)
+        _merge_count_fields(merged_rec, prev)
         merged[url] = merged_rec
     _comics_records = list(merged.values())
+
+
+def _merge_count_fields(record: dict, previous: dict | None):
+    """未知数量不覆盖已知值；合集话数与单作品图片数互斥。"""
+    images = int(record.get("image_count") or 0)
+    chapters = int(record.get("chapter_count") or 0)
+    if images > 0:
+        record["chapter_count"] = 0
+    elif chapters > 0:
+        record["image_count"] = 0
+    else:
+        record["image_count"] = int(previous.get("image_count") or 0) if previous else 0
+        record["chapter_count"] = int(previous.get("chapter_count") or 0) if previous else 0
 
 
 def _upsert_cached_record(record: dict):
@@ -451,6 +475,8 @@ def _upsert_cached_record(record: dict):
     merged.setdefault("translated_title", "")
     merged.setdefault("downloaded", 0)
     merged.setdefault("downloaded_at", "")
+    merged.setdefault("favorite", 0)
+    merged.setdefault("chapter_count", 0)
     _comics_records.append(merged)
 
 
@@ -849,12 +875,14 @@ class DatabaseManager:
                     translated_title TEXT DEFAULT '',
                     date TEXT DEFAULT '',
                     image_count INTEGER DEFAULT 0,
+                    chapter_count INTEGER DEFAULT 0,
                     cover_url TEXT DEFAULT '',
                 category TEXT DEFAULT '',
                 category_label TEXT DEFAULT '',
                 author TEXT DEFAULT '',
                 downloaded INTEGER DEFAULT 0,
                 downloaded_at TEXT DEFAULT '',
+                favorite INTEGER DEFAULT 0,
                 updated_at TEXT DEFAULT (datetime('now', 'localtime'))
                 )
                 """
@@ -888,6 +916,10 @@ class DatabaseManager:
                 )
             if "author" not in cols:
                 conn.execute("ALTER TABLE comics ADD COLUMN author TEXT DEFAULT ''")
+            if "favorite" not in cols:
+                conn.execute("ALTER TABLE comics ADD COLUMN favorite INTEGER DEFAULT 0")
+            if "chapter_count" not in cols:
+                conn.execute("ALTER TABLE comics ADD COLUMN chapter_count INTEGER DEFAULT 0")
             conn.execute(
                 """
                 UPDATE comics SET aid = CAST(
@@ -924,9 +956,9 @@ class DatabaseManager:
                 """
                 INSERT INTO comics
                     (detail_url, aid, title, translated_title, date,
-                     image_count, cover_url, category, category_label,
-                     downloaded, downloaded_at, author)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     image_count, chapter_count, cover_url, category, category_label,
+                     downloaded, downloaded_at, author, favorite)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(detail_url) DO UPDATE SET
                     aid = excluded.aid,
                     title = excluded.title,
@@ -934,12 +966,20 @@ class DatabaseManager:
                         WHEN excluded.translated_title = '' THEN comics.translated_title
                         ELSE excluded.translated_title END,
                     date = excluded.date,
-                    image_count = excluded.image_count,
+                    image_count = CASE
+                        WHEN excluded.image_count > 0 THEN excluded.image_count
+                        WHEN excluded.chapter_count > 0 THEN 0
+                        ELSE comics.image_count END,
+                    chapter_count = CASE
+                        WHEN excluded.chapter_count > 0 THEN excluded.chapter_count
+                        WHEN excluded.image_count > 0 THEN 0
+                        ELSE comics.chapter_count END,
                     cover_url = excluded.cover_url,
                     category = excluded.category,
                     category_label = excluded.category_label,
                     downloaded = comics.downloaded,
                     downloaded_at = comics.downloaded_at,
+                    favorite = comics.favorite,
                     author = CASE
                         WHEN excluded.author = '' THEN comics.author
                         ELSE excluded.author END
@@ -952,12 +992,14 @@ class DatabaseManager:
                         c.get("translated_title", ""),
                         c.get("date", ""),
                         int(c.get("image_count") or 0),
+                        int(c.get("chapter_count") or 0),
                         c.get("cover_url", ""),
                         c.get("category", ""),
                         c.get("category_label", ""),
                         0,
                         "",
                         extract_author(c.get("title", "")),
+                        0,
                     )
                     for c in comics
                 ],
@@ -1000,6 +1042,29 @@ class DatabaseManager:
         _upsert_cached_record(
             {"detail_url": detail_url, "downloaded": 1, "downloaded_at": downloaded_at}
         )
+
+    def set_favorite(self, comic: dict, favorite: bool):
+        """保存收藏状态；搜索结果尚未入库时同时保存作品资料。"""
+        detail_url = comic.get("detail_url", "")
+        if not detail_url:
+            raise ValueError("作品缺少详情链接，无法保存收藏")
+        self.save_comics([comic])
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE comics SET favorite = ?, updated_at = datetime('now', 'localtime') "
+                "WHERE detail_url = ?",
+                (int(favorite), detail_url),
+            )
+        _upsert_cached_record({"detail_url": detail_url, "favorite": int(favorite)})
+
+    def load_favorites(self) -> list[dict]:
+        """返回所有收藏作品，按作品 ID 从新到旧排列。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM comics WHERE favorite = 1 "
+                "ORDER BY aid IS NULL, aid DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def load_comics(self, category: str | None = None, limit: int | None = None) -> list[dict]:
         """读取漫画记录，按作品 ID（aid）倒序（最新上传优先）。

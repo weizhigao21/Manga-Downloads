@@ -6,12 +6,13 @@
 import re
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtGui import QColor, QFontMetrics, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -30,6 +31,7 @@ from ui.fetch_worker import FetchWorker
 from ui.models import ComicItem
 from ui.settings import BASE_URL, CATEGORIES, AppSettings, ProjectConfig
 from ui.styles import LIGHT_THEME_QSS
+from ui.threads import register
 from ui.version import __version__
 from ui.widgets import ComicsGrid, PageBar
 
@@ -37,15 +39,22 @@ from ui.widgets import ComicsGrid, PageBar
 class MainWindow(QMainWindow):
     """漫画浏览器主窗口。"""
 
+    FAVORITES_LABEL = "我的收藏"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"漫画浏览器 v{__version__}")
         self.setMinimumSize(1080, 720)
         self._comics: list[ComicItem] = []
         self._worker: FetchWorker | None = None
+        self._chapter_workers: dict = {}
+        self._chapter_cache: dict[str, list[dict]] = {}
+        self._history: list[dict] = []
+        self._view_generation = 0
         self._silent_fetch: bool = False
         self._current_page: int = 1
         self._search_keyword: str = ""  # 非空时处于"关键词搜索"模式
+        self._favorite_mode = False
         # 请求序号：每次发起新抓取递增；worker 完成回调时校验序号，
         # 过期结果（期间已发起新请求）直接丢弃，防止旧结果覆盖/污染数据。
         self._fetch_seq: int = 0
@@ -58,7 +67,10 @@ class MainWindow(QMainWindow):
         self._similar_worker = None  # 后台相似扫描线程引用
         self._settings = AppSettings()
         self._project_config = ProjectConfig()
+        self._current_category_name = "全部更新"
         self._setup_ui()
+        if hasattr(self, "category_combo"):
+            self._current_category_name = self.category_combo.currentText()
         self._load_initial_data()
 
     # ---- UI 构建 ----
@@ -79,12 +91,21 @@ class MainWindow(QMainWindow):
         toolbar_layout.setContentsMargins(24, 16, 24, 16)
         toolbar_layout.setSpacing(16)
 
+        self.back_btn = QPushButton("← 返回")
+        self.back_btn.setObjectName("refreshButton")
+        self.back_btn.setToolTip("返回上一个列表（Alt+左箭头）")
+        self.back_btn.setEnabled(False)
+        self.back_btn.clicked.connect(self._go_back)
+        toolbar_layout.addWidget(self.back_btn)
+        self._back_shortcut = QShortcut(QKeySequence("Alt+Left"), self)
+        self._back_shortcut.activated.connect(self._go_back)
+
         title = QLabel("漫画浏览器")
         title.setObjectName("titleLabel")
         toolbar_layout.addWidget(title)
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索漫画名称，回车搜索")
+        self.search_edit.setPlaceholderText("在当前分类搜索，回车搜索")
         self.search_edit.setMinimumWidth(280)
         # 搜索框随窗口宽度自适应拉伸（上限 480px），避免宽窗口下留出大片空白；
         # 超出上限后由 addStretch 把按钮组推到右侧
@@ -96,7 +117,11 @@ class MainWindow(QMainWindow):
 
         # 分类选择下拉框：切换后自动抓取该分类内容（同时退出搜索模式）
         self.category_combo = QComboBox()
-        self.category_combo.addItems(CATEGORIES.keys())
+        self.category_combo.addItem("全部更新")
+        self.category_combo.addItem(self._favorite_icon(), self.FAVORITES_LABEL)
+        self.category_combo.addItems(
+            [name for name in CATEGORIES if name != "全部更新"]
+        )
         self._select_current_category()
         self.category_combo.currentTextChanged.connect(self._on_category_changed)
         self.category_combo.setToolTip("切换浏览分类，选择后自动抓取该分类内容")
@@ -158,7 +183,7 @@ class MainWindow(QMainWindow):
         exit_similar_btn = QPushButton("返回列表")
         exit_similar_btn.setCursor(Qt.PointingHandCursor)
         # 用 lambda 包裹：clicked 信号携带的 bool 参数不能误传为 restore
-        exit_similar_btn.clicked.connect(lambda: self._exit_similar_mode())
+        exit_similar_btn.clicked.connect(self._go_back)
         banner_layout.addWidget(exit_similar_btn)
         self.similar_banner.setVisible(False)
         root_layout.addWidget(self.similar_banner)
@@ -167,6 +192,8 @@ class MainWindow(QMainWindow):
         self.comics_grid = ComicsGrid()
         self.comics_grid.similar_requested.connect(self._on_view_similar)
         self.comics_grid.read_requested.connect(self._on_open_reader)
+        self.comics_grid.favorite_changed.connect(self._on_favorite_changed)
+        self.comics_grid.author_requested.connect(self._on_author_requested)
         root_layout.addWidget(self.comics_grid)
 
         # 底部栏：统一底色（QFrame#pageBar 背景+顶边框）
@@ -214,6 +241,26 @@ class MainWindow(QMainWindow):
         bottom_layout.addWidget(left_host, 0, 0, Qt.AlignLeft | Qt.AlignVCenter)
 
         root_layout.addWidget(bottom_bar)
+
+        target_width = self.comics_grid.width_for_columns(3)
+        screen = self.screen()
+        if screen is not None:
+            target_width = min(target_width, screen.availableGeometry().width())
+        self.resize(target_width, 720)
+
+    @staticmethod
+    def _favorite_icon() -> QIcon:
+        pixmap = QPixmap(20, 20)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setPen(QColor("#EAB308"))
+        font = painter.font()
+        font.setPointSize(17)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "★")
+        painter.end()
+        return QIcon(pixmap)
 
     # ---- 数据加载 ----
 
@@ -317,6 +364,70 @@ class MainWindow(QMainWindow):
         self.status_label.setText(elided)
         self.status_label.setToolTip(text if elided != text else "")
 
+    def _capture_view(self) -> dict:
+        """保存当前列表状态，返回时无需重新联网。"""
+        return {
+            "comics": list(self._comics),
+            "category": self._current_category_name,
+            "list_url": self._project_config.list_url,
+            "keyword": self._search_keyword,
+            "search_text": self._search_keyword,
+            "page": self._current_page,
+            "favorite": self._favorite_mode,
+            "similar": self._similar_mode,
+            "similar_prev": self._similar_prev_comics,
+            "similar_banner": self.similar_banner_label.text(),
+            "scroll": self.comics_grid.verticalScrollBar().value(),
+            "status": self.status_label.toolTip() or self.status_label.text(),
+        }
+
+    def _push_history(self):
+        self._view_generation += 1
+        self._history.append(self._capture_view())
+        self._history = self._history[-50:]
+        self.back_btn.setEnabled(True)
+
+    def _go_back(self):
+        """按进入顺序退回上一个列表、搜索或分类视图。"""
+        if not self._history:
+            return
+        self._view_generation += 1
+        generation = self._view_generation
+        state = self._history.pop()
+        # 旧网络结果仍可能抵达：令其序号过期，并丢弃排队请求。
+        self._fetch_seq += 1
+        self._worker = None
+        self._pending_request = None
+        self.progress_bar.hide()
+        self._project_config.list_url = state["list_url"]
+        self._project_config.save()
+        self._current_category_name = state["category"]
+        self.category_combo.blockSignals(True)
+        self.category_combo.setCurrentText(state["category"])
+        self.category_combo.blockSignals(False)
+        self._search_keyword = state["keyword"]
+        self.search_edit.blockSignals(True)
+        self.search_edit.setText(state["search_text"])
+        self.search_edit.blockSignals(False)
+        self._current_page = state["page"]
+        self.page_bar.set_page(state["page"])
+        self._favorite_mode = state["favorite"]
+        self.page_bar.setVisible(not state["favorite"])
+        self._similar_mode = state["similar"]
+        self._similar_prev_comics = state["similar_prev"]
+        self.similar_banner_label.setText(state["similar_banner"])
+        self.similar_banner.setVisible(state["similar"])
+        self.set_comics(state["comics"])
+        self.set_status(state["status"])
+        scroll = state["scroll"]
+        self.comics_grid.verticalScrollBar().setValue(scroll)
+        QTimer.singleShot(
+            0,
+            lambda: self.comics_grid.verticalScrollBar().setValue(scroll)
+            if self._view_generation == generation else None,
+        )
+        self.back_btn.setEnabled(bool(self._history))
+
     def set_comics_from_raw(self, raw_comics: list[dict]):
         """将爬虫原始字典转换为 ComicItem 并展示（自动关联本地封面缓存）。
 
@@ -325,18 +436,25 @@ class MainWindow(QMainWindow):
         """
         from ui.database import _cached_records, cover_cache_path
 
-        # 数据库缓存：detail_url -> translated_title（含增量缓存，无需重复全表查询）
-        translations = {
-            r.get("detail_url", ""): r.get("translated_title", "")
+        # 数据库缓存：搜索结果不入库，翻译名与收藏标记需从已有记录回填。
+        saved = {
+            r.get("detail_url", ""): r
             for r in _cached_records()
         }
         items = []
         for c in raw_comics:
             detail_url = c.get("detail_url", "")
+            stored = saved.get(detail_url, {})
+            image_count = int(c.get("image_count") or 0)
+            chapter_count = int(c.get("chapter_count") or 0)
+            if image_count <= 0 and chapter_count <= 0:
+                image_count = int(stored.get("image_count") or 0)
+                chapter_count = int(stored.get("chapter_count") or 0)
             items.append(
                 ComicItem(
                     title=c.get("title", "未知"),
-                    image_count=c.get("image_count", 0),
+                    image_count=image_count,
+                    chapter_count=chapter_count,
                     upload_date=c.get("date", ""),
                     detail_url=detail_url,
                     cover_url=c.get("cover_url", ""),
@@ -344,8 +462,9 @@ class MainWindow(QMainWindow):
                     category=c.get("category", ""),
                     category_label=c.get("category_label", ""),
                     translated_title=(
-                        c.get("translated_title") or translations.get(detail_url, "")
+                        c.get("translated_title") or stored.get("translated_title", "")
                     ),
+                    favorite=bool(c.get("favorite", stored.get("favorite", 0))),
                 )
             )
         self.set_comics(items)
@@ -356,6 +475,19 @@ class MainWindow(QMainWindow):
         """回车触发网站搜索；输入为空时若处于搜索模式则返回列表。"""
         keyword = self.search_edit.text().strip()
         if keyword:
+            if (keyword != self._search_keyword or self._current_page != 1
+                    or self._favorite_mode or self._similar_mode):
+                self._push_history()
+            if self._favorite_mode:
+                # 收藏是本地视图；从这里搜索作者/关键词时切回全站搜索。
+                self._favorite_mode = False
+                self.page_bar.show()
+                self.category_combo.blockSignals(True)
+                self.category_combo.setCurrentText("全部更新")
+                self.category_combo.blockSignals(False)
+                self._current_category_name = "全部更新"
+                self._project_config.list_url = f"{BASE_URL}/{CATEGORIES['全部更新']}"
+                self._project_config.save()
             self._search_keyword = keyword
             self._start_fetch(page=1)
         elif self._search_keyword:
@@ -368,6 +500,7 @@ class MainWindow(QMainWindow):
 
     def _exit_search(self):
         """退出搜索模式：清空关键词并抓取列表第 1 页。"""
+        self._push_history()
         self._search_keyword = ""
         self._start_fetch(page=1)
 
@@ -387,12 +520,44 @@ class MainWindow(QMainWindow):
 
     def _on_category_changed(self, name: str):
         """切换分类：退出搜索模式，更新列表 URL 并抓取该分类第 1 页。"""
+        self._push_history()
+        self._current_category_name = name
         self._search_keyword = ""
         self.search_edit.clear()  # 关键词已清空，textChanged 不会重复触发请求
+        if name == self.FAVORITES_LABEL:
+            self._show_favorites()
+            return
+        self._favorite_mode = False
+        self.page_bar.show()
         suffix = CATEGORIES.get(name, "albums.html")
         self._project_config.list_url = f"{BASE_URL}/{suffix}"
         self._project_config.save()
         self._start_fetch(silent=False, page=1)
+
+    def _show_favorites(self):
+        """进入本地收藏列表，并丢弃尚未完成的网络抓取结果。"""
+        from ui.database import DatabaseManager
+
+        self._favorite_mode = True
+        self._fetch_seq += 1
+        self._worker = None  # 线程注册表继续持有旧线程直至它退出
+        self._pending_request = None
+        self.progress_bar.hide()
+        self.page_bar.hide()
+        self._exit_similar_mode(restore=False)
+        records = DatabaseManager.instance().load_favorites()
+        self.set_comics_from_raw(records)
+        self.set_status(f"我的收藏：共 {len(records)} 部作品")
+
+    def _on_favorite_changed(self, comic: ComicItem, favorite: bool):
+        if self._favorite_mode:
+            self._show_favorites()
+        else:
+            self.set_status(f"已{'收藏' if favorite else '取消收藏'}：{comic.display_title}")
+
+    def _on_author_requested(self, author: str):
+        self.search_edit.setText(author)
+        self._on_search_submit()
 
     # ---- 抓取调度 ----
 
@@ -436,6 +601,7 @@ class MainWindow(QMainWindow):
             url=self._project_config.list_url,
             page=self._current_page,
             keyword=self._search_keyword,
+            category=self._current_category_filter() if self._search_keyword else None,
         )
         self._worker.done.connect(
             lambda raw, s=seq: self._on_fetch_finished(raw, s)
@@ -447,11 +613,13 @@ class MainWindow(QMainWindow):
         # emit（线程未退出），不能连 deleteLater，否则销毁运行中的 QThread 会
         # 触发 "QThread: Destroyed while thread is still running" 崩溃
         self._worker.finished.connect(self._worker.deleteLater)
+        register(self._worker)
         self._worker.start()
 
     def _on_page_requested(self, page: int):
         """翻页栏请求跳转回调。"""
-        if page >= 1:
+        if page >= 1 and page != self._current_page and not self._favorite_mode:
+            self._push_history()
             self._start_fetch(page=page)
 
     def _on_fetch_finished(self, raw_comics: list[dict], seq: int):
@@ -460,14 +628,21 @@ class MainWindow(QMainWindow):
             # 期间已发起新请求（搜索/切分类/翻页），旧结果不再使用：
             # 避免搜索结果被当成列表写入数据库/缓存（数据污染）
             return
+        if self._pending_request is not None:
+            # 用户已切分类/翻页/重新搜索：丢弃旧请求结果，直接执行最新请求。
+            self._worker = None
+            self._run_pending_request()
+            return
         self._worker = None
         self.progress_bar.setVisible(False)
         if self._search_keyword:
             # 搜索结果仅展示，不写入缓存与数据库（避免污染下次启动的本地数据）
             self.set_comics_from_raw(raw_comics)
+            scope = self.category_combo.currentText()
+            scope_text = f"（{scope}）" if scope != "全部更新" else ""
             self.set_status(
-                f"搜索“{self._search_keyword}”：第 {self._current_page} 页，"
-                f"共 {len(raw_comics)} 部漫画"
+                f"搜索“{self._search_keyword}”{scope_text}：原站第 "
+                f"{self._current_page} 页筛选出 {len(raw_comics)} 部"
             )
         else:
             save_cache(raw_comics)
@@ -493,6 +668,10 @@ class MainWindow(QMainWindow):
     def _on_fetch_error(self, message: str, seq: int):
         """抓取线程错误回调；过期请求的错误同样丢弃，不打扰用户。"""
         if seq != self._fetch_seq:
+            return
+        if self._pending_request is not None:
+            self._worker = None
+            self._run_pending_request()
             return
         self._worker = None
         self.progress_bar.setVisible(False)
@@ -533,6 +712,7 @@ class MainWindow(QMainWindow):
         # 它们在 run() 返回前 emit，此时销毁运行中的 QThread 会触发
         # "QThread: Destroyed while thread is still running" 崩溃
         worker.finished.connect(worker.deleteLater)
+        register(worker)
         worker.start()
 
     def _on_similar_done(self, similar_map: dict):
@@ -561,6 +741,7 @@ class MainWindow(QMainWindow):
         if not records:
             self.set_status("本地数据库没有找到相似作品")
             return
+        self._push_history()
         self._similar_prev_comics = self._comics
         self.set_comics(self._comic_items_for_similar(comic, records))
         self._similar_mode = True
@@ -589,6 +770,7 @@ class MainWindow(QMainWindow):
                 ComicItem(
                     title=rec.get("title", "未知"),
                     image_count=rec.get("image_count", 0),
+                    chapter_count=rec.get("chapter_count", 0),
                     upload_date=rec.get("date", ""),
                     detail_url=detail_url,
                     cover_url=rec.get("cover_url", ""),
@@ -623,6 +805,8 @@ class MainWindow(QMainWindow):
             prev = self._similar_prev_comics
             self._similar_prev_comics = None
             self.set_comics(prev)
+        elif not restore:
+            self._similar_prev_comics = None
 
     def _run_pending_request(self):
         """当前 worker 结束后，若期间有排队请求则立即执行。"""
@@ -635,6 +819,9 @@ class MainWindow(QMainWindow):
 
     def _on_refresh(self):
         """刷新按钮回调：重新抓取当前模式的当前页数据。"""
+        if self._favorite_mode:
+            self._show_favorites()
+            return
         self._start_fetch(silent=False)
 
     def _on_download_manager(self):
@@ -646,16 +833,92 @@ class MainWindow(QMainWindow):
 
     def _on_open_reader(self, comic: ComicItem):
         """打开阅读器窗口（非模态，可多开）：本地优先，缺页边看边缓存。"""
-        from ui.reader.reader_window import ReaderWindow
-
         comic_dict = {
             "title": comic.title,
             "detail_url": comic.detail_url,
             "image_count": comic.image_count,
             "category_label": comic.display_category_label,
+            "original_category_label": comic.category_label,
             "translated_title": comic.translated_title,
         }
+        if comic.chapter_count > 0:
+            self._open_collection(comic, comic_dict)
+            return
+        self._show_reader(comic_dict, comic.detail_url)
+
+    def _open_collection(self, comic: ComicItem, comic_dict: dict):
+        """在后台读取章节，随后选择单章进入原有阅读器。"""
+        from ui.reader.chapter_worker import ChapterListWorker
+
+        url = comic.detail_url
+        if url in self._chapter_cache:
+            self._choose_chapter(comic_dict, self._chapter_cache[url])
+            return
+        if url in self._chapter_workers:
+            self.set_status("正在获取章节目录，请稍候…")
+            return
+        worker = ChapterListWorker(url)
+        self._chapter_workers[url] = worker
+        register(worker)
+        worker.done.connect(
+            lambda chapters, data=comic_dict, key=url: self._chapters_ready(key, data, chapters)
+        )
+        worker.error.connect(lambda message, key=url: self._chapters_failed(key, message))
+        worker.finished.connect(lambda key=url: self._chapter_workers.pop(key, None))
+        worker.finished.connect(worker.deleteLater)
+        self.set_status("正在获取章节目录…")
+        worker.start()
+
+    def _chapters_ready(self, url: str, comic_dict: dict, chapters: list[dict]):
+        self._chapter_cache[url] = chapters
+        self._choose_chapter(comic_dict, chapters)
+
+    def _chapters_failed(self, url: str, message: str):
+        self.set_status(f"获取章节失败：{message}")
+        QMessageBox.warning(self, "无法打开合集", f"获取章节目录失败：{message}")
+
+    def _choose_chapter(self, comic_dict: dict, chapters: list[dict]):
+        labels = [
+            f"{chapter['title']}  ({chapter['image_count']} 张)"
+            if chapter['image_count'] else chapter['title']
+            for chapter in chapters
+        ]
+        choice, accepted = QInputDialog.getItem(
+            self, "选择章节", comic_dict["title"], labels, 0, False
+        )
+        if not accepted:
+            self.set_status("已取消选择章节")
+            return
+        chapter = chapters[labels.index(choice)]
+        selected = {
+            **comic_dict,
+            "title": chapter["title"],
+            "translated_title": "",
+            "detail_url": chapter["detail_url"],
+            "image_count": chapter["image_count"],
+        }
+        self._show_reader(selected, comic_dict["detail_url"], comic_dict)
+
+    def _show_reader(self, comic_dict: dict, source_url: str, parent_comic: dict | None = None):
+        from ui.reader.reader_window import ReaderWindow
+
         reader = ReaderWindow(comic_dict, parent=None)
+        if parent_comic is not None:
+            reader.back_btn.setText("← 返回章节")
+            reader.back_requested.connect(
+                lambda data=parent_comic, url=source_url: QTimer.singleShot(
+                    0, lambda: self._reopen_chapters(data, url)
+                )
+            )
+        reader.cache_progress_changed.connect(
+            lambda cached, total, url=comic_dict["detail_url"]: self.comics_grid.update_cache_progress(
+                url, cached, total
+            )
+        )
+        reader.reader_closed.connect(
+            lambda url=source_url: self.comics_grid.refresh_comic_status(url)
+        )
+        reader.reader_closed.connect(self._return_from_reader)
         # 持有引用，防止窗口被回收；关闭后自动清理
         reader.setAttribute(Qt.WA_DeleteOnClose, True)
         if not hasattr(self, "_readers"):
@@ -665,7 +928,17 @@ class MainWindow(QMainWindow):
             lambda *_, r=reader: self._readers.remove(r) if r in self._readers else None
         )
         reader.show()
-        self.set_status(f"正在阅读：{comic.display_title}")
+        self.set_status(f"正在阅读：{comic_dict['title']}")
+
+    def _return_from_reader(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _reopen_chapters(self, comic_dict: dict, source_url: str):
+        chapters = self._chapter_cache.get(source_url)
+        if chapters:
+            self._choose_chapter(comic_dict, chapters)
 
     def _on_settings(self):
         """打开设置对话框，保存后刷新界面以应用繁简转换。"""

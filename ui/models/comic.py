@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.utils import find_existing_translation, split_title_segments
+from src.utils import clean_title_markup, find_existing_translation, split_title_segments
 from ui.settings import AppSettings
 
 
@@ -19,10 +19,13 @@ class ComicItem:
     category: str = ""
     category_label: str = ""
     translated_title: str = ""
+    favorite: bool = False
+    chapter_count: int = 0
     similar_count: int = 0  # 本地库中相似记录数（>0 时卡片显示 ≈N 角标）
     similar_downloaded: bool = False  # 相似记录中是否存在已下载（角标变红提示）
 
     def __post_init__(self):
+        self.title = clean_title_markup(self.title)
         self._settings = AppSettings()
 
     @property
@@ -69,4 +72,10 @@ class ComicItem:
 
     @property
     def count_text(self) -> str:
-        return f"{self.image_count} 张"
+        return f"{self.image_count} 张" if self.image_count > 0 else "未知"
+
+    @property
+    def count_label_text(self) -> str:
+        if self.chapter_count > 0:
+            return f"章节: {self.chapter_count} 话"
+        return f"图片: {self.count_text}"

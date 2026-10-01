@@ -26,7 +26,7 @@ if __package__ in (None, ""):
 from src.config import ProjectConfig
 from src.net import _RETRYABLE_STATUS, _should_retry, _throttle, fetch_with_retry
 from src.net import fetch as _net_fetch
-from src.utils import data_root, safe_filename
+from src.utils import clean_title_markup, data_root, safe_filename
 
 # 项目根目录（src 的上级目录）与配置文件路径
 ROOT_DIR = data_root()
@@ -68,6 +68,16 @@ CATE_LABELS = {
     "cate-23": "3D&漫畫／漢化",
     "cate-24": "3D&漫畫／其他",
     "cate-37": "AI&圖集",
+    "cate-38": "韓漫／合集",
+}
+
+# 原站主分类页包含对应子分类；搜索结果只有具体 cate-N 标记。
+# 按原站导航菜单的层级筛选，选择主分类时保留其全部子分类。
+SEARCH_CATEGORY_GROUPS = {
+    "cate-5": {"cate-5", "cate-1", "cate-12", "cate-16", "cate-2", "cate-37", "cate-22", "cate-3"},
+    "cate-6": {"cate-6", "cate-9", "cate-13", "cate-17"},
+    "cate-7": {"cate-7", "cate-10", "cate-14", "cate-18"},
+    "cate-19": {"cate-19", "cate-38", "cate-20", "cate-21"},
 }
 
 # 仅独立运行（CLI）或未配置过日志时初始化 root logger；
@@ -80,6 +90,31 @@ logger = logging.getLogger(__name__)
 def fetch(url: str) -> str:
     """请求页面并返回 HTML 文本（自带全局节流与站点请求头）。"""
     return _net_fetch(url, HEADERS)
+
+
+def parse_collection_chapters(html_text: str) -> list[dict]:
+    """解析合集详情页的章节目录，每章作为独立图片作品阅读。"""
+    document = html.fromstring(html_text)
+    chapters = []
+    seen = set()
+    for anchor in document.xpath('//a[contains(@href, "photos-slide-aid-")]'):
+        # 顶部“开始阅读”也指向第一话，目录中的 tagshow 才有标题和页数。
+        if "tagshow" not in anchor.get("class", "").split():
+            continue
+        href = anchor.get("href", "")
+        match = re.search(r"photos-slide-aid-(\d+)", href)
+        if not match or match.group(1) in seen:
+            continue
+        seen.add(match.group(1))
+        title = " ".join(anchor.text_content().split())
+        tooltip = anchor.get("title", "")
+        page_count = _extract_int(tooltip, r"(\d+)\s*[Pp頁页張张]") or 0
+        chapters.append({
+            "title": title or f"第 {len(chapters) + 1} 话",
+            "detail_url": f"/photos-index-aid-{match.group(1)}.html",
+            "image_count": page_count,
+        })
+    return chapters
 
 
 def _extract_int(text: str | None, pattern: str) -> int | None:
@@ -122,13 +157,14 @@ def parse_comics(html_text: str) -> list[dict]:
         link_nodes = li.xpath('./div[1]/a/@href')
         title_nodes = li.xpath('./div[1]/a/@title')
         cover_nodes = li.xpath('./div[1]/a/img/@src')
-        meta_nodes = li.xpath('./div[2]/div[2]/text()')
+        meta_nodes = li.xpath('./div[2]/div[2]//text()')
 
         if not link_nodes or not title_nodes:
             continue
 
-        meta_text = meta_nodes[0] if meta_nodes else ""
-        count = _extract_int(meta_text, r"(\d+)張") or 0
+        meta_text = " ".join(part.strip() for part in meta_nodes if part.strip())
+        count = _extract_int(meta_text, r"(\d+)\s*[張张]") or 0
+        chapters = _extract_int(meta_text, r"(\d+)\s*[話话]") or 0
         date = _extract_date(meta_text) or ""
 
         cover_url = cover_nodes[0] if cover_nodes else ""
@@ -146,10 +182,11 @@ def parse_comics(html_text: str) -> list[dict]:
 
         comics.append(
             {
-                "title": title_nodes[0].strip(),
+                "title": clean_title_markup(title_nodes[0]),
                 "date": date,
                 "detail_url": link_nodes[0],
                 "image_count": count,
+                "chapter_count": chapters,
                 "cover_url": cover_url,
                 "category": category,
                 "category_label": category_label,
@@ -236,12 +273,15 @@ def fetch_comics(
     return comics
 
 
-def search_comics(keyword: str, page: int = 1) -> list[dict]:
-    """按关键词搜索漫画，返回与列表页同结构的漫画信息。
+def search_comics(
+    keyword: str, page: int = 1, category: str | None = None
+) -> list[dict]:
+    """按关键词搜索漫画，并按所选分类筛选当前搜索结果页。
 
     搜索结果页的列表结构与列表页一致（li.gallary_item），可直接复用 parse_comics：
     - 第 1 页: /search/?q=...&f=_all&s=create_time_DESC&syn=yes
     - 第 N 页: /search/index.php?q=...&m=&syn=yes&f=_all&s=create_time_DESC&p=N
+    原站搜索表单没有分类参数，分页仍按原站的全站搜索结果计算。
     """
     from urllib.parse import quote
 
@@ -255,7 +295,11 @@ def search_comics(keyword: str, page: int = 1) -> list[dict]:
         )
     logger.info("正在搜索: %s（第 %d 页）", keyword, page)
     html_text = fetch_with_retry(url, HEADERS)
-    return parse_comics(html_text)
+    comics = parse_comics(html_text)
+    if category:
+        allowed = SEARCH_CATEGORY_GROUPS.get(category, {category})
+        comics = [comic for comic in comics if comic.get("category") in allowed]
+    return comics
 
 
 # 并发下载控制（避免触发反爬，保持温和速率）
@@ -336,17 +380,22 @@ def _fetch_picture_link(link: str, retries: int = DOWNLOAD_MAX_RETRIES) -> str |
     return None
 
 
-def parse_picture_page(reading_url: str, start: int = 1, end: int | None = None) -> list[dict]:
-    """解析某个漫画的阅读页，返回所有图片链接。
+def parse_picture_page(
+    reading_url: str,
+    start: int = 1,
+    end: int | None = None,
+    resolve_links: bool = True,
+) -> list[dict]:
+    """解析某个漫画的阅读页，可按需解析图片直链。
 
     Args:
         reading_url: 阅读页 URL（含 page-N-aid-X 信息）。
         start/end: 页区间（1-based），用于分批解析（如先解析第 1-4 页）。
                    默认解析全部页。
+        resolve_links: False 时只取列表页条目，不逐张请求图片详情页。
 
-    返回列表元素格式:
-        - link: 图片直链
-        - number: 页码/名称
+    返回列表元素包含 number（页码/名称）；resolve_links=True 时
+    包含 link（图片直链），否则包含 detail_link（图片详情页地址）。
     """
     match = re.search(r"page-(\d+)-aid-(\d+)", reading_url)
     if match:
@@ -356,7 +405,10 @@ def parse_picture_page(reading_url: str, start: int = 1, end: int | None = None)
         aid = aid_match.group(1) if aid_match else ""
         page_count = 1
 
-    end = min(end or page_count, page_count)
+    # URL 里的 page-N 可能只是详情页给出的当前页，并非总页数。
+    # 调用方显式指定区间时按该区间抓取，避免第 2 页被 page-1 裁掉。
+    end = page_count if end is None else end
+    page_count = max(page_count, end)
     logger.info("解析图片页: aid=%s, 页区间=%d-%d（共 %d 页）", aid, start, end, page_count)
     pictures = []
     for num in range(start - 1, end):
@@ -394,6 +446,12 @@ def parse_picture_page(reading_url: str, start: int = 1, end: int | None = None)
                 logger.debug("跳过缺少链接或名称的图片条目: aid=%s, 第 %d/%d 页", aid, num + 1, page_count)
                 continue
             entries.append((link_nodes[0], number_nodes[0]))
+
+        if not resolve_links:
+            pictures.extend(
+                {"detail_link": link, "number": number} for link, number in entries
+            )
+            continue
 
         # 并发获取每张图片的直链（受控并发 + 退避重试，避免触发限流）
         with ThreadPoolExecutor(max_workers=PARSE_WORKERS) as executor:
