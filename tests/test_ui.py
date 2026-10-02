@@ -582,9 +582,9 @@ class TestFavoritesAndAuthor:
                 window.category_combo.findText("我的收藏")
             ).isNull()
             card = window.comics_grid._cards[0]
-            assert card.favorite_btn.text() == "☆"
+            assert card.favorite_btn.text() == "☆ 收藏"
             card.favorite_btn.click()
-            assert card.favorite_btn.text() == "★"
+            assert card.favorite_btn.text() == "★ 已收藏"
             assert "#FACC15" in card.favorite_btn.styleSheet()
             assert len(db.DatabaseManager.instance().load_favorites()) == 1
 
@@ -878,6 +878,50 @@ class TestSimilarFeature:
         card = ComicCard(self._make_comic())
         qtbot.addWidget(card)
         assert card.download_btn.focusPolicy() == Qt.NoFocus
+
+    def test_downloaded_card_click_does_not_start_download(self, qtbot, monkeypatch):
+        """已下载的绿色按钮只是状态展示：再点不会触发一遍重复下载。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card._pre_downloaded = True
+        card._sync_download_button()
+        assert card.download_btn.text() == "已下载"
+
+        started = []
+        monkeypatch.setattr(
+            card._manager, "start_download", lambda comic: started.append(comic)
+        )
+        card.download_btn.click()
+        assert started == []
+
+    def test_partial_cache_click_still_starts_download(self, qtbot, monkeypatch):
+        """只缓存了一部分时不属于"已齐全"，点击仍应继续下载。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card._pre_downloaded = True  # 目录存在但只缓存了一半
+        card.set_cache_progress(50, 5, 10)
+        assert card.download_btn.text() == "50%"
+
+        started = []
+        monkeypatch.setattr(
+            card._manager, "start_download", lambda comic: started.append(comic)
+        )
+        card.download_btn.click()
+        assert len(started) == 1
+
+    def test_favorite_button_moved_above_read_button(self, qtbot):
+        """收藏按钮在右侧信息区、阅读按钮正上方，不再压在封面里。"""
+        card = ComicCard(self._make_comic())
+        qtbot.addWidget(card)
+        card.show()
+        qtbot.wait(20)
+        assert card.favorite_btn.parentWidget() is card
+        assert card.favorite_btn.parentWidget() is not card.cover_container
+        assert card.favorite_btn.text() == "☆ 收藏"
+        # 与阅读按钮左边缘对齐，且整个位于其上方、不出卡片底边
+        assert card.favorite_btn.x() == card.read_btn.x()
+        assert card.favorite_btn.y() + card.favorite_btn.height() <= card.read_btn.y()
+        assert card.download_btn.y() + card.download_btn.height() <= card.height() - 16
 
     def test_context_menu_has_view_similar_when_count(self, qtbot):
         """similar_count > 0 时右键菜单含「查看类似作品」。"""
@@ -1722,3 +1766,92 @@ def test_notify_setting_default_enabled():
     from ui.settings import DEFAULT_SETTINGS
 
     assert DEFAULT_SETTINGS["notify_on_download_done"] is True
+
+
+class TestDownloadStatusButton:
+    """下载状态按钮：状态切换、百分比夹取与像素级填充/底槽配色。"""
+
+    def _button(self):
+        from ui.widgets.download_status_button import DownloadStatusButton
+
+        return DownloadStatusButton()
+
+    @staticmethod
+    def _pixel(widget, x, y):
+        from PySide6.QtGui import QPixmap
+
+        pixmap = QPixmap(widget.size())
+        widget.render(pixmap)
+        return pixmap.toImage().pixelColor(x, y).name()
+
+    def test_states_and_text(self, qapp):
+        btn = self._button()
+        assert (btn.text(), btn.variant, btn.progress) == ("下载", "primary", None)
+        btn.set_status("50%", "primary", 50)
+        assert (btn.text(), btn.variant, btn.progress) == ("50%", "primary", 50)
+        assert btn.is_progress is True
+        btn.set_status("已下载", "success")
+        assert (btn.text(), btn.variant, btn.is_progress) == ("已下载", "success", False)
+        btn.set_status("重试", "danger")
+        assert btn.variant == "danger"
+        btn.set_status("翻译中...", "muted")
+        assert btn.variant == "muted"
+
+    def test_unknown_variant_falls_back_to_primary(self, qapp):
+        btn = self._button()
+        btn.set_status("下载", "不存在的配色")
+        assert btn.variant == "primary"
+
+    def test_progress_is_clamped(self, qapp):
+        btn = self._button()
+        btn.set_status("150%", "primary", 150)
+        assert btn.progress == 100
+        btn.set_status("-5%", "primary", -5)
+        assert btn.progress == 0
+
+    def test_fixed_size_matches_card_layout(self, qapp):
+        """固定 104x32：与卡片原按钮尺寸一致，状态切换不会撑动布局。"""
+        btn = self._button()
+        assert (btn.width(), btn.height()) == (104, 32)
+
+    def test_done_state_fills_green(self, qapp):
+        """已下载：按钮实心填充绿色（#16A34A）。"""
+        btn = self._button()
+        btn.set_status("已下载", "success")
+        assert self._pixel(btn, 4, 16) == "#16a34a"
+
+    def test_progress_state_draws_fill_and_track(self, qapp):
+        """50%：左半为深绿进度、右半为浅绿底槽，证明进度条真的按比例画。"""
+        btn = self._button()
+        btn.set_status("50%", "primary", 50)
+        assert self._pixel(btn, 4, 16) == "#16a34a"
+        assert self._pixel(btn, 99, 16) == "#bbf7d0"
+
+    def test_progress_zero_is_all_track(self, qapp):
+        btn = self._button()
+        btn.set_status("0%", "primary", 0)
+        assert self._pixel(btn, 4, 16) == "#bbf7d0"
+        assert self._pixel(btn, 99, 16) == "#bbf7d0"
+
+    def test_progress_full_is_all_fill(self, qapp):
+        btn = self._button()
+        btn.set_status("100%", "primary", 100)
+        assert self._pixel(btn, 4, 16) == "#16a34a"
+        assert self._pixel(btn, 99, 16) == "#16a34a"
+
+    def test_progress_text_is_dark_not_white(self, qapp):
+        """百分比数字必须是深色：白字压在浅绿底槽上等于看不见。"""
+        from PySide6.QtGui import QPixmap
+
+        btn = self._button()
+        btn.set_status("50%", "primary", 50)
+        pixmap = QPixmap(btn.size())
+        btn.render(pixmap)
+        image = pixmap.toImage()
+        dark = sum(
+            1
+            for y in range(btn.height())
+            for x in range(btn.width())
+            if image.pixelColor(x, y).lightness() < 60
+        )
+        assert dark > 0, "进度态没有深色像素，百分比很可能还是白字"

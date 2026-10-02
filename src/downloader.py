@@ -201,26 +201,43 @@ def _extract_aid(detail_url: str) -> str:
     return match.group(1) if match else ""
 
 
+def _read_title_info(save_dir: Path) -> dict:
+    """读取作品目录里的 title_info.json；缺失或损坏时返回空字典。"""
+    info = save_dir / "title_info.json"
+    if not info.exists():
+        return {}
+    try:
+        data = json.loads(info.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _resolve_save_dir(save_dir: Path, comic: dict) -> Path:
     """处理下载目录命名冲突：已存在同名目录且非本作品时追加 (aid) 保证唯一。
 
     判定规则：
     - 目录不存在：直接使用；
-    - 目录存在且 title_info.json 中 original_title 与本作品相同：视为重下，
-      复用目录（图片模式断点续传自动跳过已下载文件）；
+    - title_info.json 里的 aid 与本作品一致：同一作品，复用目录
+      （图片模式断点续传会自动跳过已下载文件）；
+    - 目录没存 aid（本字段出现之前建的旧目录）：退回比较 original_title；
     - 其余情况（撞名，不同作品同名）：返回 `名称 (aid)` 目录。
+
+    阅读缓存目录也会写 title_info.json（见 _ensure_title_info），因此
+    「先在线阅读缓存了一批、之后点下载全本」同样命中这条规则，复用同一
+    目录，不会另建 `名称 (aid)` 导致同一作品两份、缓存图片白下第二遍。
     """
     if not save_dir.exists():
         return save_dir
-    info = save_dir / "title_info.json"
-    if info.exists():
-        try:
-            data = json.loads(info.read_text(encoding="utf-8"))
-            if data.get("original_title") == comic.get("title", ""):
-                return save_dir  # 同一作品重下：复用目录
-        except (OSError, json.JSONDecodeError):
-            pass
+    data = _read_title_info(save_dir)
     aid = _extract_aid(comic.get("detail_url", ""))
+    stored_aid = str(data.get("aid") or "").strip()
+    if stored_aid and aid:
+        # 有作品 ID 就以 ID 为准：标题相同但 ID 不同的确是两部作品
+        if stored_aid == aid:
+            return save_dir
+    elif data.get("original_title") == comic.get("title", ""):
+        return save_dir  # 旧目录没存 ID：退回标题比较（保持原有行为）
     if aid:
         return save_dir.parent / f"{save_dir.name} ({aid})"
     return save_dir
@@ -481,14 +498,16 @@ def _extract_reading_page_url(detail_doc) -> str | None:
 
 
 def _write_title_info(save_dir: Path, comic: dict) -> None:
-    """下载完成后在作品目录内写入标题信息 JSON（原始名 + 翻译名）。
+    """在作品目录内写入标题信息 JSON（原始名 + 翻译名 + 作品 ID）。
 
-    文件名为 title_info.json，包含 original_title（原始名称）与
-    translated_title（翻译名称，未翻译时为空）。
+    文件名为 title_info.json，包含 original_title（原始名称）、
+    translated_title（翻译名称，未翻译时为空）与 aid（作品 ID）。
+    只存 ID 不存 detail_url；下载侧靠 aid 判断同名目录是否属于同一作品。
     """
     info = {
         "original_title": comic.get("title", ""),
         "translated_title": comic.get("translated_title", ""),
+        "aid": _extract_aid(comic.get("detail_url", "")),
     }
     try:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -498,6 +517,20 @@ def _write_title_info(save_dir: Path, comic: dict) -> None:
         logger.info("已写入标题信息: %s/title_info.json", save_dir)
     except OSError as exc:
         logger.warning("写入标题信息 JSON 失败: %s", exc)
+
+
+def _ensure_title_info(save_dir: Path, comic: dict) -> None:
+    """title_info.json 不存在时才写入。
+
+    阅读器「边看边缓存」会自己创建作品目录，但没走下载流程，也就不会写
+    title_info.json。缺了它，之后点「下载全本」时 _resolve_save_dir 认不出
+    这是同一部作品，会另建 `名称 (aid)` 目录：同一部作品出现两个文件夹，
+    已缓存的那部分图片还要被重新下一遍。已有文件时不覆盖（可能带着更完整
+    的翻译名）。
+    """
+    if (save_dir / "title_info.json").exists():
+        return
+    _write_title_info(save_dir, comic)
 
 
 def download_comic(

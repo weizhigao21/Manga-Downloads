@@ -122,12 +122,12 @@ class ComicsGrid(QScrollArea):
         self._reflow()
 
     def update_cache_progress(self, detail_url: str, cached: int, total: int):
-        """阅读器缓存新图片时更新对应卡片的角标与进度环。"""
+        """阅读器缓存新图片时更新对应卡片的按钮进度（进度条 + 百分比）。"""
         percent = min(100, int(cached * 100 / total)) if total > 0 else 0
         for card in self._cards:
             if card.comic.detail_url == detail_url:
-                if cached > 0:
-                    card.set_downloaded_state(True)
+                # 不再把「缓存了哪怕一张」当成已下载：未满 100% 时按钮显示
+                # 进度条，满 100% 时由卡片自行转成绿色「已下载」。
                 card.set_cache_progress(percent, cached, total)
                 break
 
@@ -157,7 +157,9 @@ class ComicsGrid(QScrollArea):
                     comic.translated_title, comic.display_category_label,
                 )]
             ).get(detail_url, False)
-            card.set_downloaded_state(downloaded or cached > 0)
+            # 只把数据库/目录认定的「已下载」标为完成；未满 100% 的
+            # 缓存进度交由按钮显示为进度条（见 set_cache_progress）。
+            card.set_downloaded_state(downloaded)
             card.set_cache_progress(percent, cached, total)
             break
 

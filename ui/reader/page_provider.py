@@ -18,7 +18,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 from src.config import ProjectConfig
-from src.downloader import _download_folder_name, _extract_reading_page_url
+from src.downloader import (
+    _download_folder_name,
+    _ensure_title_info,
+    _extract_reading_page_url,
+)
 from src.net import fetch
 from src.utils import safe_filename
 from src.wnacg_crawler import (
@@ -103,6 +107,11 @@ class ReaderSession:
         with self._lock:
             self._local_dir = self._locate_or_plan_dir()
             self._refresh_local_files(force=True)
+            if self._local_files:
+                # 已有缓存图片但目录里没有 title_info.json（上一版留下的
+                # 历史目录）：补写归属信息，否则之后点「下载全本」会被当成
+                # 同名冲突，另建 "名称 (aid)" 目录，同一作品两份。
+                _ensure_title_info(self._local_dir, self.comic)
             self._page_urls = self.index.load_page_urls(self.aid)
 
     def refresh(self) -> None:
@@ -474,6 +483,9 @@ class ReaderSession:
             return None
         config = ProjectConfig()
         self._local_dir.mkdir(parents=True, exist_ok=True)
+        # 阅读缓存与下载共用同一个目录，落盘时必须留下与下载侧一致的归属
+        # 信息（title_info.json），否则之后点「下载全本」会另建 (aid) 目录
+        _ensure_title_info(self._local_dir, self.comic)
         try:
             failed = download_pictures(
                 [picture],

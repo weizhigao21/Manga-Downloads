@@ -19,7 +19,7 @@ from ui.download_manager import DownloadManager, DownloadTask
 from ui.models import ComicItem
 from ui.styles import PALETTE
 from ui.threads import register
-from ui.widgets.cache_ring import CacheProgressRing
+from ui.widgets.download_status_button import DownloadStatusButton
 
 
 class ComicCard(QFrame):
@@ -42,8 +42,9 @@ class ComicCard(QFrame):
         # 网格批量预计算的"已下载"结果（True/False 时直接使用，避免卡片
         # 各自遍历全表与磁盘 stat）；None 表示卡片按需自查（独立使用场景）
         self._pre_downloaded: bool | None = downloaded
-        # 发布时预计算的缓存进度（percent, cached, total）；None 表示卡片自查
-        self._pre_cache: tuple[int, int, int] | None = None
+        # 网格批量预计算的本地缓存进度（percent, cached, total）；
+        # None 表示尚未预计算，refresh_cache_progress 会按需自查后写入
+        self._cache: tuple[int, int, int] | None = None
         # 本地已有封面时不创建网络管理器（避免每张卡片都初始化网络栈）
         self._network: QNetworkAccessManager | None = None
         self._manager = DownloadManager.instance()
@@ -71,11 +72,9 @@ class ComicCard(QFrame):
         self.date_label.setText(f"上传: {self.comic.formatted_date}")
         self.url_label.setText(self.comic.detail_url)
         self._sync_download_button()
-        self.downloaded_badge.setVisible(self._is_downloaded())
-        self._position_cover_badges()
         self._update_similar_badge()
         # 复用卡片时缓存进度由网格重新预计算（set_cache_progress）覆盖
-        self._pre_cache = None
+        self._cache = None
         # 封面来源变化时重新加载（QPixmapCache 命中则直接复用，无需网络）
         if comic.cover_path != old.cover_path or comic.cover_url != old.cover_url:
             self._load_cover()
@@ -85,7 +84,7 @@ class ComicCard(QFrame):
         if task.task_id and task.task_id == self._task_id:
             self._sync_download_button(task)
             if task.status == DownloadTask.DONE:
-                self._pre_cache = None
+                self._cache = None
                 self.refresh_cache_progress()
 
     def _on_task_deleted(self, task):
@@ -164,29 +163,6 @@ class ComicCard(QFrame):
             """
         )
 
-        # 左上角"已下载"角标（绿色，仅已下载作品显示）
-        self.downloaded_badge = QLabel(self.cover_container)
-        self.downloaded_badge.setText("已下载")
-        self.downloaded_badge.setAlignment(Qt.AlignCenter)
-        self.downloaded_badge.setWordWrap(False)
-        self.downloaded_badge.setStyleSheet(
-            """
-            QLabel {
-                background-color: #16A34A;
-                color: white;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            """
-        )
-        self.downloaded_badge.adjustSize()
-        self.downloaded_badge.setFixedHeight(32)
-        # 定位到左上角，留出 8px 边距
-        self.downloaded_badge.move(8, 8)
-        self.downloaded_badge.setVisible(self._is_downloaded())
-
         # 右上角分类角标
         self.category_badge = QLabel(self.cover_container)
         self.category_badge.setAlignment(Qt.AlignCenter)
@@ -220,11 +196,6 @@ class ComicCard(QFrame):
         else:
             self.category_badge.setVisible(False)
 
-        self.cache_ring = CacheProgressRing(
-            self.cover_container, size=self.downloaded_badge.height(), thickness=3
-        )
-        self._position_cover_badges()
-
         # 左下角"相似"角标（本地库存在相似作品时显示 ≈N；
         # 相似记录中有已下载时数字变红提示，否则橙色）
         self.similar_badge = QLabel(self.cover_container)
@@ -234,13 +205,11 @@ class ComicCard(QFrame):
         self._update_similar_badge()
         self.similar_badge.setVisible(self.comic.similar_count > 0)
 
-        self.favorite_btn = QPushButton(self.cover_container)
+        # 收藏按钮不再压在封面上（既挡封面，又和左下角的相似角标抢位置），
+        # 改为信息区里的独立控件，位于「阅读」按钮正上方（见 favorite_row）
+        self.favorite_btn = QPushButton(self)
         self.favorite_btn.setObjectName("favoriteButton")
-        self.favorite_btn.setFixedSize(34, 34)
-        self.favorite_btn.move(
-            self.COVER_WIDTH - self.favorite_btn.width() - 8,
-            self.COVER_HEIGHT - self.favorite_btn.height() - 8,
-        )
+        self.favorite_btn.setFixedSize(104, 26)
         self.favorite_btn.setCursor(Qt.PointingHandCursor)
         self.favorite_btn.setFocusPolicy(Qt.NoFocus)
         self.favorite_btn.clicked.connect(self._toggle_favorite)
@@ -249,8 +218,9 @@ class ComicCard(QFrame):
         layout.addWidget(self.cover_container)
 
         # 右侧信息
+        # 行距 6：新增收藏行后，长标题（40 字上限，最多 3 行）仍需完整放下
         info_layout = QVBoxLayout()
-        info_layout.setSpacing(8)
+        info_layout.setSpacing(6)
         info_layout.setAlignment(Qt.AlignTop)
 
         self.title_label = QLabel(self)
@@ -320,6 +290,14 @@ class ComicCard(QFrame):
         info_layout.addWidget(self.url_label)
         info_layout.addStretch()
 
+        # 收藏按钮独占一行，正好落在「阅读」按钮上方；宽度与阅读/下载一致、
+        # 左边缘对齐，视觉上成为一列操作区
+        favorite_row = QHBoxLayout()
+        favorite_row.setSpacing(0)
+        favorite_row.addWidget(self.favorite_btn)
+        favorite_row.addStretch(1)
+        info_layout.addLayout(favorite_row)
+
         # 卡片右下角按钮区：阅读 + 下载
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(12)
@@ -355,37 +333,10 @@ class ComicCard(QFrame):
         bottom_row.addWidget(self.read_btn)
         bottom_row.addStretch(1)
 
-        self.download_btn = QPushButton("下载", self)
-        self.download_btn.setObjectName("downloadButton")
-        self.download_btn.setCursor(Qt.PointingHandCursor)
-        # 点击不抢焦点：按钮状态切换（下载→下载中/翻译中→已下载/重试）会
-        # setEnabled(False)，若按钮获焦，焦点移除会触发 QScrollArea 自动
-        # ensureVisible 滚动——按钮恰好部分位于视口边缘外时页面会"自己滑动"。
-        # NoFocus 后点击不获焦，状态切换无焦点变化，滚动不再发生。
-        self.download_btn.setFocusPolicy(Qt.NoFocus)
-        # 固定宽度：文本在「下载/下载中.../已下载/重试/翻译中...」间切换时
-        # 宽度保持稳定，避免按钮膨胀导致卡片内布局重排、界面视觉跳动
-        self.download_btn.setFixedSize(104, 32)
-        self.download_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                background-color: {PALETTE["primary"]};
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 4px 14px;
-                font-size: 13px;
-                font-weight: 500;
-            }}
-            QPushButton:hover {{
-                background-color: {PALETTE["primary_hover"]};
-            }}
-            QPushButton:disabled {{
-                background-color: {PALETTE["border"]};
-                color: {PALETTE["text_secondary"]};
-            }}
-            """
-        )
+        # 下载按钮：作品下载状态的唯一出口（封面不再叠加「已下载」角标）。
+        # 组件固定 104x32，进度态自行绘制进度条 + 百分比，文本在
+        # 「下载 / 42% / 已下载 / 重试 / 翻译中...」之间切换不改变尺寸。
+        self.download_btn = DownloadStatusButton("下载", self)
         self.download_btn.clicked.connect(self._on_download_clicked)
         bottom_row.addWidget(self.download_btn)
         info_layout.addLayout(bottom_row)
@@ -484,9 +435,16 @@ class ComicCard(QFrame):
         self.cover_label.setPixmap(pixmap)
 
     def _on_download_clicked(self):
-        """点击下载按钮：交由下载管理器创建后台任务。"""
+        """点击下载按钮：交由下载管理器创建后台任务。
+
+        本地已齐全的作品直接忽略点击：绿色「已下载」只是状态展示，
+        不该再触发一遍完整下载（旧实现会真的重新下一遍）。
+        """
         if not self.comic.detail_url:
             QMessageBox.information(self, "下载", "该作品没有详情页链接，无法下载。")
+            return
+        if self._is_download_complete():
+            self._show_status(f"《{self.comic.display_title}》已在本地，不会重复下载")
             return
         self._manager.start_download(self.comic)
         self._sync_download_button()
@@ -500,13 +458,32 @@ class ComicCard(QFrame):
 
     def _update_favorite_button(self):
         favored = bool(self.comic.favorite)
-        self.favorite_btn.setText("★" if favored else "☆")
+        self.favorite_btn.setText("★ 已收藏" if favored else "☆ 收藏")
         self.favorite_btn.setToolTip("取消收藏" if favored else "收藏作品")
+        if favored:
+            colors = (
+                "background-color: #FEF9C3; color: #B45309; "
+                "border: 1px solid #FACC15;"
+            )
+            hover = "background-color: #FEF08A;"
+        else:
+            colors = (
+                f"background-color: {PALETTE['surface']}; "
+                f"color: {PALETTE['text_secondary']}; "
+                f"border: 1px solid {PALETTE['border']};"
+            )
+            hover = f"border-color: {PALETTE['primary']};"
         self.favorite_btn.setStyleSheet(
-            "QPushButton { background: rgba(20, 24, 31, 0.72); border: none; "
-            f"border-radius: 17px; color: {'#FACC15' if favored else '#FFFFFF'}; "
-            "font-size: 26px; padding: 0; }"
-            "QPushButton:hover { background: rgba(20, 24, 31, 0.9); }"
+            f"""
+            QPushButton {{
+                {colors}
+                border-radius: 6px;
+                padding: 2px 10px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{ {hover} }}
+            """
         )
 
     def _toggle_favorite(self):
@@ -533,40 +510,29 @@ class ComicCard(QFrame):
         self._update_favorite_button()
         self.favorite_changed.emit(self.comic, target)
 
-    # ---- 缓存进度圈 ----
+    # ---- 下载状态按钮 ----
 
     def set_downloaded_state(self, downloaded: bool):
-        """同步当前作品的已下载角标及其关联的缓存进度环。"""
+        """同步「已下载」标记（阅读/下载完成后由网格调用）并刷新按钮。"""
         self._pre_downloaded = bool(downloaded)
-        self.downloaded_badge.setVisible(self._pre_downloaded)
-        self._position_cover_badges()
-
-    def _position_cover_badges(self):
-        """仅在已下载角标出现时显示等高进度环，并避开分类角标。"""
-        downloaded = not self.downloaded_badge.isHidden()
-        self.cache_ring.setVisible(downloaded)
-        ring_x = self.downloaded_badge.x() + self.downloaded_badge.width() + 6
-        ring_y = self.downloaded_badge.y() + (
-            self.downloaded_badge.height() - self.cache_ring.height()
-        ) // 2
-        self.cache_ring.move(ring_x, ring_y)
-        if not self.category_badge.isHidden():
-            overlaps = downloaded and ring_x + self.cache_ring.width() + 4 > self.category_badge.x()
-            self.category_badge.move(
-                self.category_badge.x(), self.downloaded_badge.height() + 16 if overlaps else 8
-            )
+        self._sync_download_button()
 
     def set_cache_progress(self, percent: int, cached: int = 0, total: int = 0):
-        """设置本地缓存进度（网格批量预计算后调用，避免卡片各自扫盘）。"""
-        self._pre_cache = (int(percent), int(cached), int(total))
-        self.cache_ring.set_progress(percent, cached, total)
-        self._position_cover_badges()
+        """设置本地缓存进度（网格批量预计算后调用，避免卡片各自扫盘）。
+
+        进度直接画进下载按钮：0 < percent < 100 显示进度条 + 百分比，
+        100% 或已下载标记为真时转为绿色「已下载」。
+        """
+        self._cache = (
+            max(0, min(int(percent), 100)),
+            max(0, int(cached)),
+            max(0, int(total)),
+        )
+        self._sync_download_button()
 
     def refresh_cache_progress(self):
-        """按需自查缓存进度（下载/阅读完成等状态变化后调用）。"""
-        if self._pre_cache is not None:
-            self.cache_ring.set_progress(*self._pre_cache)
-            self._position_cover_badges()
+        """按需自查本地缓存进度（下载/阅读完成等状态变化后调用）。"""
+        if self._cache is not None:
             return
         from ui.reader.cache_index import cache_progress, find_local_dir
 
@@ -580,8 +546,7 @@ class ComicCard(QFrame):
             }
         )
         cached, total, percent = cache_progress(folder, self.comic.image_count)
-        self.cache_ring.set_progress(percent, cached, total)
-        self._position_cover_badges()
+        self.set_cache_progress(percent, cached, total)
 
     def _is_downloaded(self) -> bool:
         """判断当前作品是否已下载（任务完成、数据库标记或下载目录文件夹）。
@@ -597,30 +562,85 @@ class ComicCard(QFrame):
 
         return is_downloaded(self.comic.detail_url, self.comic.title)
 
+    def _is_download_complete(self) -> bool:
+        """本地是否已齐全：已下载标记为真，或缓存进度已满 100%。
+
+        0 < 进度 < 100 一律算未完成：下载目录里只有一部分图片时，
+        按钮要显示进度条，而不是绿色「已下载」。
+        """
+        percent, _cached, total = self._cache or (0, 0, 0)
+        if 0 < percent < 100:
+            return False
+        return self._is_downloaded() or (total > 0 and percent >= 100)
+
     def _sync_download_button(self, task: DownloadTask | None = None):
-        """根据下载管理器中的任务状态，同步按钮文本与可用性。
+        """刷新下载按钮——这是作品下载状态的**唯一出口**（封面不再有角标）。
+
+        优先级：进行中任务 > 失败任务 > 已下载/缓存齐全 > 部分缓存 > 未下载。
 
         Args:
             task: 定向信号传入的本作品任务（免遍历任务列表）；None 时自行查找。
         """
         if task is None:
             task = self._manager.task_for(self.comic)
-        if task is None:
-            self.download_btn.setEnabled(True)
-            self.download_btn.setText("下载")
+
+        if task is not None and task.status in (
+            DownloadTask.WAITING,
+            DownloadTask.DOWNLOADING,
+        ):
+            percent = self._percent(task.current, task.total)
+            text = "下载中" if percent is None else f"{percent}%"
+            self.download_btn.set_status(
+                text, "primary", percent, self._task_tooltip(task, percent)
+            )
+            self.download_btn.setEnabled(False)
             return
 
-        if task.status in (DownloadTask.WAITING, DownloadTask.DOWNLOADING):
-            self.download_btn.setEnabled(False)
-            self.download_btn.setText("下载中...")
-        elif task.status == DownloadTask.DONE:
+        if task is not None and task.status == DownloadTask.FAILED:
+            self.download_btn.set_status(
+                "重试", "danger", None, task.error or "下载失败，点击重试"
+            )
             self.download_btn.setEnabled(True)
-            self.download_btn.setText("已下载")
-            self.downloaded_badge.setVisible(True)
-            self._position_cover_badges()
-        elif task.status == DownloadTask.FAILED:
+            return
+
+        percent, cached, total = self._cache or (0, 0, 0)
+        if 0 < percent < 100:
+            # 在线观看/部分下载：按钮变进度条；此处已知是部分缓存，
+            # 无需再走一次已下载查询（省掉每卡一次全表遍历 + stat）
+            self.download_btn.set_status(
+                f"{percent}%",
+                "primary",
+                percent,
+                # 提示分两行：第一行是缓存进度，第二行说明点击的后果
+                f"本地已缓存 {cached} / {total} 张（{percent}%）\n点击下载全本",
+            )
             self.download_btn.setEnabled(True)
-            self.download_btn.setText("重试")
+            return
+
+        if self._is_download_complete():
+            self.download_btn.set_status(
+                "已下载", "success", None, "已在本地，不会重复下载"
+            )
+        else:
+            self.download_btn.set_status("下载", "primary", None, "下载到本地")
+        self.download_btn.setEnabled(True)
+
+    @staticmethod
+    def _percent(current: int, total: int) -> int | None:
+        """计算进度百分比；总数未知（total <= 0）时返回 None。"""
+        if total <= 0:
+            return None
+        return max(0, min(int(current * 100 / total), 100))
+
+    @staticmethod
+    def _task_tooltip(task: DownloadTask, percent: int | None) -> str:
+        """下载中任务的悬停提示：阶段 + 数量 + 百分比。"""
+        parts = [task.stage or "下载中"]
+        if task.total > 0:
+            parts.append(f"{task.current} / {task.total}")
+        if percent is not None:
+            parts.append(f"{percent}%")
+        return " · ".join(parts)
 
     def contextMenuEvent(self, event: QContextMenuEvent):
         """右键卡片弹出上下文菜单：复制/翻译作品名称。
@@ -751,7 +771,7 @@ class ComicCard(QFrame):
             )
             return
 
-        self.download_btn.setText("翻译中...")
+        self.download_btn.set_status("翻译中...", "muted")
         self.download_btn.setEnabled(False)
 
         worker = TranslateWorker(

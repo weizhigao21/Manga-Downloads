@@ -2,7 +2,7 @@
 
 > 项目地址：<https://github.com/weizhigao21/Manga-Downloads>
 >
-> 当前版本：v1.3.9（更新日志见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：v1.3.10（更新日志见 [CHANGELOG.md](CHANGELOG.md)）
 
 基于 PySide6 的 wnacg.com（紳士漫畫）桌面浏览器与下载工具，支持分类浏览、关键词搜索、封面缓存、多模式下载与断点续传。
 

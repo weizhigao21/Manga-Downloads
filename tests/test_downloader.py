@@ -191,7 +191,8 @@ class TestWriteTitleInfo:
         data = json.loads(info_path.read_text(encoding="utf-8"))
         assert data["original_title"] == "[社团] オリジナルタイトル [タグ]"
         assert data["translated_title"] == "[社团] 原创标题 [标签]"
-        # 不包含 detail_url 字段
+        # 只存作品 ID，不存 detail_url
+        assert data["aid"] == "10001"
         assert "detail_url" not in data
 
     def test_empty_translated_title(self, tmp_path):
@@ -274,6 +275,84 @@ class TestResolveSaveDir:
         comic = {"title": "我的作品", "detail_url": "/x-aid-42.html"}
         resolved = _resolve_save_dir(target, comic)
         assert resolved == tmp_path / "作品 (42)"
+
+
+    def test_same_title_different_aid_is_not_merged(self, tmp_path):
+        """标题相同但 aid 不同 = 两部不同作品，必须另建目录而不是合并。"""
+        import json
+
+        from src.downloader import _resolve_save_dir
+
+        target = tmp_path / "作品"
+        target.mkdir()
+        (target / "title_info.json").write_text(
+            json.dumps({"original_title": "作品", "aid": "111"}), encoding="utf-8"
+        )
+        comic = {"title": "作品", "detail_url": "/x-aid-222.html"}
+        assert _resolve_save_dir(target, comic) == tmp_path / "作品 (222)"
+
+
+class TestEnsureTitleInfo:
+    """阅读缓存目录补写归属信息：让下载侧认得出是同一部作品。"""
+
+    def test_writes_when_missing(self, tmp_path):
+        import json
+
+        from src.downloader import _ensure_title_info
+
+        folder = tmp_path / "作品"
+        folder.mkdir()
+        _ensure_title_info(
+            folder,
+            {"title": "作品", "translated_title": "", "detail_url": "/x-aid-7.html"},
+        )
+        data = json.loads((folder / "title_info.json").read_text(encoding="utf-8"))
+        assert data["original_title"] == "作品"
+        assert data["aid"] == "7"
+
+    def test_keeps_existing_file(self, tmp_path):
+        """已有 title_info.json 不覆盖（可能带着更完整的翻译名）。"""
+        import json
+
+        from src.downloader import _ensure_title_info
+
+        (tmp_path / "title_info.json").write_text(
+            json.dumps(
+                {"original_title": "旧名", "translated_title": "翻译名", "aid": "7"}
+            ),
+            encoding="utf-8",
+        )
+        _ensure_title_info(tmp_path, {"title": "新名", "detail_url": "/x-aid-7.html"})
+        data = json.loads((tmp_path / "title_info.json").read_text(encoding="utf-8"))
+        assert data["original_title"] == "旧名"
+        assert data["translated_title"] == "翻译名"
+
+    def test_reader_cache_dir_is_reused_by_download(self, tmp_path):
+        """回归：在线阅读缓存过的目录，点「下载全本」后必须是同一个目录。
+
+        旧行为：阅读器建目录时没写 title_info.json，下载侧认不出是同一作品，
+        于是另建 "名称 (aid)" 目录  用户在下载文件夹里看到两个名称相近的
+        文件夹，缓存那部分图片白占一份空间。
+        """
+        from src.downloader import (
+            _download_folder_name,
+            _ensure_title_info,
+            _resolve_save_dir,
+        )
+
+        comic = {
+            "title": "冲突作品",
+            "translated_title": "",
+            "detail_url": "/albums-show-aid-390583.html",
+            "category_label": "AI_图集",
+        }
+        folder = tmp_path / _download_folder_name(comic, True)
+        folder.mkdir(parents=True)
+        (folder / "1.jpg").write_bytes(b"x")
+
+        assert _resolve_save_dir(folder, comic).name.endswith("(390583)")
+        _ensure_title_info(folder, comic)
+        assert _resolve_save_dir(folder, comic) == folder
 
 
 class TestSafeZipMembers:

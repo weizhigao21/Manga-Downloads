@@ -553,6 +553,63 @@ class TestPageNamingConsistency:
         assert session._local_by_page(4) is None
 
 
+    def test_download_one_writes_title_info(self, tmp_path, monkeypatch):
+        """阅读缓存落盘时必须写 title_info.json：下载侧靠它复用同一目录。"""
+        import json
+
+        from ui.reader.page_provider import ReaderSession
+
+        base = tmp_path / "Download"
+        base.mkdir()
+        idx = ReaderCacheIndex(tmp_path / "reader.db")
+        comic = {
+            "title": "作品T",
+            "detail_url": "/photos-index-page-1-aid-77.html",
+            "image_count": 1,
+            "category_label": "單行本",
+        }
+        session = ReaderSession(comic, base_dir=base, index=idx)
+        session.ensure_ready()
+
+        def _fake_download(pictures, save_dir, **kwargs):
+            (Path(save_dir) / f"{pictures[0]['number']}.jpg").write_bytes(b"x")
+            return 0
+
+        monkeypatch.setattr("ui.reader.page_provider.download_pictures", _fake_download)
+        assert session._download_one(1, {"link": "http://x", "number": "1"}) is not None
+
+        data = json.loads(
+            (session.local_dir / "title_info.json").read_text(encoding="utf-8")
+        )
+        assert data["original_title"] == "作品T"
+        assert data["aid"] == "77"
+
+    def test_ensure_ready_backfills_title_info_for_legacy_cache(self, tmp_path):
+        """历史缓存目录（有图片、没 title_info.json）在打开阅读器时补写。"""
+        import json
+
+        from ui.reader.page_provider import ReaderSession
+
+        base = tmp_path / "Download"
+        folder = base / "[單行本] 作品L"
+        folder.mkdir(parents=True)
+        (folder / "1.jpg").write_bytes(b"x")
+        assert not (folder / "title_info.json").exists()
+
+        idx = ReaderCacheIndex(tmp_path / "reader.db")
+        comic = {
+            "title": "作品L",
+            "detail_url": "/photos-index-page-1-aid-55.html",
+            "image_count": 1,
+            "category_label": "單行本",
+        }
+        ReaderSession(comic, base_dir=base, index=idx).ensure_ready()
+
+        data = json.loads((folder / "title_info.json").read_text(encoding="utf-8"))
+        assert data["original_title"] == "作品L"
+        assert data["aid"] == "55"
+
+
 class TestPageNumberFromName:
     """从文件名提取页码：取最后一个数字段。"""
 
@@ -2229,12 +2286,23 @@ class TestComicCardReaderEntry:
         card.read_btn.click()
         assert received == []
 
-    def test_set_cache_progress_updates_ring(self, qapp):
+    def test_set_cache_progress_shows_progress_on_button(self, qapp):
+        """部分缓存：按钮变进度条 + 百分比，封面不再有进度环。"""
         card = self._card(qapp)
         card.set_cache_progress(50, 5, 10)
-        assert card.cache_ring.percent == 50
+        assert card.download_btn.progress == 50
+        assert card.download_btn.text() == "50%"
+        assert card.download_btn.variant == "primary"
+        tooltip = card.download_btn.toolTip()
+        assert "5 / 10" in tooltip
+        # 悬停提示要有第二行说明点击后果，否则用户不知道进度条能点
+        assert "点击下载全本" in tooltip
+        assert tooltip.count("\n") == 1
+        assert not hasattr(card, "cache_ring")
+        assert not hasattr(card, "downloaded_badge")
 
-    def test_progress_ring_sits_beside_downloaded_badge(self, qapp):
+    def test_downloaded_card_has_no_cover_badge(self, qapp):
+        """已下载：封面左上角不再有角标，只保留绿色「已下载」按钮。"""
         from ui.models import ComicItem
         from ui.widgets.comic_card import ComicCard
 
@@ -2249,26 +2317,25 @@ class TestComicCardReaderEntry:
         card.set_cache_progress(100, 10, 10)
         card.show()
         qapp.processEvents()
-        assert card.cache_ring.parentWidget() is card.cover_container
-        assert card.cache_ring.x() >= card.downloaded_badge.geometry().right()
-        assert card.cache_ring.width() == card.downloaded_badge.height()
-        assert card.cache_ring.height() == card.downloaded_badge.height()
-        assert card.cache_ring.y() == card.downloaded_badge.y()
-        assert card.cache_ring.isVisible()
-        assert "100%" in card.cache_ring.toolTip()
+        assert not hasattr(card, "downloaded_badge")
+        assert not hasattr(card, "cache_ring")
+        assert card.download_btn.text() == "已下载"
+        assert card.download_btn.variant == "success"
+        assert card.download_btn.is_progress is False
         card.close()
 
-    def test_progress_ring_requires_downloaded_badge(self, qapp):
+    def test_cache_progress_bar_turns_green_when_complete(self, qapp):
+        """未满 100% 显示进度条；满 100% 转为绿色「已下载」实心按钮。"""
         card = self._card(qapp)
-        card.downloaded_badge.hide()
         card.set_cache_progress(50, 5, 10)
-        card.show()
-        qapp.processEvents()
-        assert not card.cache_ring.isVisible()
+        assert card.download_btn.is_progress is True
+        assert card.download_btn.variant == "primary"
+        assert card.download_btn.text() == "50%"
 
-        card.downloaded_badge.show()
-        card._position_cover_badges()
-        assert card.cache_ring.isVisible()
+        card.set_cache_progress(100, 10, 10)
+        assert card.download_btn.is_progress is False
+        assert card.download_btn.text() == "已下载"
+        assert card.download_btn.variant == "success"
         card.close()
 
     def test_context_menu_contains_read_action(self, qapp):
@@ -2317,9 +2384,9 @@ class TestGridCacheProgress:
         card = grid._cards[0]
         grid.show()
         qapp.processEvents()
-        assert card.cache_ring.percent == 50
-        assert card.cache_ring.isVisible()
-        assert "5 / 10" in card.cache_ring.toolTip()
+        assert card.download_btn.progress == 50
+        assert card.download_btn.text() == "50%"
+        assert "5 / 10" in card.download_btn.toolTip()
         grid.close()
 
     def test_render_sets_ring_from_local_dir(self, qapp, tmp_path, monkeypatch):
@@ -2348,13 +2415,15 @@ class TestGridCacheProgress:
             )
         ]
         grid.render(comics)
-        assert grid._cards[0].cache_ring.percent == 50
-        assert not grid._cards[0].downloaded_badge.isHidden()
+        card = grid._cards[0]
+        assert card.download_btn.progress == 50
+        assert card.download_btn.text() == "50%"
         grid.update_cache_progress(comics[0].detail_url, 10, 10)
-        assert grid._cards[0].cache_ring.percent == 100
-        assert "10 / 10" in grid._cards[0].cache_ring.toolTip()
+        assert card.download_btn.is_progress is False
+        assert card.download_btn.text() == "已下载"
+        assert card.download_btn.variant == "success"
 
-    def test_reader_progress_and_close_refresh_downloaded_badge(
+    def test_reader_progress_and_close_refresh_button(
         self, qapp, tmp_path, monkeypatch
     ):
         from ui.models import ComicItem
@@ -2382,17 +2451,19 @@ class TestGridCacheProgress:
         grid.show()
         qapp.processEvents()
         card = grid._cards[0]
-        assert card.downloaded_badge.isHidden()
+        assert card.download_btn.text() == "下载"
+        assert card.download_btn.is_progress is False
 
-        # 阅读过程中一张图片落盘，角标应立即出现。
+        # 阅读过程中一张图片落盘：按钮立即变进度条（不再是"已下载"角标）。
         grid.update_cache_progress(comic.detail_url, 1, 3)
-        assert not card.downloaded_badge.isHidden()
-        assert card.cache_ring.percent == 33
+        assert card.download_btn.text() == "33%"
+        assert card.download_btn.progress == 33
+        assert card.download_btn.variant == "primary"
 
-        # 窗口关闭时重新核对实际文件，补上最后完成的缓存数量。
+        # 窗口关闭时重新核对实际文件，缓存补齐后转为绿色「已下载」。
         _make_folder(base, "[單行本] 窗口测试作品", 3)
         grid.refresh_comic_status(comic.detail_url)
-        assert not card.downloaded_badge.isHidden()
-        assert card.cache_ring.percent == 100
-        assert "3 / 3" in card.cache_ring.toolTip()
+        assert card.download_btn.text() == "已下载"
+        assert card.download_btn.variant == "success"
+        assert card.download_btn.is_progress is False
         grid.close()

@@ -70,24 +70,8 @@ QPushButton#pageButton:disabled {{
     border: 1px solid {PALETTE["border"]};
 }}
 
-QPushButton#downloadButton {{
-    background-color: {PALETTE["primary"]};
-    color: white;
-    border: none;
-    border-radius: 6px;
-    padding: 4px 14px;
-    font-size: 13px;
-    font-weight: 500;
-}}
-
-QPushButton#downloadButton:hover {{
-    background-color: {PALETTE["primary_hover"]};
-}}
-
-QPushButton#downloadButton:disabled {{
-    background-color: {PALETTE["border"]};
-    color: {PALETTE["text_secondary"]};
-}}
+/* 卡片下载按钮（#downloadButton）由 DownloadStatusButton 自行绘制：
+   进度条 / 百分比 / 绿色完成态都随状态变化，不在此处定义样式。 */
 
 QLineEdit {{
     background-color: {PALETTE["surface"]};
