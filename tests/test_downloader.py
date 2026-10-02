@@ -96,6 +96,35 @@ class TestDownloadPicturesResume:
         assert target.read_bytes() == b"existing"  # 文件未被覆盖
         assert progress == [(1, 1)]
 
+    def test_skips_same_page_with_other_extension(self, tmp_path, monkeypatch):
+        """同一页本地已有就跳过  扩展名不同也算同一页。
+
+        回归：阅读缓存写 001.jpg，整包解压出 001.webp；旧实现只比文件名，
+        判定为"不存在"，于是同一页又下一份 .jpg，目录里同页存两份。
+        """
+        from src.wnacg_crawler import download_pictures
+
+        (tmp_path / "001.webp").write_bytes(b"from-zip")
+        requested: list[str] = []
+
+        def fake_get(url, **kwargs):
+            requested.append(url)
+            return self._fake_response()
+
+        monkeypatch.setattr("src.wnacg_crawler.requests.get", fake_get)
+
+        progress: list[tuple[int, int]] = []
+        download_pictures(
+            [{"link": "https://img.example.com/001.jpg", "number": "001"}],
+            tmp_path,
+            progress_callback=lambda cur, total: progress.append((cur, total)),
+        )
+
+        assert requested == []  # 同页已存在，不发起网络请求
+        assert not (tmp_path / "001.jpg").exists()  # 也不再写出第二种格式
+        assert (tmp_path / "001.webp").read_bytes() == b"from-zip"
+        assert progress == [(1, 1)]
+
     def test_downloads_missing_file(self, tmp_path, monkeypatch):
         from src.wnacg_crawler import download_pictures
 
@@ -431,6 +460,52 @@ class TestSafeZipMembers:
         out = tmp_path / "out"
         _extract_archive(archive, out)
         assert (out / "a" / "b.txt").read_bytes() == b"content"
+
+
+class TestExtractPrunesSamePageCache:
+    """整包解压后必须清掉同页旧缓存，否则同一页以两种扩展名各存一份。"""
+
+    @staticmethod
+    def _make_zip(path, names: list[str]) -> None:
+        with zipfile.ZipFile(path, "w") as zf:
+            for name in names:
+                zf.writestr(name, "archive-content")
+
+    def test_prunes_cached_copy_of_same_page(self, tmp_path):
+        from src.downloader import _extract_archive
+
+        archive = tmp_path / "ok.zip"
+        self._make_zip(archive, ["001.webp", "002.webp"])
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "001.jpg").write_bytes(b"cached-page-1")  # 阅读时缓存的第一页
+        (out / "003.jpg").write_bytes(b"cached-page-3")  # 压缩包没有第 3 页
+        (out / "title_info.json").write_text("{}", encoding="utf-8")
+
+        _extract_archive(archive, out)
+
+        # 第 1 页的旧缓存被解压出的原件取代；不存在同页两份
+        assert not (out / "001.jpg").exists()
+        assert (out / "001.webp").read_bytes() == b"archive-content"
+        assert (out / "002.webp").exists()
+        # 压缩包没有的页、以及非图片文件都必须保留
+        assert (out / "003.jpg").read_bytes() == b"cached-page-3"
+        assert (out / "title_info.json").exists()
+
+    def test_keeps_everything_when_archive_has_no_numbers(self, tmp_path):
+        """压缩包条目解析不出页码时不误删任何东西。"""
+        from src.downloader import _extract_archive
+
+        archive = tmp_path / "ok.zip"
+        self._make_zip(archive, ["cover.webp"])
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "001.jpg").write_bytes(b"cached-page-1")
+
+        _extract_archive(archive, out)
+
+        assert (out / "001.jpg").exists()
+        assert (out / "cover.webp").exists()
 
 
 class TestExtractWith7z:

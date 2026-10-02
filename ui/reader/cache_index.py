@@ -16,14 +16,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.downloader import _download_folder_name
-from src.utils import safe_filename
+from src.utils import IMAGE_SUFFIXES, page_number_from_name, safe_filename
 
 logger = logging.getLogger(__name__)
-
-# 视为漫画图片的扩展名（小写，含点）
-IMAGE_SUFFIXES = frozenset(
-    {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".avif"}
-)
 
 # 阅读器元数据文件名（与 title_info.json 并列存放，用于断点续读）
 READER_STATE_FILE = "reader_state.json"
@@ -53,26 +48,6 @@ def natural_sort_key(value) -> tuple:
         else:
             parts.append((1, segment.lower()))
     return tuple(parts)
-
-
-def page_number_from_name(name: str) -> int | None:
-    """从文件名中提取页码（数字段），无法判定时返回 None。
-
-    下载侧与压缩包内的图片名普遍以页码/序号命名（`1.jpg`、`0001.jpg`、
-    `page_10.jpg`），因此**文件名里的数字即页码**。取**最后一个**数字段：
-    前缀常含作品 ID 等噪声（如 `aid-99-3.jpg` 的第 3 页），页码总在末尾。
-
-    Returns:
-        解析出的页码（>0）；无数字段或数字为 0 时返回 None。
-    """
-    matches = _DIGITS_RE.findall(str(name))
-    if not matches:
-        return None
-    try:
-        number = int(matches[-1])
-    except ValueError:  # 数字段过长/异常：视为无法判定
-        return None
-    return number if number > 0 else None
 
 
 def index_local_images(folder: Path) -> dict[int, Path]:

@@ -26,7 +26,12 @@ if __package__ in (None, ""):
 from src.config import ProjectConfig
 from src.net import _RETRYABLE_STATUS, _should_retry, _throttle, fetch_with_retry
 from src.net import fetch as _net_fetch
-from src.utils import clean_title_markup, data_root, safe_filename
+from src.utils import (
+    IMAGE_SUFFIXES,
+    clean_title_markup,
+    data_root,
+    safe_filename,
+)
 
 # 项目根目录（src 的上级目录）与配置文件路径
 ROOT_DIR = data_root()
@@ -509,6 +514,17 @@ def download_pictures(
             progress_callback(0, 0)
         return 0
 
+    # 断点续传的判据是「同一页」而不是「完全同名」：阅读缓存写 001.jpg、
+    # 整包解压出 001.webp，主文件名相同、扩展名不同，必须视为同一页跳过，
+    # 否则同一页会以两种格式各存一份。
+    # 只比主文件名（不含扩展名），不按末位数字宽松匹配：合集作品里
+    # 05_01.jpg 与 05_preⅢ_01.png 是不同图，按数字匹配会误判为同一页。
+    existing_stems = {
+        p.stem.lower()
+        for p in save_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+    }
+
     done = 0
     failed: list[Exception] = []
     lock = threading.Lock()
@@ -518,8 +534,9 @@ def download_pictures(
         url = pic["link"]
         # 页码/名称来自网页 HTML（不可信来源），清洗后拼接，防止路径穿越
         target = save_dir / f"{safe_filename(str(pic['number']))}.jpg"
-        # 断点续传：目标文件已存在且非空时跳过，不重复下载
-        if target.exists() and target.stat().st_size > 0:
+        # 断点续传：主文件名相同就认为这一页已在本地（扩展名不同也算），
+        # 不重复下载、也不会再写出一份不同格式的同页副本
+        if target.stem.lower() in existing_stems:
             with lock:
                 done += 1
                 if progress_callback:

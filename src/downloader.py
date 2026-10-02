@@ -24,7 +24,7 @@ if __package__ in (None, ""):
 
 from src.config import ProjectConfig
 from src.net import _throttle, fetch, fetch_page_with_cookies
-from src.utils import display_title_for_comic, safe_filename
+from src.utils import IMAGE_SUFFIXES, display_title_for_comic, safe_filename
 from src.wnacg_crawler import (
     G_URL,
     HEADERS,
@@ -283,6 +283,46 @@ def _safe_zip_members(zf: zipfile.ZipFile) -> list[str]:
     return members
 
 
+def _prune_shadowed_copies(save_dir: Path, archive_names: list[str]) -> int:
+    """删除被压缩包原文件取代的旧缓存副本，保证同一页只留一份。
+
+    阅读器边看边缓存时按 `页码.jpg` 落盘，而整包解压出的是压缩包内的原始
+    文件名（站点多打包成 `001.webp`）：两者**主文件名相同、扩展名不同**，
+    同一页于是存了两份。这里以「主文件名（不含扩展名）相同」为判据，删除
+    被刚解压出的原件取代的旧副本。
+
+    判据刻意不用「末位数字相同」这种更宽松的页码匹配：合集类作品里
+    `05_01.jpg` 与 `05_preⅢ_01.png` 是不同图，末位数字却都是 1，
+    按页码匹配会误删。代价是缓存名与压缩包名连主文件名都不同时
+    （如 `1.jpg` 对 `001.webp`）清不掉，这种由断点续传那侧兜住。
+
+    Returns:
+        删除的文件数。
+    """
+    if not save_dir.is_dir() or not archive_names:
+        return 0
+    keep_names = {PurePosixPath(name.replace("\\", "/")).name for name in archive_names}
+    archive_stems = {Path(name).stem.lower() for name in keep_names if Path(name).stem}
+    if not archive_stems:
+        return 0
+
+    removed = 0
+    for path in save_dir.rglob("*"):
+        if not path.is_file() or path.name in keep_names:
+            continue
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        if path.stem.lower() not in archive_stems:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+            logger.info("清理同页重复副本: %s", path.name)
+        except OSError as exc:
+            logger.warning("清理同页重复副本失败 %s: %s", path.name, exc)
+    return removed
+
+
 def _extract_archive(
     archive_path: Path,
     save_dir: Path,
@@ -312,9 +352,11 @@ def _extract_archive(
             _extract_with_7z(
                 seven_zip, archive_path, save_dir, progress_callback, total_files, base, span
             )
-            return
         except Exception as exc:
             logger.warning("7z 解压失败，回退内置 zipfile: %s", exc)
+        else:
+            _prune_shadowed_copies(save_dir, safe_names)
+            return
 
     logger.info("使用内置 zipfile 解压: %s", archive_path)
     with zipfile.ZipFile(archive_path) as zf:
@@ -323,6 +365,7 @@ def _extract_archive(
             if progress_callback and total_files:
                 pct = min(int(i * span / total_files), span)
                 progress_callback(base + pct, 100)
+    _prune_shadowed_copies(save_dir, safe_names)
 
 
 def _extract_with_7z(

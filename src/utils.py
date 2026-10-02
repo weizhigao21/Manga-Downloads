@@ -60,6 +60,37 @@ def safe_filename(name: str) -> str:
     return name
 
 
+# 视为漫画图片的扩展名（小写，含点）
+IMAGE_SUFFIXES = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".avif"}
+)
+
+_DIGITS_RE = re.compile(r"(\d+)")
+
+
+def page_number_from_name(name: str) -> int | None:
+    """从文件名中提取页码（取最后一个数字段），无法判定时返回 None。
+
+    漫画图片名普遍以页码/序号命名（`1.jpg`、`0001.jpg`、`page_10.jpg`），
+    所以文件名里的数字即页码；取**最后一个**数字段，因为前缀常含作品 ID
+    等噪声（如 `aid-99-3.jpg` 的第 3 页），页码总在末尾。
+
+    这是「同一页在本地只应存在一份」的判据：阅读缓存写 `001.jpg`、整包
+    解压出压缩包原名 `001.webp`，扩展名不同但页码相同，据此识别为同页。
+
+    Returns:
+        解析出的页码（>0）；无数字段或数字为 0 时返回 None。
+    """
+    matches = _DIGITS_RE.findall(str(name))
+    if not matches:
+        return None
+    try:
+        number = int(matches[-1])
+    except ValueError:  # 数字段过长/异常：视为无法判定
+        return None
+    return number if number > 0 else None
+
+
 def data_root() -> Path:
     """返回应用数据根目录（Config 目录的所在位置）。
 
