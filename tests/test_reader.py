@@ -1840,6 +1840,37 @@ class TestReaderWindow:
             assert btn_y > area_top, f"{name} 不应出现在图片区上方"
         window.close()
 
+    def test_loaded_page_exposes_local_path_for_drag(self, qapp, tmp_path):
+        """加载完成后图片区要拿到本地文件路径：拖出时对方才能收到原始文件。"""
+        from ui.reader.reader_window import ReaderWindow
+
+        session, _ = self._session(tmp_path, real_image=True)
+        window = ReaderWindow(self._comic(), session=session)
+        page = session.local_pages()[0]
+        self._emit_loaded(window, 1, page)
+
+        assert window.image_area._source_path == str(page)
+        mime = window.image_area.drag_mime()
+        assert mime is not None
+        assert mime.hasUrls() and mime.hasImage()
+        # toLocalFile() 在 Windows 上返回正斜杠，用 Path 比对分隔符差异
+        assert Path(mime.urls()[0].toLocalFile()) == Path(page)
+        window.close()
+
+    def test_drag_armed_shows_and_restores_status_hint(self, qapp, tmp_path):
+        """长按进入可拖拽态时底部给出提示，退出后恢复显示页码。"""
+        from ui.reader.reader_window import ReaderWindow
+
+        session, _ = self._session(tmp_path, real_image=True)
+        window = ReaderWindow(self._comic(), session=session)
+        self._emit_loaded(window, 1, session.local_pages()[0])
+
+        window.image_area.drag_armed.emit(True)
+        assert "拖" in window.status_label.text()
+        window.image_area.drag_armed.emit(False)
+        assert window.status_label.text() == "第 1 页"
+        window.close()
+
     def test_close_joins_workers(self, qapp, tmp_path):
         """关闭必须**同步等待**后台线程结束（防 QThread 析构崩溃）。
 
@@ -2057,6 +2088,166 @@ class TestReaderWindow:
 
         assert requested == [2], f"翻页只应取第 2 页，实际请求 {requested}"
         window.close()
+
+
+class TestImageDragOut:
+    """阅读器图片拖出：长按才可拖、拖拽数据带文件 URL 与图像数据。"""
+
+    @staticmethod
+    def _area(tmp_path):
+        from PySide6.QtGui import QPixmap
+
+        from ui.reader.reader_window import _ImageArea
+
+        path = tmp_path / "001.webp"
+        path.write_bytes(b"fake-image")
+        area = _ImageArea()
+        area.resize(400, 300)
+        pixmap = QPixmap(20, 10)
+        pixmap.fill()
+        area.set_source(pixmap, path)
+        return area
+
+    @staticmethod
+    def _move(area, x, y):
+        """构造带左键按下的移动事件（QTest.mouseMove 不带按键状态）。"""
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+
+        area.mouseMoveEvent(
+            QMouseEvent(
+                QEvent.MouseMove,
+                QPointF(x, y),   # localPos
+                QPointF(x, y),   # globalPos
+                Qt.NoButton,
+                Qt.LeftButton,
+                Qt.NoModifier,
+            )
+        )
+
+    def test_drag_mime_carries_url_and_image(self, qapp, tmp_path):
+        """文件 URL 与图像数据都要给：前者保原始画质与文件名，后者兼容只认位图的程序。"""
+        mime = self._area(tmp_path).drag_mime()
+        assert mime is not None
+        assert mime.hasUrls() and mime.hasImage()
+        assert mime.urls()[0].toLocalFile().endswith("001.webp")
+
+    def test_no_pixmap_means_no_drag(self, qapp, tmp_path):
+        area = self._area(tmp_path)
+        area.set_source(None)
+        assert area.drag_mime() is None
+
+    def test_long_press_arms_then_release_disarms(self, qapp, tmp_path):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        area = self._area(tmp_path)
+        armed = []
+        area.drag_armed.connect(armed.append)
+
+        QTest.mousePress(area, Qt.LeftButton, pos=QPoint(10, 10))
+        assert area._drag_ready is False  # 刚按下还没到长按时间
+        QTest.qWait(area.LONG_PRESS_MS + 150)
+        assert area._drag_ready is True
+        assert armed == [True]
+
+        QTest.mouseRelease(area, Qt.LeftButton, pos=QPoint(10, 10))
+        assert area._drag_ready is False
+        assert armed == [True, False]
+
+    def test_move_before_long_press_does_not_drag(self, qapp, tmp_path, monkeypatch):
+        """没到长按时间就移动不应发起拖拽，否则手抖会让点击翻页失灵。"""
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        area = self._area(tmp_path)
+        started = []
+        monkeypatch.setattr(area, "_start_drag", lambda: started.append(True))
+
+        QTest.mousePress(area, Qt.LeftButton, pos=QPoint(10, 10))
+        self._move(area, 200, 10)
+        assert started == []
+
+    def test_move_after_long_press_starts_drag(self, qapp, tmp_path, monkeypatch):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        area = self._area(tmp_path)
+        started = []
+        monkeypatch.setattr(area, "_start_drag", lambda: started.append(True))
+
+        QTest.mousePress(area, Qt.LeftButton, pos=QPoint(10, 10))
+        QTest.qWait(area.LONG_PRESS_MS + 150)
+        self._move(area, 200, 10)
+        assert started == [True]
+
+    def test_release_after_drag_does_not_flip_page(self, qapp, tmp_path, monkeypatch):
+        """拖出图片那次手势松手时不能再触发翻页。"""
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        area = self._area(tmp_path)
+        flipped = []
+        area.clicked_right.connect(lambda: flipped.append(True))
+        monkeypatch.setattr(
+            area, "_start_drag", lambda: setattr(area, "_dragging", True)
+        )
+
+        QTest.mousePress(area, Qt.LeftButton, pos=QPoint(10, 10))
+        QTest.qWait(area.LONG_PRESS_MS + 150)
+        self._move(area, 200, 10)  # 这里会走 _start_drag，进入拖拽中
+        QTest.mouseRelease(area, Qt.LeftButton, pos=QPoint(200, 10))
+        assert flipped == []
+
+    def test_start_drag_hands_mime_to_qdrag(self, qapp, tmp_path, monkeypatch):
+        """_start_drag 把拖拽数据交给 QDrag，并以 CopyAction 发起（不进入真实 DnD 循环）。"""
+        from PySide6.QtCore import Qt
+
+        from ui.reader import reader_window as rw
+
+        calls = {}
+
+        class FakeDrag:
+            def __init__(self, parent):
+                calls["parent"] = parent
+
+            def setMimeData(self, mime):
+                calls["mime"] = mime
+
+            def setPixmap(self, pixmap):
+                calls["pixmap"] = pixmap
+
+            def setHotSpot(self, point):
+                calls["hotspot"] = point
+
+            def exec(self, action):
+                calls["action"] = action
+                return action
+
+        monkeypatch.setattr(rw, "QDrag", FakeDrag)
+        area = self._area(tmp_path)
+        area._start_drag()
+
+        assert calls["parent"] is area
+        assert calls["mime"].hasUrls() and calls["mime"].hasImage()
+        assert calls["action"] == Qt.CopyAction
+        assert not calls["pixmap"].isNull(), "拖动时应带缩略图跟随光标"
+        assert area._drag_ready is False
+
+    def test_quick_click_still_flips_page(self, qapp, tmp_path):
+        """普通点击（未长按）仍按左右半屏翻页，行为不变。"""
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        area = self._area(tmp_path)
+        right, left = [], []
+        area.clicked_right.connect(lambda: right.append(True))
+        area.clicked_left.connect(lambda: left.append(True))
+
+        QTest.mouseClick(area, Qt.LeftButton, pos=QPoint(350, 150))
+        QTest.mouseClick(area, Qt.LeftButton, pos=QPoint(50, 150))
+        assert right == [True]
+        assert left == [True]
 
 
 class TestStaleResultGuard:

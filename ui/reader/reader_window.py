@@ -15,10 +15,12 @@
 """
 import logging
 import time
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDrag, QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -37,22 +39,65 @@ from ui.threads import register
 logger = logging.getLogger(__name__)
 
 
+def build_image_drag_mime(path, image) -> QMimeData:
+    """构造拖出图片用的拖拽数据：本地文件 URL + 原始图像数据。
+
+    两者都给是为了兼容不同接收方：
+    - 只给 URL：只认图像数据的程序（部分聊天窗口、画图类）收不到；
+    - 只给图像数据：文件管理器/图库拿不到原始文件名，也可能被重新编码。
+    """
+    mime = QMimeData()
+    if path:
+        mime.setUrls([QUrl.fromLocalFile(str(Path(path).resolve()))])
+    if image is not None and not image.isNull():
+        mime.setImageData(image)
+    return mime
+
+
 class _ImageArea(QLabel):
-    """图片显示区：等比缩放适配，并支持左右半屏点击翻页。"""
+    """图片显示区：等比缩放适配、左右半屏点击翻页，长按后可把图片拖出到其他程序。
+
+    拖拽做成「长按后再拖」而不是直接拖动：图片区同时承担点击翻页，若一按下
+    就能拖，轻微手抖会被判成拖拽、点击翻页会失灵。按住不动超过 LONG_PRESS_MS
+    进入可拖拽态（光标变手型、底部提示），此后再移动才真正发起拖拽。
+    """
 
     clicked_left = Signal()
     clicked_right = Signal()
+    # 进入/退出「可拖拽」态：由窗口在底部状态栏给出文字提示
+    drag_armed = Signal(bool)
+
+    # 长按判定阈值：按住不动超过该毫秒数才允许拖出
+    LONG_PRESS_MS = 350
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.setMinimumSize(1, 1)
+        self.setToolTip("点击左右半屏翻页；长按后拖动可把图片拖到其他程序")
         self._source: QPixmap | None = None
+        self._source_path: str = ""
+        self._press_pos = None
+        self._drag_ready = False
+        self._dragging = False
+        # 长按定时器：按下后不动，到点进入可拖拽态
+        self._long_press_timer = QTimer(self)
+        self._long_press_timer.setSingleShot(True)
+        self._long_press_timer.setInterval(self.LONG_PRESS_MS)
+        self._long_press_timer.timeout.connect(self._on_long_press)
 
-    def set_source(self, pixmap: QPixmap | None):
-        """设置原图；窗口尺寸变化时按当前尺寸重新缩放。"""
+    def set_source(self, pixmap: QPixmap | None, path=None):
+        """设置原图与对应的本地文件路径；窗口尺寸变化时按当前尺寸重新缩放。
+
+        path 是拖拽要用的：只有给出文件 URL，对方程序才能拿到原始画质与
+        原始文件名，而不是本控件缩放后的位图。
+        """
         self._source = pixmap
+        self._source_path = (
+            str(path) if path and pixmap is not None and not pixmap.isNull() else ""
+        )
+        self._stop_long_press()
         self._rescale()
 
     def _rescale(self):
@@ -70,9 +115,94 @@ class _ImageArea(QLabel):
         super().resizeEvent(event)
         self._rescale()
 
-    def mouseReleaseEvent(self, event):
-        """点击左半屏上一页、右半屏下一页（与主流阅读器一致）。"""
+    # ---- 长按拖出到其他程序 ----
+
+    def _stop_long_press(self):
+        """复位长按/拖拽手势状态（翻页、切图、鼠标松开时都要调）。"""
+        self._long_press_timer.stop()
+        armed = self._drag_ready
+        self._drag_ready = False
+        self._dragging = False
+        self._press_pos = None
+        self.unsetCursor()
+        if armed:
+            self.drag_armed.emit(False)
+
+    def _on_long_press(self):
+        """按住不动到点：进入可拖拽态，给出光标与文字反馈。"""
+        if self._press_pos is None or self._source is None:
+            return
+        self._drag_ready = True
+        self.setCursor(Qt.OpenHandCursor)
+        self.drag_armed.emit(True)
+
+    def drag_mime(self) -> QMimeData | None:
+        """当前图片的拖拽数据；没有图片时返回 None。"""
+        if self._source is None or self._source.isNull():
+            return None
+        return build_image_drag_mime(self._source_path, self._source.toImage())
+
+    def _start_drag(self):
+        """发起拖拽：进入 Qt 的 DnD 事件循环，直到对方接收或取消。"""
+        mime = self.drag_mime()
+        if mime is None:
+            self._stop_long_press()
+            return
+        self._dragging = True
+        self._long_press_timer.stop()
+        self.setCursor(Qt.ClosedHandCursor)
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        # 跟随光标的缩略图用**当前显示尺寸**，避免拖一张巨图当预览
+        preview = self.pixmap()
+        if preview is not None and not preview.isNull():
+            thumb = preview.scaled(
+                160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            drag.setPixmap(thumb)
+            drag.setHotSpot(thumb.rect().center())
+        drag.exec(Qt.CopyAction)
+        # exec 返回即本次拖拽结束；_dragging 留到鼠标松开再清，
+        # 否则松手时会被当成一次点击而翻页
+        self._drag_ready = False
+        self._press_pos = None
+        self.unsetCursor()
+        self.drag_armed.emit(False)
+
+    def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self._source is not None:
+            self._press_pos = event.position().toPoint()
+            self._drag_ready = False
+            self._dragging = False
+            self._long_press_timer.start()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """长按就绪后再移动超过拖拽阈值，才真正发起拖出。"""
+        if (
+            self._drag_ready
+            and not self._dragging
+            and self._press_pos is not None
+            and event.buttons() & Qt.LeftButton
+            and (event.position().toPoint() - self._press_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self._start_drag()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """点击左半屏上一页、右半屏下一页（与主流阅读器一致）。
+
+        拖出图片的那次手势不再翻页；只长按没有拖走仍按普通点击处理。
+        """
+        dragged = self._dragging
+        self._stop_long_press()
+        if (
+            not dragged
+            and event.button() == Qt.LeftButton
+            and self._source is not None
+        ):
             if event.position().x() < self.width() / 2:
                 self.clicked_left.emit()
             else:
@@ -131,6 +261,7 @@ class ReaderWindow(QWidget):
         self.image_area = _ImageArea()
         self.image_area.clicked_left.connect(self.go_prev)
         self.image_area.clicked_right.connect(self.go_next)
+        self.image_area.drag_armed.connect(self._on_drag_armed)
         root.addWidget(self.image_area, stretch=1)
 
         # 底部工具条分两行，避免状态文字把竖图窗口撑得过宽
@@ -328,7 +459,7 @@ class ReaderWindow(QWidget):
         self.setUpdatesEnabled(False)
         try:
             self._fit_window_to_image(pixmap)
-            self.image_area.set_source(pixmap)
+            self.image_area.set_source(pixmap, path)
             self.status_label.setText(f"第 {page_no} 页")
         finally:
             self.setUpdatesEnabled(True)
@@ -393,6 +524,13 @@ class ReaderWindow(QWidget):
                   target_width, target_height)
         if (client.x(), client.y(), client.width(), client.height()) != target:
             self.setGeometry(*target)
+
+    def _on_drag_armed(self, armed: bool):
+        """长按进入/退出可拖拽态时，在底部状态栏给出文字提示。"""
+        if armed:
+            self.status_label.setText("可拖拽：按住图片拖到其他程序")
+        elif self._loaded_page:
+            self.status_label.setText(f"第 {self._loaded_page} 页")
 
     def _on_page_failed(self, seq: int, page_no: int, message: str):
         # 过期请求（用户已翻页）的错误不覆盖当前页提示
