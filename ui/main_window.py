@@ -3,6 +3,7 @@
 负责顶部工具栏（搜索/分类/按钮）、内容区与翻页栏的组装，
 以及列表浏览与关键词搜索两种模式的切换调度。
 """
+import logging
 import re
 
 from PySide6.QtCore import Qt, QTimer
@@ -34,6 +35,8 @@ from ui.styles import LIGHT_THEME_QSS
 from ui.threads import register
 from ui.version import __version__
 from ui.widgets import ComicsGrid, PageBar
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -72,6 +75,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "category_combo"):
             self._current_category_name = self.category_combo.currentText()
         self._load_initial_data()
+        # 启动静默检查更新：延迟到界面加载完再查，失败不打扰（手动入口在
+        # 设置 → 关于与更新）；发现新版本只在状态栏提示一句
+        QTimer.singleShot(3000, self._silent_update_check)
 
     # ---- UI 构建 ----
 
@@ -349,6 +355,22 @@ class MainWindow(QMainWindow):
         self._comics = comics
         self.comics_grid.render(comics)
         self.set_status(f"共 {len(comics)} 部漫画")
+
+    def _silent_update_check(self):
+        """启动后台静默检查更新（只在发现新版本时于状态栏提示一句）。"""
+        from ui.update_dialog import check_updates
+
+        try:
+            check_updates(self, silent=True, on_available=self._on_update_available)
+        except Exception:  # 更新检查绝不能影响主流程
+            logger.exception("启动检查更新失败")
+
+    def _on_update_available(self, release):
+        """静默检查发现新版本：状态栏提示，更新入口在 设置 → 关于与更新。"""
+        logger.info("发现新版本 v%s（当前 v%s）", release.version, __version__)
+        self.set_status(
+            f"发现新版本 v{release.version}，可在「设置 → 关于与更新」中更新"
+        )
 
     def set_status(self, text: str):
         """在左下角状态栏显示提示（超长自动省略，悬停显示全文）。

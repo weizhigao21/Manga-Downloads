@@ -75,7 +75,7 @@ class SettingsDialog(QDialog):
         self.nav_list.setObjectName("settingsNav")
         self.nav_list.setFixedWidth(150)
         self.nav_list.setStyleSheet(_NAV_QSS)
-        for name in ("行为偏好", "名称翻译", "项目配置", "数据库管理"):
+        for name in ("行为偏好", "名称翻译", "项目配置", "数据库管理", "关于与更新"):
             item = QListWidgetItem(name)
             item.setSizeHint(QSize(0, 42))
             self.nav_list.addItem(item)
@@ -86,6 +86,7 @@ class SettingsDialog(QDialog):
         self.stack.addWidget(self._build_translate_page())
         self.stack.addWidget(self._build_config_page())
         self.stack.addWidget(self._build_database_page())
+        self.stack.addWidget(self._build_about_page())
 
         body.addWidget(self.nav_list)
         body.addWidget(self.stack, 1)
@@ -427,6 +428,58 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "完成", "数据库已清空。")
 
     # ---- 入口与保存 ----
+
+    def _build_about_page(self) -> QWidget:
+        """关于与更新：显示版本号，并可手动检查更新。"""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(12)
+
+        heading = QLabel("关于与更新")
+        heading.setStyleSheet("font-size: 15px; font-weight: 600;")
+        v.addWidget(heading)
+
+        from ui.version import __version__
+
+        self.version_label = QLabel(f"当前版本：v{__version__}")
+        self.version_label.setObjectName("aboutVersion")
+        self.version_label.setStyleSheet(
+            f"color: {PALETTE['text']}; font-size: 14px; font-weight: 600;"
+        )
+        v.addWidget(self.version_label)
+
+        hint = QLabel(
+            "更新会从发布页下载完整程序包，替换程序文件并自动重启；"
+            "本地数据（Config/ 数据库与封面、Download/ 已下载漫画、logs/ 日志）"
+            "不会被覆盖或删除。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {PALETTE['text_secondary']}; font-size: 12px;")
+        v.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.check_update_btn = QPushButton("检查更新")
+        self.check_update_btn.setCursor(Qt.PointingHandCursor)
+        self.check_update_btn.clicked.connect(self._on_check_updates)
+        row.addWidget(self.check_update_btn)
+        self.update_status_label = QLabel("")
+        self.update_status_label.setStyleSheet(
+            f"color: {PALETTE['text_secondary']}; font-size: 12px;"
+        )
+        row.addWidget(self.update_status_label)
+        row.addStretch()
+        v.addLayout(row)
+        v.addStretch()
+        return page
+
+    def _on_check_updates(self):
+        """手动检查更新：结果由更新对话框呈现（父窗口用主窗口，避免本对话框先被关闭）。"""
+        from ui.update_dialog import check_updates
+
+        self.update_status_label.setText("正在检查…")
+        owner = self.parent() if isinstance(self.parent(), QWidget) else None
+        check_updates(owner, silent=False)
 
     def _open_database_dialog(self):
         """打开数据库管理窗口。"""
