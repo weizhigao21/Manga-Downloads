@@ -2,7 +2,8 @@
 
 设计要点：
 - **独立非模态窗口**，可同时打开多部作品对比翻阅；
-- 中央图片区 + 底部翻页与播放控制条；
+- 中央图片区；翻页与播放控制条是**独立停靠小窗**（ReaderControlBar）——
+  固定停靠屏幕底部中央，图片窗口可以随图片大小缩放/移动，按钮位置不变；
 - 图片**优先读本地缓存**（ReaderSession 本地优先），未命中才联网补拉；
 - **纯按需加载**：只在用户点「下一页/上一页」时获取该页，不主动预取
   （如需更顺滑的翻页，可在设置里显式开启"后台预取相邻页"）；
@@ -17,20 +18,23 @@ import logging
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDrag, QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
-    QHBoxLayout,
     QInputDialog,
     QLabel,
-    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
+from ui.reader.control_bar import (
+    ReaderControlBar,
+    raise_bar,
+    register_bar,
+    unregister_bar,
+)
 from ui.reader.page_provider import ReaderSession
 from ui.reader.prefetch_worker import PageLoadWorker, PrefetchWorker
 from ui.styles import PALETTE
@@ -239,6 +243,8 @@ class ReaderWindow(QWidget):
         self._slideshow_timer.setSingleShot(True)
         self._slideshow_timer.timeout.connect(self._advance_slideshow)
         self._initial_top_placed = False
+        # 控制条是否已登记/钉屏（showEvent 里一次性完成）
+        self._bar_registered = False
 
         title = self.comic.get("translated_title") or self.comic.get("title") or "阅读"
         self.setWindowTitle(f"阅读 - {title}")
@@ -264,69 +270,31 @@ class ReaderWindow(QWidget):
         self.image_area.drag_armed.connect(self._on_drag_armed)
         root.addWidget(self.image_area, stretch=1)
 
-        # 底部工具条分两行，避免状态文字把竖图窗口撑得过宽
-        bottom = QFrame()
-        bottom.setObjectName("readerBottom")
-        bottom_layout = QVBoxLayout(bottom)
-        bottom_layout.setContentsMargins(12, 6, 12, 6)
-        bottom_layout.setSpacing(2)
-        info_layout = QHBoxLayout()
-        info_layout.setSpacing(8)
-        nav_layout = QHBoxLayout()
-        nav_layout.setSpacing(8)
-
-        self.back_btn = QPushButton("← 返回列表")
-        self.back_btn.setObjectName("readerNavButton")
-        self.back_btn.setCursor(Qt.PointingHandCursor)
-        self.back_btn.setFocusPolicy(Qt.NoFocus)
+        # 控制条：**独立停靠小窗**，固定屏幕底部中央。图片窗口照旧随图片
+        # 宽高自动缩放/移动，按钮的屏幕位置全程不变（用户明确要求：
+        # 「图片窗口可以动，但是按钮不能动」）。控件归控制条所有，窗口侧
+        # 通过属性转发继续以 self.next_btn 等方式访问。
+        self.bar = ReaderControlBar(self)
+        self.back_btn = self.bar.back_btn
+        self.prev_btn = self.bar.prev_btn
+        self.next_btn = self.bar.next_btn
+        self.play_btn = self.bar.play_btn
+        self.status_label = self.bar.status_label
+        self.page_label = self.bar.page_label
+        self.cache_label = self.bar.cache_label
         self.back_btn.clicked.connect(self._on_back_requested)
-        info_layout.addWidget(self.back_btn)
-
-        self.prev_btn = QPushButton("‹ 上一页")
-        self.prev_btn.setObjectName("readerNavButton")
-        self.prev_btn.setCursor(Qt.PointingHandCursor)
-        self.prev_btn.setFocusPolicy(Qt.NoFocus)
-        self.prev_btn.setMinimumWidth(82)
         self.prev_btn.clicked.connect(self.go_prev)
-        nav_layout.addWidget(self.prev_btn)
-
-        self.status_label = QLabel("准备中…")
-        self.status_label.setObjectName("readerStatus")
-        info_layout.addWidget(self.status_label)
-        info_layout.addStretch()
-
-        self.cache_label = QLabel("")
-        self.cache_label.setObjectName("readerCache")
-
-        self.page_label = QLabel("1 / ?")
-        self.page_label.setObjectName("readerPage")
-        self.page_label.setAlignment(Qt.AlignCenter)
-        info_layout.addWidget(self.page_label)
-        info_layout.addStretch()
-        info_layout.addWidget(self.cache_label)
-
-        self.play_btn = QPushButton("▶ 图片播放")
-        self.play_btn.setObjectName("readerPlayButton")
-        self.play_btn.setCursor(Qt.PointingHandCursor)
-        self.play_btn.setFocusPolicy(Qt.NoFocus)
-        self.play_btn.setFixedWidth(100)
-        self.play_btn.clicked.connect(self.toggle_slideshow)
-        nav_layout.addStretch()
-        nav_layout.addWidget(self.play_btn)
-        nav_layout.addStretch()
-
-        self.next_btn = QPushButton("下一页 ›")
-        self.next_btn.setObjectName("readerNavButton")
-        self.next_btn.setCursor(Qt.PointingHandCursor)
-        self.next_btn.setFocusPolicy(Qt.NoFocus)
-        self.next_btn.setMinimumWidth(82)
         self.next_btn.clicked.connect(self.go_next)
-        nav_layout.addWidget(self.next_btn)
+        self.play_btn.clicked.connect(self.toggle_slideshow)
+        # 控制条虽设了 WindowDoesNotAcceptFocus，部分平台仍可能抢到激活；
+        # 点击后主动把激活还给图片窗口，保证方向键/空格翻页不失效
+        for button in (self.back_btn, self.prev_btn, self.next_btn, self.play_btn):
+            button.clicked.connect(self._reclaim_window_activation)
 
-        bottom_layout.addLayout(info_layout)
-        bottom_layout.addLayout(nav_layout)
-
-        root.addWidget(bottom)
+    def _reclaim_window_activation(self):
+        """点击控制条按钮后，确保图片窗口仍是活动窗口（快捷键继续可用）。"""
+        if not self.isActiveWindow():
+            self.activateWindow()
 
     def _bind_shortcuts(self):
         """绑定键盘快捷键（对齐常见阅读器）。"""
@@ -492,20 +460,22 @@ class ReaderWindow(QWidget):
         max_width = max(1, available.width() - frame_width - 24)
         max_height = max(1, available.height() - frame_height - 24)
         layout = self.layout()
-        toolbar_height = layout.itemAt(1).widget().sizeHint().height()
+        # 底部控制条是**独立停靠小窗**（不在本窗口布局内，见 ReaderControlBar）：
+        # 预留它占用的屏幕底边空间，避免高图窗口滑到控制条底下被盖住。
+        bar_reserve = self.bar.sizeHint().height() + 24
         padding = 16
         image_width = pixmap.width() / pixmap.devicePixelRatioF()
         image_height = pixmap.height() / pixmap.devicePixelRatioF()
         scale = min(
             1.0,
             max(1, max_width - padding) / image_width,
-            max(1, max_height - toolbar_height - padding) / image_height,
+            max(1, max_height - bar_reserve) / image_height,
         )
         min_width = max(self.minimumWidth(), layout.minimumSize().width())
         target_width = min(max_width, max(min_width, round(image_width * scale) + padding))
         target_height = min(
             max_height,
-            max(self.minimumHeight(), round(image_height * scale) + toolbar_height + padding),
+            max(self.minimumHeight(), round(image_height * scale) + padding),
         )
         if not self.isVisible():
             if self.size().width() != target_width or self.size().height() != target_height:
@@ -524,6 +494,24 @@ class ReaderWindow(QWidget):
                   target_width, target_height)
         if (client.x(), client.y(), client.width(), client.height()) != target:
             self.setGeometry(*target)
+
+    def moveEvent(self, event):
+        """换屏时把控制条跟到新屏幕底部（同屏内移动不动控制条）。
+
+        控制条固定停靠屏幕底部中央是硬约束（用户要求「按钮不能动」），
+        但读者把窗口拖到另一块显示器时，控制条必须跟着过去，否则会留在
+        旧屏幕上与窗口分离。
+        """
+        super().moveEvent(event)
+        screen = self.screen()
+        if screen is not None and screen is not self.bar.pinned_screen:
+            self.bar.pin_to(screen)
+
+    def changeEvent(self, event):
+        """本窗口被激活时，把它的控制条提为最前（隐藏其他阅读器的控制条）。"""
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            raise_bar(self.bar)
 
     def _on_drag_armed(self, armed: bool):
         """长按进入/退出可拖拽态时，在底部状态栏给出文字提示。"""
@@ -668,8 +656,9 @@ class ReaderWindow(QWidget):
         self.move(left, available.top())
 
     def showEvent(self, event):
-        """首次显示时将窗口置于屏幕顶部中央。"""
+        """首次显示时将窗口置于屏幕顶部中央，并登记/钉住控制条。"""
         super().showEvent(event)
+        self._ensure_bar_shown()
         if self._initial_top_placed or self.isFullScreen():
             return
         screen = self.screen() or QGuiApplication.primaryScreen()
@@ -677,6 +666,28 @@ class ReaderWindow(QWidget):
             return
         self._center_at_screen_top(screen)
         self._initial_top_placed = True
+
+    def _ensure_bar_shown(self):
+        """（可重复调用）登记控制条、钉到当前屏幕底部中央、提为最前。
+
+        显示动作推迟到事件循环的下一拍：在 showEvent 里直接 show 子 Tool
+        窗属于 Qt reentrancy 坑（实测与后台加载线程的信号 emit 并发时
+        offscreen 平台直接 access violation）。
+        """
+        if self._bar_registered:
+            return
+        self._bar_registered = True
+        register_bar(self.bar)
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            self.bar.pin_to(screen)
+        QTimer.singleShot(0, self._raise_bar_deferred)
+
+    def _raise_bar_deferred(self):
+        try:
+            raise_bar(self.bar)
+        except RuntimeError:
+            pass  # 窗口已关闭：无需再置前
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -699,6 +710,9 @@ class ReaderWindow(QWidget):
         self._stop_slideshow()
         self._save_progress()
         self._shutdown_workers()
+        # 注销控制条：关闭它，并把「最前」让给还活着的阅读器
+        unregister_bar(self.bar)
+        self._bar_registered = False
         self.reader_closed.emit()
         super().closeEvent(event)
 
@@ -743,9 +757,10 @@ QWidget {{
     background-color: #1B1D21;
     font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI", sans-serif;
 }}
-QFrame#readerBottom {{
-    background-color: #23262B;
-    border-top: 1px solid #34383F;
+/* 控制条底色由 ReaderControlBar.paintEvent 自绘（带半透明背景的顶层
+   QWidget 不绘制 QSS background），这里只负责清掉标签自己的底色 */
+#readerBottom QLabel {{
+    background: transparent;
 }}
 QLabel#readerStatus {{
     color: #9CA3AF;

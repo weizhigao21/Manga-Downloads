@@ -1565,6 +1565,7 @@ class TestReaderWindow:
     def test_window_centers_at_screen_top_after_each_image_fit(
         self, qapp, tmp_path
     ):
+        """每张图适配后都重新置顶居中（图片窗口该动就动）。"""
         from PySide6.QtGui import QPixmap
 
         from ui.reader.reader_window import ReaderWindow
@@ -1745,37 +1746,223 @@ class TestReaderWindow:
         assert window.findChild(QFrame, "readerTop") is None
         window.close()
 
-    def test_nav_buttons_both_at_bottom(self, qapp, tmp_path):
-        """翻页按钮必须都在图片区下方（用户要求，别改回上下夹图）。
+    def test_nav_buttons_live_in_detached_bar(self, qapp, tmp_path):
+        """翻页/播放按钮在独立控制条里，同处一行（用户要求，别改回上下夹图）。
 
-        上一页、图片播放、下一页同处底部工具条。
+        控制条已从图片窗口剥离（独立停靠小窗），因此「在图片下方」改为
+        「同在控制条内同一行」的结构断言：父容器归属 + 行内 y 对齐。
         """
         from ui.reader.reader_window import ReaderWindow
 
         session, _ = self._session(tmp_path, real_image=True)
         window = ReaderWindow(self._comic(), session=session)
-        window.resize(1000, 720)
         window.show()
         _drain_events(qapp, 3)
 
-        area = window.image_area
-        area_bottom = area.mapTo(window, area.rect().bottomLeft()).y()
-        prev_y = window.prev_btn.mapTo(
-            window, window.prev_btn.rect().topLeft()
-        ).y()
-        next_y = window.next_btn.mapTo(
-            window, window.next_btn.rect().topLeft()
-        ).y()
-        play_y = window.play_btn.mapTo(
-            window, window.play_btn.rect().topLeft()
-        ).y()
+        bar = window.bar
+        assert window.prev_btn.parent() is bar
+        assert window.next_btn.parent() is bar
+        assert window.play_btn.parent() is bar
+        assert bar.isWindow(), "控制条必须是独立窗口"
 
-        assert prev_y > area_bottom, "「上一页」必须在图片下方"
-        assert next_y > area_bottom, "「下一页」必须在图片下方"
-        assert play_y > area_bottom, "「图片播放」必须在图片下方"
+        prev_y = window.prev_btn.mapTo(bar, window.prev_btn.rect().topLeft()).y()
+        next_y = window.next_btn.mapTo(bar, window.next_btn.rect().topLeft()).y()
+        play_y = window.play_btn.mapTo(bar, window.play_btn.rect().topLeft()).y()
         assert abs(prev_y - next_y) <= 4, "两个翻页按钮应在同一行"
         assert abs(prev_y - play_y) <= 4, "图片播放按钮应与翻页按钮同一行"
         window.close()
+
+    def test_control_bar_is_separate_window_pinned_to_screen_bottom(self, qapp, tmp_path):
+        """控制条是独立置顶小窗，固定停靠屏幕可用区域底部中央。"""
+        from PySide6.QtCore import Qt
+
+        from ui.reader.reader_window import ReaderWindow
+
+        session, _ = self._session(tmp_path, count=1)
+        window = ReaderWindow(self._comic(1), session=session)
+        window.show()
+        _drain_events(qapp, 3)
+
+        bar = window.bar
+        assert bar.isWindow()
+        assert bar.parent() is window
+        flags = bar.windowFlags()
+        assert flags & Qt.Tool, "必须是 Tool 窗（不进任务栏、随阅读器关闭）"
+        assert flags & Qt.FramelessWindowHint, "必须无边框"
+        assert flags & Qt.WindowDoesNotAcceptFocus, "不能抢焦点（否则快捷键失效）"
+
+        available = window.screen().availableGeometry()
+        frame = bar.frameGeometry()
+        assert abs(frame.center().x() - available.center().x()) <= 1, "应水平居中"
+        assert abs(frame.bottom() - (available.bottom() - 16)) <= 1, "应贴屏幕底边"
+        window.close()
+
+    def test_bar_stays_put_while_window_fits_each_image(self, qapp, tmp_path, monkeypatch):
+        """图片窗口随图片宽高缩放/移动，控制条与按钮屏幕位置全程不变。
+
+        回归背景：用户最终澄清的诉求——「图片窗口可以动，但是按钮不能动」。
+        竖图→横图切换时窗口会明显变宽，但「下一页」按钮的屏幕坐标必须纹丝
+        不动，连点才不会点空。
+        """
+        from PySide6.QtGui import QImage
+
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=2)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        window = rw.ReaderWindow(self._comic(2), session=session)
+        window.show()
+        _drain_events(qapp)
+
+        portrait = tmp_path / "portrait.jpg"
+        landscape = tmp_path / "landscape.jpg"
+        for path, width, height in ((portrait, 480, 1200), (landscape, 1200, 400)):
+            image = QImage(width, height, QImage.Format_RGB32)
+            image.fill(0x00FF00)
+            assert image.save(str(path))
+
+        window._on_page_loaded(window._load_seq, 1, portrait)
+        _drain_events(qapp)
+        portrait_width = window.width()
+        bar_geo = window.bar.geometry()
+        next_global = window.next_btn.mapToGlobal(window.next_btn.rect().center())
+
+        # 翻到横图：窗口确实变宽（窗口该动就动）……
+        window._page = 2
+        window._load_seq += 1
+        window._on_page_loaded(window._load_seq, 2, landscape)
+        _drain_events(qapp)
+        assert window.width() > portrait_width, "图片窗口应随横图放宽"
+
+        # ……但控制条与按钮的屏幕位置一动不动
+        assert window.bar.geometry() == bar_geo
+        assert window.next_btn.mapToGlobal(
+            window.next_btn.rect().center()
+        ) == next_global
+        window.close()
+
+    def test_two_readers_show_only_front_bar(self, qapp, tmp_path, monkeypatch):
+        """多阅读器并存：只有最前面阅读器的控制条可见，不会两条叠一起。"""
+        from ui.reader import reader_window as rw
+
+        session_a, _ = self._session(tmp_path, count=1)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        window_a = rw.ReaderWindow(self._comic(1), session=session_a)
+        window_a.show()
+        _drain_events(qapp, 3)
+        assert window_a.bar.isVisible()
+
+        session_b, _ = self._session(tmp_path, count=1)
+        window_b = rw.ReaderWindow(self._comic(1), session=session_b)
+        window_b.show()
+        _drain_events(qapp, 3)
+        # B 置前：显示 B 的控制条，隐藏 A 的
+        assert window_b.bar.isVisible()
+        assert not window_a.bar.isVisible()
+
+        # A 重新激活：最前让回 A
+        window_a.activateWindow()
+        _drain_events(qapp, 3)
+        assert window_a.bar.isVisible()
+        assert not window_b.bar.isVisible()
+
+        # B 关闭：A 仍开着，控制条应还给 A
+        window_b.close()
+        _drain_events(qapp, 3)
+        assert window_a.bar.isVisible()
+        window_a.close()
+
+    def test_bar_buttons_drive_paging(self, qapp, tmp_path, monkeypatch):
+        """控制条按钮接线完好：点「下一页」真的翻页（属性转发不断链）。"""
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=2)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        window = rw.ReaderWindow(self._comic(2), session=session)
+        window.show()
+        _drain_events(qapp, 3)
+
+        assert window._page == 1
+        window.next_btn.click()
+        assert window._page == 2
+        window.prev_btn.click()
+        assert window._page == 1
+        window.close()
+
+    def test_control_bar_paints_opaque_card_background(self, qapp, tmp_path, monkeypatch):
+        """控制条必须画出不透明圆角卡片底（回归：整条透明只剩按钮）。
+
+        背景：控制条是**带半透明背景的顶层 QWidget**，QSS 的 background
+        在这种组合下不会被绘制——用户截图里整条透出后面的窗口、只剩按钮
+        和标签自己的深色小方块。改为 paintEvent 自绘后，用离屏 grab 的
+        像素分布把行为钉死。
+        """
+        import collections
+
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=1)
+        monkeypatch.setattr(rw.PageLoadWorker, "start", lambda self: None)
+        window = rw.ReaderWindow(self._comic(1), session=session)
+        window.show()
+        _drain_events(qapp, 3)
+
+        image = window.bar.grab().toImage()
+        counts = collections.Counter()
+        for y in range(image.height()):
+            for x in range(image.width()):
+                color = image.pixelColor(x, y)
+                counts[(color.red(), color.green(), color.blue(), color.alpha())] += 1
+        total = image.width() * image.height()
+
+        # 卡片底色（#23262B）应占主体：按钮/文字之外都是它
+        assert counts[(0x23, 0x26, 0x2B, 255)] > total * 0.4, "控制条底色未绘制"
+        # 圆角：四角在圆角外，应为透明
+        assert image.pixelColor(0, 0).alpha() == 0, "圆角未生效"
+        # 标签清底只能静态守：标签的深色底方块只在真实 Windows 平台渲染
+        # 出来（离屏 grab 复现不出，实测删掉清底像素分布也不变），
+        # 因此改为守「三个标签都显式声明了透明背景」这一决策
+        for label in (window.status_label, window.page_label, window.cache_label):
+            assert "transparent" in label.styleSheet(), "标签未声明透明背景"
+        window.close()
+
+    def test_unclosed_window_bar_does_not_poison_registry(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """窗口未 close 就被 GC：其控制条必须同步清出注册表。
+
+        回归背景：修复前 `_OPEN_BARS` 留着 C++ 已销毁的僵尸 bar 包装器，
+        下一个阅读器 `raise_bar` 调 `parentWidget()` 直接 access violation
+        （整个 pytest 进程崩掉，不是普通断言失败）。靠 QObject.destroyed
+        在析构时同步摘除；本用例复刻「建窗→show→丢弃引用→GC→再开窗」。
+        """
+        import gc
+
+        from ui.reader import control_bar as cb
+        from ui.reader import reader_window as rw
+
+        session, _ = self._session(tmp_path, count=1)
+        window = rw.ReaderWindow(self._comic(1), session=session)
+        window.show()
+        _drain_events(qapp, 8)
+        bar = window.bar
+        assert bar in cb._OPEN_BARS
+        # 等加载线程结束并经 deleteLater 删除 C++ 对象：它与窗口的信号
+        # 连接释放后，窗口才可被 GC（_load_worker 被清空即表示已结束）
+        assert window._load_worker is None
+
+        del window
+        gc.collect()
+        _drain_events(qapp, 5)
+        assert bar not in cb._OPEN_BARS, "已销毁的控制条残留在注册表里"
+
+        # 再开一个阅读器：raise_bar 不得碰到僵尸（否则进程直接崩）
+        session2, _ = self._session(tmp_path, count=1)
+        window2 = rw.ReaderWindow(self._comic(1), session=session2)
+        window2.show()
+        _drain_events(qapp, 5)
+        assert window2.bar.isVisible()
+        window2.close()
 
     def test_slideshow_waits_for_loaded_image_and_stops_at_end(self, qapp, tmp_path, monkeypatch):
         """每张图显示完再计时；翻到末页后自动停止。"""
