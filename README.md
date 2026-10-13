@@ -92,7 +92,7 @@
 │   ├── styles/            # 主题样式
 │   └── widgets/           # 漫画卡片（含下载按钮进度）、网格视图、翻页栏
 ├── tests/                 # pytest 测试套件（398 个用例，离线运行）
-├── tools/                 # 辅助脚本（发布前更新自检 verify_updater.py 等）
+├── tools/                 # 辅助脚本（一键发布 publish_release.py、更新自检 verify_updater.py）
 ├── tools/_archive/        # 开发期残留脚本归档（可安全删除）
 ├── requirements.txt       # 运行依赖
 ├── requirements-dev.txt   # 测试/开发依赖
@@ -201,8 +201,9 @@ pyinstaller 更新程序.spec     # 独立更新程序（单文件，约 8 MB）
 
 1. **发布仓库必须公开**：更新检查走 `https://api.github.com/repos/weizhigao21/Manga-Downloads/releases/latest`，私有仓库匿名访问会 404，终端用户查不到更新（仓库公开后源码也会公开）。
 2. 先把 `ui/version.py` 的版本号升好（`打包.bat` 会据此命名产物与发布包）。
-3. 跑 `打包.bat`，它会在 `dist/` 下生成 **`漫画浏览器-v<版本>.zip`**（内含主程序与更新程序）。
-4. 在 GitHub 建一个 Release，**tag 用 `v<版本>`**（如 `v1.3.14`），把该 zip 作为资源上传——**资源名必须带版本号**，主程序据此识别并下载。
+3. 跑 `打包.bat`，它会在 `dist/` 下生成 **`Manga-Downloads-v<版本>.zip`**（内含主程序与更新程序）。
+4. 跑 **`python tools/publish_release.py`** 一键发布：自动读版本号、用 CHANGELOG 正文做 Release 说明、创建 tag 为 `v<版本>` 的 Release、上传更新包，最后用主程序自己的检查逻辑自检（`--check` 可只看不动）。
+   > 等价的手动方式：在 GitHub 建 Release，tag 用 `v<版本>`（如 `v1.3.14`），把 zip 作为资源上传——**资源名必须带版本号**，主程序据此识别并下载；**资源名必须是纯 ASCII**（GitHub 会静默删掉中文等非 ASCII 字符，`漫画浏览器-v1.3.14.zip` 会变成 `-v1.3.14.zip`），故统一用 `Manga-Downloads-v<版本>.zip`。
 5. 发布前可跑 `python tools/verify_updater.py` 自检：用构建出的 `更新程序.exe` 真实跑一次「新版启动失败 → 回滚」流程，确认用户数据（Config/Download）不被破坏。
 
 > 注意：更新程序是随包分发的，**第一个带更新功能的版本需要用户手动安装**；从该版本起才能应用内更新。

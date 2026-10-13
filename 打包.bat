@@ -151,7 +151,7 @@ if not exist "!DIST_DIR!\漫画浏览器.exe" (
 echo.
 rem ---- 8. 生成发布压缩包（GitHub Release 资源）----
 echo [8/8] 正在压缩发布包（约 30-60 秒）...
-set "ZIP_PATH=%~dp0dist\漫画浏览器-v!VER!.zip"
+set "ZIP_PATH=%~dp0dist\Manga-Downloads-v!VER!.zip"
 if exist "!ZIP_PATH!" del /q "!ZIP_PATH!"
 powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Compress-Archive -Path '!DIST_DIR!\*' -DestinationPath '!ZIP_PATH!' -Force"
 if not exist "!ZIP_PATH!" (
@@ -173,8 +173,8 @@ echo 整个 dist\漫画浏览器-v!VER! 目录即完整程序，可整体拷贝分发。
 echo 更新程序: !DIST_DIR!\更新程序.exe
 echo 发布包:   !ZIP_PATH!
 echo.
-echo 发布到 GitHub Release 时请上传 !ZIP_PATH!（资源名必须带版本号，
-echo 主程序据此识别并下载更新：漫画浏览器-v!VER!.zip）。
+echo 发布到 GitHub Release 时请上传 !ZIP_PATH!（资源名必须带版本号；
+echo GitHub 会删掉资源名里的中文，故包名用纯 ASCII）
 echo.
 explorer "!DIST_DIR!" >nul 2>nul
 pause

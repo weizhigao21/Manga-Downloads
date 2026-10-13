@@ -4,7 +4,7 @@
 
 发布约定（与 `打包.bat` / `更新程序.spec` 配套）：
 - Release tag 形如 `v1.3.14`，与 `ui/version.py::__version__`（`1.3.14`）对齐；
-- 更新包是**整个程序目录的 zip**，名字形如 `漫画浏览器-v1.3.14.zip`，
+- 更新包是**整个程序目录的 zip**，名字形如 `Manga-Downloads-v1.3.14.zip`，
   内含 `漫画浏览器.exe` 与 `_internal/`（与 onedir 产物一致）。
 """
 from __future__ import annotations
