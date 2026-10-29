@@ -22,11 +22,13 @@ DEFAULT_SETTINGS = {
     "db_path": "",
     "covers_dir": "",
     # 在线阅读器
-    # 默认纯按需：只在用户翻页时获取当前这一页，不主动联网拉取其他页。
-    # 三个值必须同时为"关/0/0"，避免只打开总开关就悄悄恢复自动预取。
-    "reader_prefetch_enabled": False,  # 是否后台预取相邻页（关闭则纯按需）
-    "reader_prefetch_ahead": 0,        # 向后预取页数（0-10）
-    "reader_prefetch_behind": 0,       # 向前预取页数（0-10）
+    # 默认预取「当前页之后的 2 页」：翻到第 N 页时后台把 N+1、N+2 取到本地并
+    # 解码进内存窗口缓存，翻下一页基本无需等待。只向后预取（不回看历史页），
+    # 窗口越小请求越省；三个值共同决定预取与内存缓存窗口，关掉开关即退化为
+    # 「纯按需、只留当前页」。
+    "reader_prefetch_enabled": True,  # 是否后台预取相邻页（关闭则纯按需）
+    "reader_prefetch_ahead": 2,       # 向后预取页数（0-10）
+    "reader_prefetch_behind": 0,      # 向前预取页数（0-10）
     "reader_resume": True,             # 打开时续读到上次位置
 }
 
@@ -71,6 +73,7 @@ class AppSettings:
 
     def _load(self):
         self._settings = DEFAULT_SETTINGS.copy()
+        loaded: dict = {}
         if SETTINGS_PATH.exists():
             try:
                 with open(SETTINGS_PATH, encoding="utf-8") as f:
@@ -89,7 +92,45 @@ class AppSettings:
             # 迁移完成后从 settings.json 移除，避免双源不一致
             self._settings.pop("convert_traditional_to_simplified", None)
             self._save_settings()
+        self._migrate_reader_prefetch(loaded)
         self._converter = OpenCC("t2s")  # 繁体转简体
+
+    # 迁移标记：读完设置后写入内存，随设置一起保存（settings.json 里的键名）
+    _PREFETCH_MIGRATION_KEY = "reader_prefetch_migrated"
+
+    def _migrate_reader_prefetch(self, loaded: dict) -> None:
+        """v1.3.15 一次性迁移：把「纯按需」的旧默认值升级为「预取后两页」。
+
+        老用户的 settings.json 里已经落盘了旧默认值（关/0/0），它会盖住新的
+        DEFAULT_SETTINGS——不迁移的话，升级后看起来"新功能没生效"。这里只在
+        **三值都等于旧默认**、且文件里没有迁移标记时改一次；标记落盘后，用户
+        之后自己关掉预取（设置对话框保存会带上标记）不会再被改回来。
+
+        `loaded` 是 settings.json 里**实际存在的键**：用它判断"是否已迁移"
+        而不是看 `self._settings`，因为后者已被默认值打底，永远会有这些键。
+        """
+        if self._PREFETCH_MIGRATION_KEY in loaded:
+            return  # 已迁移过（或用户在新版本里保存过设置）
+        legacy = (
+            self._settings.get("reader_prefetch_enabled") is False
+            and self._clamp_pages(self._settings.get("reader_prefetch_ahead"), 0) == 0
+            and self._clamp_pages(self._settings.get("reader_prefetch_behind"), 0) == 0
+        )
+        if legacy:
+            self._settings["reader_prefetch_enabled"] = DEFAULT_SETTINGS[
+                "reader_prefetch_enabled"
+            ]
+            self._settings["reader_prefetch_ahead"] = DEFAULT_SETTINGS[
+                "reader_prefetch_ahead"
+            ]
+            self._settings["reader_prefetch_behind"] = DEFAULT_SETTINGS[
+                "reader_prefetch_behind"
+            ]
+        self._settings[self._PREFETCH_MIGRATION_KEY] = True
+        if legacy and loaded:
+            # 只在实际改动了已落盘的老值时写盘；新装（无文件）等用户第一次
+            # 保存设置时再一并写入，避免启动即写盘。
+            self._save_settings()
 
     def _save_settings(self):
         """将应用设置写入 settings.json。"""
@@ -179,10 +220,11 @@ class AppSettings:
     def reader_prefetch_enabled(self) -> bool:
         """阅读时是否后台预取相邻页。
 
-        默认 **False**：只在用户翻页时获取当前页（纯按需）。开启后才
-        会提前缓存相邻页以换取更顺滑的翻页，代价是请求更密。
+        默认 **True**：翻页时后台预取当前页之后的 2 页（`reader_prefetch_ahead`），
+        翻下一页几乎无需等待。关掉后回到纯按需——只取当前页，内存里也只
+        保留当前页这一张。
         """
-        return bool(self._settings.get("reader_prefetch_enabled", False))
+        return bool(self._settings.get("reader_prefetch_enabled", True))
 
     @reader_prefetch_enabled.setter
     def reader_prefetch_enabled(self, value: bool):
@@ -199,8 +241,8 @@ class AppSettings:
 
     @property
     def reader_prefetch_ahead(self) -> int:
-        """向后（下一页方向）预取页数（默认 0：不预取）。"""
-        return self._clamp_pages(self._settings.get("reader_prefetch_ahead", 0), 0)
+        """向后（下一页方向）预取页数（默认 2：当前页之后的 2 页）。"""
+        return self._clamp_pages(self._settings.get("reader_prefetch_ahead", 2), 2)
 
     @reader_prefetch_ahead.setter
     def reader_prefetch_ahead(self, value: int):

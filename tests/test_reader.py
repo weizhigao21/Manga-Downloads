@@ -2161,6 +2161,19 @@ class TestReaderWindow:
         window._page = page_no
         window._on_page_loaded(window._load_seq, page_no, path)
 
+    @staticmethod
+    def _wait_until(qapp, predicate, timeout: float = 3.0) -> bool:
+        """派发事件直到 predicate 成立或超时（等跨线程信号落到槽里）。"""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            _drain_events(qapp, rounds=2)
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return predicate()
+
     def _spy_prefetch(self, monkeypatch, window):
         """把 _start_prefetch 换成记录器，返回被调用页码的列表。"""
         called: list[int] = []
@@ -2169,42 +2182,61 @@ class TestReaderWindow:
         )
         return called
 
-    def test_prefetch_default_is_off_in_settings_source(self):
-        """默认开关必须在**唯一事实来源**（DEFAULT_SETTINGS）里就是关闭。
+    def _partial_session(self, tmp_path, local: int = 3, total: int = 12):
+        """本地只有前 local 页、作品共 total 页的会话。
+
+        预取的用例必须用**不完整**的会话：本地已完整的作品会被
+        `_maybe_prefetch` 直接跳过（没有需要补的页），断言就永远是空。
+        """
+        session, idx = self._session(tmp_path, count=local, real_image=True)
+        session.comic["image_count"] = total
+        return session, idx
+
+    def test_prefetch_default_is_next_two_in_settings_source(self):
+        """默认预取「后 2 页」必须写在**唯一事实来源**（DEFAULT_SETTINGS）里。
 
         仅断言 property 的兜底值不够：AppSettings._load 用
         DEFAULT_SETTINGS.copy() 打底，写入 settings.json 的键会覆盖兜底，
-        因此只需把 DEFAULT_SETTINGS 改回 True 即可悄悄恢复自动预取——
-        本用例正是守住这个点。
+        因此只改 property 不影响实际默认行为。本用例守住「默认值是什么」，
+        同时固定「只向后、不回看历史页」的窗口形态（behind=0）。
         """
         from ui.settings import DEFAULT_SETTINGS
 
-        assert DEFAULT_SETTINGS["reader_prefetch_enabled"] is False
-        # 前后页数的默认值也必须与"纯按需"一致（不预取任何一页）
-        assert DEFAULT_SETTINGS["reader_prefetch_ahead"] == 0
+        assert DEFAULT_SETTINGS["reader_prefetch_enabled"] is True
+        assert DEFAULT_SETTINGS["reader_prefetch_ahead"] == 2
         assert DEFAULT_SETTINGS["reader_prefetch_behind"] == 0
 
-    def test_no_prefetch_by_default(self, qapp, tmp_path, monkeypatch):
-        """**默认不做预取**：页显示完成后不得启动任何后台预取线程。
+    def test_prefetch_next_two_from_first_page(self, qapp, tmp_path, monkeypatch):
+        """**从第 1 页起**就为第 2、3 页启动预取（默认配置）。
 
-        这是用户的明确要求——「不需要自动获取，点下一页的时候再获取」。
-        若有人把 _on_page_loaded 里的 _maybe_prefetch 换成无条件
-        _start_prefetch，或把默认开关改回 True，此用例会失败。
+        预取窗口只含「当前页 + 后两页」：第 1 页显示完成后立刻补拉 2、3，
+        不碰第 0 页（不存在）也不越过窗口多取。若有人把默认关掉，或把
+        `_maybe_prefetch` 从显示出口摘掉，此用例会失败。
 
         注意用真实图片：假字节会让 QPixmap 解码失败、回调提前 return，
-        导致守卫变成"假通过"。
+        守卫会变成"假通过"。
         """
         from ui.reader.reader_window import ReaderWindow
+        from ui.settings import DEFAULT_SETTINGS, AppSettings
 
-        session, _ = self._session(tmp_path, real_image=True)
-        window = ReaderWindow(self._comic(), session=session)
+        settings = AppSettings()
+        for key in (
+            "reader_prefetch_enabled",
+            "reader_prefetch_ahead",
+            "reader_prefetch_behind",
+        ):
+            monkeypatch.setitem(settings._settings, key, DEFAULT_SETTINGS[key])
+
+        session, _ = self._partial_session(tmp_path)
+        window = ReaderWindow(self._comic(12), session=session)
         called = self._spy_prefetch(monkeypatch, window)
 
-        # 走完整路径：真实图片 + 页加载完成回调
-        self._emit_loaded(window, 2, session.local_pages()[1])
+        # 走完整路径：真实图片 + 页加载完成回调（第 1 页）
+        self._emit_loaded(window, 1, session.local_pages()[0])
 
-        assert called == [], "默认配置下不允许自动预取"
-        assert window._prefetch_worker is None
+        assert called == [1], "第 1 页显示完成后就应触发预取"
+        assert window._prefetch_window() == (2, 0), "默认只向后预取两页"
+        assert window._image_cache.window == (1, 3), "内存窗口应为当前页+后两页"
         window.close()
 
     def test_prefetch_only_when_explicitly_enabled(self, qapp, tmp_path, monkeypatch):
@@ -2217,8 +2249,8 @@ class TestReaderWindow:
         monkeypatch.setitem(settings._settings, "reader_prefetch_ahead", 2)
         monkeypatch.setitem(settings._settings, "reader_prefetch_behind", 0)
 
-        session, _ = self._session(tmp_path, real_image=True)
-        window = ReaderWindow(self._comic(), session=session)
+        session, _ = self._partial_session(tmp_path)
+        window = ReaderWindow(self._comic(12), session=session)
         called = self._spy_prefetch(monkeypatch, window)
         self._emit_loaded(window, 3, session.local_pages()[2])
 
@@ -2237,26 +2269,39 @@ class TestReaderWindow:
         monkeypatch.setitem(settings._settings, "reader_prefetch_ahead", 0)
         monkeypatch.setitem(settings._settings, "reader_prefetch_behind", 0)
 
-        session, _ = self._session(tmp_path, real_image=True)
-        window = ReaderWindow(self._comic(), session=session)
+        session, _ = self._partial_session(tmp_path)
+        window = ReaderWindow(self._comic(12), session=session)
         called = self._spy_prefetch(monkeypatch, window)
         self._emit_loaded(window, 2, session.local_pages()[1])
 
         assert called == []
         window.close()
 
-    def test_go_next_fetches_exactly_one_page(self, qapp, tmp_path, monkeypatch):
-        """点「下一页」只请求那一页：fetch_page 恰好被调用一次，参数为目标页。
-
-        守卫「按需加载」语义——不得因为翻页而顺带拉取相邻页。
-
-        注意：bootstrap 会先加载首页（第 1 页），因此打补丁后需先清空
-        记录，再断言翻页带来的请求。
-        """
+    def test_prefetch_skipped_when_local_complete(self, qapp, tmp_path, monkeypatch):
+        """本地已完整：不启动预取线程、不发任何请求（没有需要补的页）。"""
         from ui.reader.reader_window import ReaderWindow
 
-        session, _ = self._session(tmp_path, real_image=True)
+        session, _ = self._session(tmp_path, real_image=True)   # 12/12 全在本地
         window = ReaderWindow(self._comic(), session=session)
+        called = self._spy_prefetch(monkeypatch, window)
+
+        self._emit_loaded(window, 1, session.local_pages()[0])
+
+        assert called == [], "本地已完整时不应再起预取线程"
+        window.close()
+
+    def test_go_next_display_fetches_only_target_page(self, qapp, tmp_path, monkeypatch):
+        """前台加载只请求目标页；相邻页由预取线程负责。
+
+        这里屏蔽预取线程（`PrefetchWorker.start` 不干活），只统计前台加载
+        的取页：点「下一页」必须**恰好**取第 2 页一次。守卫「一次翻页不会
+        在前台顺带多取几页」——预取窗口本身的行为由上面的用例覆盖。
+        """
+        from ui.reader import reader_window as rw
+
+        session, _ = self._partial_session(tmp_path)
+        monkeypatch.setattr(rw.PrefetchWorker, "start", lambda self: None)
+        window = rw.ReaderWindow(self._comic(12), session=session)
         # 等 bootstrap 的首页加载线程结束，避免它的请求混入断言
         if window._load_worker is not None:
             window._load_worker.wait(2000)
@@ -2274,6 +2319,174 @@ class TestReaderWindow:
             window._load_worker.wait(2000)
 
         assert requested == [2], f"翻页只应取第 2 页，实际请求 {requested}"
+        window.close()
+
+    def test_cached_page_revisit_does_not_fetch(self, qapp, tmp_path, monkeypatch):
+        """命中内存窗口缓存：回看当前页不再取页（不读盘、不联网、不起线程）。"""
+        from ui.reader import reader_window as rw
+
+        monkeypatch.setattr(rw.PrefetchWorker, "start", lambda self: None)
+        session, _ = self._partial_session(tmp_path)
+        window = rw.ReaderWindow(self._comic(12), session=session)
+        self._emit_loaded(window, 1, session.local_pages()[0])
+        assert 1 in window._image_cache, "显示完成后当前页应在内存缓存里"
+
+        requested = []
+        original = session.fetch_page
+
+        def _spy(page_no):
+            requested.append(page_no)
+            return original(page_no)
+
+        monkeypatch.setattr(session, "fetch_page", _spy)
+        window.load_page(1)
+        # 若命中快路径失效，会起线程去取页；必须等它跑完再断言，否则
+        # 线程还没来得及调用 fetch_page，守卫会"假通过"。
+        worker = window._load_worker
+        if worker is not None:
+            assert worker.wait(2000)
+        _drain_events(qapp)
+
+        assert requested == [], f"缓存命中不应再取页，实际请求 {requested}"
+        assert window._loaded_page == 1
+        window.close()
+
+    def test_prefetch_result_goes_into_memory_cache(self, qapp, tmp_path, monkeypatch):
+        """预取回来的图解码后入窗口缓存，翻到该页直接命中（不再取页）。"""
+        from PySide6.QtGui import QImage
+
+        from ui.reader import reader_window as rw
+
+        monkeypatch.setattr(rw.PrefetchWorker, "start", lambda self: None)
+        session, _ = self._partial_session(tmp_path)
+        window = rw.ReaderWindow(self._comic(12), session=session)
+        self._emit_loaded(window, 1, session.local_pages()[0])
+
+        image = QImage(6, 6, QImage.Format_RGB32)
+        image.fill(0x0000FF)
+        window._on_prefetch_page_ready(2, image, str(session.local_pages()[1]))
+        assert 2 in window._image_cache, "预取结果应进内存窗口缓存"
+        # 迟到结果（已滑出窗口）直接丢弃，不占内存
+        window._on_prefetch_page_ready(9, image, "unused")
+        assert 9 not in window._image_cache
+
+        requested = []
+        original = session.fetch_page
+
+        def _spy(page_no):
+            requested.append(page_no)
+            return original(page_no)
+
+        monkeypatch.setattr(session, "fetch_page", _spy)
+        window.load_page(2)
+        worker = window._load_worker
+        if worker is not None:
+            assert worker.wait(2000)
+        _drain_events(qapp)
+
+        assert requested == [], f"命中预取结果不应再取页，实际 {requested}"
+        assert window._loaded_page == 2
+        window.close()
+
+    def test_prefetch_thread_fills_memory_cache(self, qapp, tmp_path, monkeypatch):
+        """端到端：后台预取线程把后两页下载+解码进内存缓存，翻页零取页。
+
+        与上一个用例（手工投递 `page_ready`）互补：这里跑**真实的
+        PrefetchWorker 线程**，验证「下载 → 线程内解码 → 信号回主线程 →
+        QPixmap 入窗」整条链路，以及随后翻页确实不再取页。
+        """
+        from ui.reader import reader_window as rw
+
+        session, _ = self._partial_session(tmp_path, local=1, total=12)
+        window = rw.ReaderWindow(self._comic(12), session=session)
+        source = session.local_pages()[0]
+
+        def _fake_download(page_no, picture):
+            # 不发网络请求：直接把第 1 张的字节复制成目标页
+            target = session.local_dir / f"{page_no}.jpg"
+            target.write_bytes(source.read_bytes())
+            session._refresh_local_files(force=True)
+            return target
+
+        monkeypatch.setattr(session, "_download_one", _fake_download)
+        monkeypatch.setattr(
+            session,
+            "_parse_page",
+            lambda p: [{"link": "http://example.invalid/x.jpg", "number": str(p)}],
+        )
+
+        self._emit_loaded(window, 1, source)     # 触发真实预取线程
+        assert self._wait_until(
+            qapp, lambda: {2, 3} <= set(window._image_cache.pages())
+        ), f"预取结果未进缓存：{window._image_cache.pages()}"
+
+        requested = []
+        original = session.fetch_page
+
+        def _spy(page_no):
+            requested.append(page_no)
+            return original(page_no)
+
+        monkeypatch.setattr(session, "fetch_page", _spy)
+        window.load_page(2)
+
+        assert requested == [], f"预取已覆盖该页，不该再取，实际 {requested}"
+        assert window._loaded_page == 2
+        window.close()
+
+    def test_memory_window_stays_bounded_while_flipping(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """连续翻页：内存缓存始终只剩窗口内的页，不会越看越多。"""
+        from ui.reader import reader_window as rw
+
+        monkeypatch.setattr(rw.PrefetchWorker, "start", lambda self: None)
+        session, _ = self._partial_session(tmp_path, local=6, total=12)
+        window = rw.ReaderWindow(self._comic(12), session=session)
+
+        for page_no in range(1, 7):
+            window.load_page(page_no)
+            worker = window._load_worker
+            if worker is not None:
+                assert worker.wait(2000)
+            _drain_events(qapp)
+            assert window._loaded_page == page_no
+            # 关掉预取线程时，窗口内只有正在看的那一页；若滑动淘汰失效，
+            # 这里会累积成 [1..page_no]
+            assert window._image_cache.pages() == [page_no], (
+                f"第 {page_no} 页时缓存应只剩当前页，"
+                f"实际 {window._image_cache.pages()}"
+            )
+        window.close()
+
+    def test_prefetch_failure_keeps_current_page(self, qapp, tmp_path, monkeypatch):
+        """预取全部失败：当前页照常显示，状态栏不变成错误、图片不消失。"""
+        from ui.reader import reader_window as rw
+        from ui.reader.page_provider import PageFetchError
+
+        session, _ = self._partial_session(tmp_path, local=1)
+        window = rw.ReaderWindow(self._comic(12), session=session)
+        pages = session.local_pages()
+        original = session.fetch_page
+
+        def _flaky(page_no):
+            # 第 1 页照常（bootstrap 要显示它），预取的第 2、3 页一律失败
+            if page_no >= 2:
+                raise PageFetchError(page_no, "模拟预取失败")
+            return original(page_no)
+
+        monkeypatch.setattr(session, "fetch_page", _flaky)
+        self._emit_loaded(window, 1, pages[0])
+
+        worker = window._prefetch_worker
+        if worker is not None:
+            assert worker.wait(5000)
+        _drain_events(qapp)
+
+        assert window._loaded_page == 1
+        assert window.status_label.text() == "第 1 页"
+        assert window.image_area.pixmap() is not None, "预取失败不应清掉当前页"
+        assert 1 in window._image_cache
         window.close()
 
 
@@ -2845,3 +3058,266 @@ class TestGridCacheProgress:
         assert card.download_btn.variant == "success"
         assert card.download_btn.is_progress is False
         grid.close()
+
+
+class TestPageImageCache:
+    """内存窗口缓存：滑出即淘汰、窗外拒收、硬上限兜底。"""
+
+    @pytest.fixture(autouse=True)
+    def _qt_app(self, qapp):
+        """创建 QPixmap 需要 QApplication 存在（单独跑本类时也不例外）。
+
+        没有这个 fixture 时，只有先跑过带 qapp 的窗口用例才碰巧能过——
+        用 `-k PageImageCache` 单独跑会直接 abort（exit 127）。
+        """
+        return qapp
+
+    @staticmethod
+    def _pixmap():
+        from PySide6.QtGui import QPixmap
+
+        return QPixmap(4, 4)   # 尺寸大于 0 即为非空图
+
+    def test_default_window_is_current_plus_two(self):
+        from ui.reader.image_cache import PageImageCache
+
+        cache = PageImageCache()
+        assert (cache.ahead, cache.behind) == (2, 0)
+        assert cache.window_size == 3
+        assert cache.window == (1, 3)   # 初始中心为第 1 页
+
+    def test_slide_evicts_pages_outside_window(self):
+        """窗口滑动后，离开窗口的页必须立即从缓存里消失（否则内存会一直涨）。"""
+        from ui.reader.image_cache import PageImageCache
+
+        cache = PageImageCache(ahead=2, behind=0)
+        cache.slide_to(1)
+        for no in (1, 2, 3):
+            assert cache.put(no, self._pixmap()) is True
+        assert cache.pages() == [1, 2, 3]
+
+        evicted = cache.slide_to(3)          # 窗口变为 [3, 5]
+        assert evicted == [1, 2]
+        assert cache.pages() == [3]
+
+        cache.put(4, self._pixmap())
+        cache.put(5, self._pixmap())
+        assert cache.pages() == [3, 4, 5]
+
+        # 翻到第 5 页：窗口变 [5, 7]，滑出窗口的 3、4 立即释放
+        assert cache.slide_to(5) == [3, 4]
+        cache.put(6, self._pixmap())          # 后两页由预取填进来
+        cache.put(7, self._pixmap())
+        assert cache.pages() == [5, 6, 7]
+
+        # 再翻一页：窗口 [6, 8]，刚离开的第 5 页被释放
+        assert cache.slide_to(6) == [5]
+        assert cache.pages() == [6, 7]
+
+    def test_put_out_of_window_is_rejected(self):
+        """迟到的预取结果（页已滑出窗口）直接拒收，不占内存。"""
+        from ui.reader.image_cache import PageImageCache
+
+        cache = PageImageCache(ahead=2, behind=0)
+        cache.slide_to(5)                     # 窗口 [5, 7]
+        assert cache.put(2, self._pixmap()) is False
+        assert len(cache) == 0
+        assert cache.put(6, self._pixmap()) is True
+
+    def test_hard_cap_after_shrinking_window(self):
+        """窗口被调小（关掉预取）后，下一次写入必须把多余页清到窗口大小。"""
+        from ui.reader.image_cache import PageImageCache
+
+        cache = PageImageCache(ahead=5, behind=5)
+        cache.slide_to(1)
+        for no in range(1, 7):
+            cache.put(no, self._pixmap())
+        assert len(cache) == 6
+
+        cache.configure(0, 0)                 # 只留当前页
+        assert cache.put(1, self._pixmap()) is True
+        assert cache.pages() == [1], "超出窗口大小的页应被淘汰"
+
+    def test_null_pixmap_is_not_cached(self):
+        from PySide6.QtGui import QPixmap
+
+        from ui.reader.image_cache import PageImageCache
+
+        cache = PageImageCache()
+        cache.slide_to(1)
+        assert cache.put(1, QPixmap()) is False
+        assert len(cache) == 0
+
+    def test_path_kept_for_drag_out(self):
+        """缓存要带原始文件路径：命中缓存显示时仍能把原图拖到其他程序。"""
+        from ui.reader.image_cache import PageImageCache
+
+        cache = PageImageCache()
+        cache.slide_to(1)
+        cache.put(1, self._pixmap(), "D:/Download/1.jpg")
+        entry = cache.get(1)
+        assert entry is not None and entry.path == "D:/Download/1.jpg"
+
+
+class TestSamePageRequestDedup:
+    """同一页被前台加载与后台预取同时要求时，只下载一次。"""
+
+    def _session(self, tmp_path, total: int = 5):
+        from ui.reader.page_provider import ReaderSession
+
+        base = tmp_path / "Download"
+        base.mkdir(exist_ok=True)
+        comic = {
+            "title": "去重作品",
+            "detail_url": "/photos-index-page-1-aid-9.html",
+            "image_count": total,
+            "category_label": "單行本",
+        }
+        session = ReaderSession(
+            comic, base_dir=base, index=ReaderCacheIndex(tmp_path / "reader.db")
+        )
+        session.ensure_ready()
+        return session
+
+    def _patch_slow_download(self, monkeypatch, session, calls, lock, fail_first=False):
+        """把下载换成可控的假实现（记录调用、延迟 0.2s、可让第一次失败）。"""
+        import time
+
+        def _fake_download(page_no, picture):
+            with lock:
+                calls.append((page_no, time.monotonic()))
+                attempt = len(calls)
+            time.sleep(0.2)                    # 拉长下载窗口，确保两线程真的重叠
+            if attempt == 1 and fail_first:
+                return None                    # 模拟领跑者下载失败
+            session.local_dir.mkdir(parents=True, exist_ok=True)
+            path = session.local_dir / f"{page_no}.jpg"
+            path.write_bytes(b"fake-image")
+            session._refresh_local_files(force=True)
+            return path
+
+        monkeypatch.setattr(session, "_download_one", _fake_download)
+        monkeypatch.setattr(
+            session,
+            "_parse_page",
+            lambda p: [{"link": "http://example.invalid/1.jpg", "number": str(p)}],
+        )
+
+    def test_concurrent_fetch_downloads_once(self, tmp_path, monkeypatch):
+        """两个线程同时要第 1 页：只有一次下载，两人拿到同一张。"""
+        import threading
+
+        session = self._session(tmp_path)
+        calls: list[tuple[int, float]] = []
+        lock = threading.Lock()
+        self._patch_slow_download(monkeypatch, session, calls, lock)
+
+        barrier = threading.Barrier(2)
+        results: list[Path] = []
+
+        def _fetch():
+            barrier.wait(5)                    # 保证两线程同时进入 fetch_page
+            results.append(session.fetch_page(1))
+
+        threads = [threading.Thread(target=_fetch) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        assert [no for no, _ in calls] == [1], f"同一页只应下载一次，实际 {calls}"
+        assert len(results) == 2
+        assert all(path.name == "1.jpg" for path in results)
+
+    def test_follower_takes_over_after_leader_failure(self, tmp_path, monkeypatch):
+        """领跑者下载失败：等待的跟随者接管重试，不把失败甩给用户。"""
+        import threading
+        import time
+
+        session = self._session(tmp_path)
+        calls: list[tuple[int, float]] = []
+        lock = threading.Lock()
+        self._patch_slow_download(monkeypatch, session, calls, lock, fail_first=True)
+
+        paths: list[Path] = []
+        errors: list[Exception] = []
+
+        def _fetch():
+            try:
+                paths.append(session.fetch_page(1))
+            except Exception as exc:  # noqa: BLE001 - 测试需要拿到失败本身
+                errors.append(exc)
+
+        leader = threading.Thread(target=_fetch)
+        leader.start()
+        time.sleep(0.05)                       # 让 leader 先登记为领跑者
+        follower = threading.Thread(target=_fetch)
+        follower.start()
+        leader.join(10)
+        follower.join(10)
+
+        assert [no for no, _ in calls] == [1, 1], f"应恰好重试一次，实际 {calls}"
+        assert calls[1][1] - calls[0][1] >= 0.15, "跟随者必须等领跑者结束再重试"
+        assert len(paths) == 1 and paths[0].name == "1.jpg"
+        assert len(errors) == 1, "领跑者应把失败如实抛出"
+
+
+class TestReaderPrefetchSettingsMigration:
+    """设置迁移：老 settings.json 的「纯按需」旧默认值要一次性升级为「后 2 页」。"""
+
+    def _reload(self, monkeypatch, path):
+        from ui import settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "SETTINGS_PATH", path)
+        monkeypatch.setattr(settings_mod.AppSettings, "_instance", None)
+        return settings_mod.AppSettings()
+
+    def test_legacy_defaults_are_upgraded_and_flag_saved(self, tmp_path, monkeypatch):
+        import json
+
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "reader_prefetch_enabled": False,
+                    "reader_prefetch_ahead": 0,
+                    "reader_prefetch_behind": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        settings = self._reload(monkeypatch, path)
+
+        assert settings.reader_prefetch_enabled is True
+        assert settings.reader_prefetch_ahead == 2
+        assert settings.reader_prefetch_behind == 0
+        # 迁移标记必须落盘，否则用户之后关掉预取会在下次启动被重新打开
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["reader_prefetch_migrated"] is True
+
+        settings.reader_prefetch_enabled = False
+        settings.reader_prefetch_ahead = 0
+        settings.save()
+        settings_again = self._reload(monkeypatch, path)
+        assert settings_again.reader_prefetch_enabled is False, "用户的选择不该被迁移覆盖"
+        assert settings_again.reader_prefetch_ahead == 0
+
+    def test_custom_values_are_left_alone(self, tmp_path, monkeypatch):
+        import json
+
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "reader_prefetch_enabled": True,
+                    "reader_prefetch_ahead": 5,
+                    "reader_prefetch_behind": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        settings = self._reload(monkeypatch, path)
+
+        assert settings.reader_prefetch_enabled is True
+        assert settings.reader_prefetch_ahead == 5
+        assert settings.reader_prefetch_behind == 1

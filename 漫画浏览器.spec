@@ -47,6 +47,15 @@ a = Analysis(
         "win32con",
         "win32gui",
         "Pythonwin",
+        # urllib3 2.5+ 的可选 zstd 依赖：绝不能让它「半收进来」。
+        # 若打包机装过 backports.zstd，PyInstaller 可能只收进包目录/命名空间、
+        # 漏掉编译扩展，运行时 `import backports.zstd` 成功但缺 ZstdError，
+        # urllib3 在 class 体里取属性即抛 AttributeError —— 表现为程序一启动
+        # 就崩（requests 导入失败），且只在冻结包里复现。
+        # 项目用不到 zstd 响应解压，直接整体排除，让 urllib3 走「不支持」分支。
+        # 运行期另有 src/compat.py 兜底（覆盖不按本 spec 打包的情况）。
+        "backports",
+        "backports.zstd",
         # 环境里装过、被 hook 误收集进打包的非项目依赖
         "pythonnet",
         "sounddevice",

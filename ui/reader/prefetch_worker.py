@@ -8,12 +8,18 @@
 
 两种线程：
 - PageLoadWorker：加载单页（前台请求，优先级高）
-- PrefetchWorker：预取窗口（后台补拉，可取消）
+- PrefetchWorker：预取窗口（后台补拉 + 解码，可取消）
+
+预取为什么在**线程里**解码：翻页时命中内存缓存才能"秒开"，而把两页
+JPEG 在主线程解码会让界面卡顿（每页几十毫秒）。QImage 是纯光栅数据，
+可以在后台线程解码；QPixmap 只能在 GUI 线程创建——所以这里交出 QImage，
+由窗口在主线程转成 QPixmap 存进缓存。
 """
 import logging
 
 from PySide6.QtCore import QThread, Signal
 
+from ui.reader.image_cache import decode_image
 from ui.reader.page_provider import PageFetchError, ReaderSession
 
 logger = logging.getLogger(__name__)
@@ -56,10 +62,14 @@ class PageLoadWorker(QThread):
 
 
 class PrefetchWorker(QThread):
-    """后台预取窗口内的缺失页（可取消：用户翻页后旧窗口任务立即作废）。"""
+    """后台预取窗口内的缺失页（可取消：用户翻页后旧窗口任务立即作废）。
 
-    page_ready = Signal(int)       # 某页补拉成功（页码）
-    progress = Signal(int, int)    # (已缓存张数, 期望总数)
+    每补拉成功一页就在**本线程内**解码，把 QImage 交回主线程——主线程
+    只做 QPixmap 转换与入缓存，翻到该页时无需再读盘解码。
+    """
+
+    page_ready = Signal(int, object, str)  # (页码, 解码后的 QImage, 本地路径)
+    progress = Signal(int, int)            # (已缓存张数, 期望总数)
 
     def __init__(
         self,
@@ -95,9 +105,17 @@ class PrefetchWorker(QThread):
             if not self.isInterruptionRequested():
                 self.progress.emit(self.session.local_count, total)
 
-    def _on_page(self, page_no: int):
-        """单个页面补拉成功：通知界面刷新进度（取消后不再 emit）。"""
+    def _on_page(self, page_no: int, path):
+        """单页补拉成功：在线程内解码，再通知主线程入内存缓存。
+
+        解码失败（文件损坏/格式不支持）不影响磁盘缓存已经写好的事实，
+        只是这一页不做内存预取；用户翻到它时会走正常加载路径重试。
+        """
         if self.isInterruptionRequested():
             return
-        self.page_ready.emit(page_no)
+        image = decode_image(path)
+        if image is None:
+            logger.info("预取解码失败（翻页时将重新尝试）: page=%s", page_no)
+            return
+        self.page_ready.emit(page_no, image, str(path))
         self.progress.emit(self.session.local_count, self.session.resolve_total_pages())

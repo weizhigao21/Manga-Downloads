@@ -5,8 +5,11 @@
 - 中央图片区；翻页与播放控制条是**独立停靠小窗**（ReaderControlBar）——
   固定停靠屏幕底部中央，图片窗口可以随图片大小缩放/移动，按钮位置不变；
 - 图片**优先读本地缓存**（ReaderSession 本地优先），未命中才联网补拉；
-- **纯按需加载**：只在用户点「下一页/上一页」时获取该页，不主动预取
-  （如需更顺滑的翻页，可在设置里显式开启"后台预取相邻页"）；
+- **两层缓存**：磁盘（ReaderSession 落盘，重开仍在）+ 内存窗口缓存
+  （PageImageCache：当前页与后两页的解码结果，翻到即显示、滑出即释放）；
+- **预取**：页显示完成后在后台补拉「后两页」并解码入缓存（默认开启，
+  可在设置里改页数或关掉）。预取全程在后台线程，失败只记日志，绝不影响
+  当前页显示；预取窗口同时就是内存缓存的窗口，避免内存随阅读时长增长；
 - 关闭时中断所有后台线程（业务信号全名 `done`，清理连接原生 `finished`）。
 
 线程约定（与项目既有实践一致）：
@@ -35,6 +38,7 @@ from ui.reader.control_bar import (
     register_bar,
     unregister_bar,
 )
+from ui.reader.image_cache import PageImageCache
 from ui.reader.page_provider import ReaderSession
 from ui.reader.prefetch_worker import PageLoadWorker, PrefetchWorker
 from ui.styles import PALETTE
@@ -230,6 +234,9 @@ class ReaderWindow(QWidget):
         self._total = 0
         self._load_worker: PageLoadWorker | None = None
         self._prefetch_worker: PrefetchWorker | None = None
+        # 解码后的内存窗口缓存（默认「当前页 + 后两页」）：翻到缓存内的页
+        # 直接显示，离开窗口的页在滑动时立即释放，避免内存持续增长。
+        self._image_cache = PageImageCache()
         # 快速翻页时旧加载线程可能仍在收尾；保留它们直到 finished，
         # 防止引用被新线程覆盖后 QThread 在运行中析构。
         self._active_workers: list = []
@@ -352,19 +359,30 @@ class ReaderWindow(QWidget):
         self.load_page(self._total)
 
     def load_page(self, page_no: int):
-        """加载指定页：本地命中的同步路径由工作线程统一处理。"""
+        """加载指定页：内存缓存命中则同步显示，否则交给工作线程。
+
+        两条路径的共同点：先按新页滑动内存缓存窗口（离开窗口的图立即释放），
+        再递增请求序号。序号必须**先**加——无论后面走同步命中还是异步加载，
+        在跑的旧线程回来时都会因序号过期被丢弃，快速连翻不会出现"旧页盖
+        新页"（「点了下一页还显示上一页」）。
+        """
         self._slideshow_timer.stop()
         page_no = max(1, min(int(page_no), self._total))
         self._page = page_no
         self._update_page_ui()
-        # 已有加载线程在跑：请求中断，其原生 finished 会清空引用；
-        # 新线程照常启动（旧线程在下一个检查点自行退出）。
-        # 注意：中断只是「尽力」，旧线程仍可能跑完并 emit 结果，
-        # 因此这里还必须递增请求序号，由回调按序号丢弃过期结果，
-        # 否则旧页画面会覆盖到新页上（「点了下一页还显示上一页」）。
-        self._interrupt_worker("_load_worker")
         self._load_seq += 1
-        self._start_load(page_no, self._load_seq)
+        seq = self._load_seq
+        self._slide_image_window(page_no)
+        # 已有加载线程在跑：请求中断，其原生 finished 会清空引用；旧线程在
+        # 下一个检查点自行退出。中断只是「尽力」，过期判定仍靠上面的序号。
+        self._interrupt_worker("_load_worker")
+        cached = self._image_cache.get(page_no)
+        if cached is not None:
+            # 内存命中：同步显示，不起线程、不读盘、不联网（预取/回看的主路径）
+            logger.debug("内存缓存命中: page=%s", page_no)
+            self._display_page(seq, page_no, path=cached.path, pixmap=cached.pixmap)
+            return
+        self._start_load(page_no, seq)
 
     def _interrupt_worker(self, attr: str):
         """安全请求中断指定 worker，并清空已失效的引用。
@@ -416,9 +434,21 @@ class ReaderWindow(QWidget):
         if self._is_stale(seq, page_no):
             logger.debug("丢弃过期加载结果: seq=%s page=%s", seq, page_no)
             return
+        self._display_page(seq, page_no, path=path)
+
+    def _display_page(
+        self, seq: int, page_no: int, path=None, pixmap: QPixmap | None = None
+    ):
+        """把一页提交到界面：**异步加载完成与内存缓存命中走同一个出口**。
+
+        两条路径共用这里，保证窗口尺寸、拖拽路径、状态文字、缓存计数、
+        阅读进度、自动播放计时与预取调度的行为完全一致；缓存命中只是省掉
+        了读盘/解码这一步（`pixmap` 已给出）。
+        """
         self._loaded_page = page_no
         self._loaded_seq = seq
-        pixmap = QPixmap(str(path))
+        if pixmap is None:
+            pixmap = QPixmap(str(path)) if path else QPixmap()
         if pixmap.isNull():
             self._on_page_failed(seq, page_no, "图片无法解码")
             return
@@ -432,11 +462,14 @@ class ReaderWindow(QWidget):
         finally:
             self.setUpdatesEnabled(True)
         self.update()
+        # 解码结果进内存窗口缓存：翻回来/预取命中时直接取用，不再读盘。
+        # 窗口外的页会被拒收（迟到的预取结果），不会白占内存。
+        self._image_cache.put(page_no, pixmap, path or "")
         self._update_cache_label()
         self.cache_progress_changed.emit(self.session.local_count, self._total)
         self._save_progress()
-        # 默认不做任何预取：只有用户真正翻页时才去取那一页。
-        # 若用户在设置里显式开启了预取，才在页显示完成后补拉相邻窗口。
+        # 页已显示：后台补拉「后两页」并解码入缓存。纯后台线程，失败只记
+        # 日志，不影响当前页显示（本地已完整的作品直接跳过，不发请求）。
         self._maybe_prefetch(page_no)
         if self._slideshow_playing:
             if page_no >= self._total:
@@ -567,35 +600,64 @@ class ReaderWindow(QWidget):
             return
         self.go_next()
 
-    # ---- 预取（默认关闭；仅当用户在设置中显式开启时才生效） ----
+    # ---- 内存缓存窗口与预取 ----
 
-    def _maybe_prefetch(self, page_no: int):
-        """按设置决定是否预取相邻页。
+    def _prefetch_window(self) -> tuple[int, int]:
+        """当前生效的窗口 (向后页数, 向前页数)。
 
-        默认 `reader_prefetch_enabled=False`，此方法直接返回——阅读器
-        始终只取用户翻到的那一页，符合「点下一页时再获取」的预期。
+        同一个窗口既决定"预取几页"，也决定"内存缓存留几页"——关掉预取就
+        只保留当前页，不会出现"没开预取却悄悄占着三张图内存"的情况。
         """
         from ui.settings import AppSettings
 
         settings = AppSettings()
         if not settings.reader_prefetch_enabled:
+            return 0, 0
+        return settings.reader_prefetch_ahead, settings.reader_prefetch_behind
+
+    def _slide_image_window(self, page_no: int):
+        """把内存缓存窗口滑到当前页，窗口外的解码图立即释放。
+
+        这是「内存不随阅读时长增长」的关键一步：默认窗口只有 3 页，翻过
+        第 N+2 页后第 N 页的位图就没有缓存持有者了（正在显示的那张由图片
+        控件自己引用，不会在屏幕上消失），内存占用恒定。
+        """
+        ahead, behind = self._prefetch_window()
+        self._image_cache.configure(ahead, behind)
+        evicted = self._image_cache.slide_to(page_no)
+        if evicted:
+            logger.debug("释放离开窗口的缓存页: %s", evicted)
+
+    def _maybe_prefetch(self, page_no: int):
+        """当前页显示完成后，后台补拉窗口内缺失的页（默认后两页）。
+
+        - 预取**只**在后台线程里做（下载 + 解码），当前页显示不受影响；
+        - 本地已完整时直接跳过：没有需要补的页，不必起线程、不必发请求；
+        - 窗口为 0/0（用户关掉预取）时什么也不做。
+        """
+        ahead, behind = self._prefetch_window()
+        if ahead <= 0 and behind <= 0:
             return
-        if settings.reader_prefetch_ahead <= 0 and settings.reader_prefetch_behind <= 0:
+        if self.session.is_offline_ready(self._total):
+            return
+        # 窗口内每一页都已在内存缓存里：没有可预取的。快速来回翻页时
+        # 避免为每次翻页都起一个空转线程（末页时把上界夹到总页数）。
+        lo, hi = self._image_cache.window
+        hi = min(hi, self._total)
+        if all(self._image_cache.get(no) is not None for no in range(lo, hi + 1)):
             return
         self._start_prefetch(page_no)
 
     def _start_prefetch(self, page_no: int):
         """为当前页启动后台预取；已有预取线程先取消（窗口已过期）。"""
-        from ui.settings import AppSettings
-
-        settings = AppSettings()
+        ahead, behind = self._prefetch_window()
         # 旧预取线程请求中断后自行退出，其原生 finished 会清空引用
         self._interrupt_worker("_prefetch_worker")
         worker = PrefetchWorker(
             self.session,
             page_no,
-            ahead=settings.reader_prefetch_ahead,
-            behind=settings.reader_prefetch_behind,
+            ahead=ahead,
+            behind=behind,
             parent=None,
         )
         self._prefetch_worker = worker
@@ -610,8 +672,21 @@ class ReaderWindow(QWidget):
         register(worker)
         worker.start()
 
-    def _on_prefetch_page_ready(self, page_no: int):
-        """预取补拉了当前页（首次加载失败后的补偿）时，刷新当前页显示。"""
+    def _on_prefetch_page_ready(self, page_no: int, image=None, path=""):
+        """预取完成：把解码结果放进内存窗口缓存（已滑出窗口的直接丢弃）。
+
+        `image` 是后台线程解码好的 QImage；QPixmap 只能在 GUI 线程创建，
+        所以在主线程转换后入缓存。若当前页此前加载失败（图片区为空）而
+        预取刚好把这一页补回来，则顺手重新显示当前页。
+        """
+        if (
+            image is not None
+            and not image.isNull()
+            and self._image_cache.in_window(page_no)
+        ):
+            pixmap = QPixmap.fromImage(image)
+            if not pixmap.isNull():
+                self._image_cache.put(page_no, pixmap, path)
         if page_no == self._page and (
             self.image_area.pixmap() is None or self.image_area.pixmap().isNull()
         ):
@@ -710,6 +785,8 @@ class ReaderWindow(QWidget):
         self._stop_slideshow()
         self._save_progress()
         self._shutdown_workers()
+        # 关窗即释放内存缓存：多开/反复开关阅读器时不留下解码图占用
+        self._image_cache.clear()
         # 注销控制条：关闭它，并把「最前」让给还活着的阅读器
         unregister_bar(self.bar)
         self._bar_registered = False

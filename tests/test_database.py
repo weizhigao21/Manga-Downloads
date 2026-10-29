@@ -82,6 +82,38 @@ class TestExtractAuthor:
     def test_skips_ai_drawing_tag(self, _isolated_db):
         assert _isolated_db.extract_author("[AI绘图] [kelingkl屋] 作品") == "kelingkl屋"
 
+    def test_dash_separated_title(self, _isolated_db):
+        # 无方括号的作品常用「作者 - 作品名」格式
+        assert _isolated_db.extract_author(
+            "Umeko J - Yoruichi Cat Form「Bleach」"
+        ) == "Umeko J"
+        assert _isolated_db.extract_author("阿薰kaOri - 2B白花嫁") == "阿薰kaOri"
+        # 破折号只有一侧有空白也算分隔
+        assert _isolated_db.extract_author(
+            "Tiny Asa アサ- Eve Swimsuit – Stellar Blade"
+        ) == "Tiny Asa アサ"
+        # 名字里的圆括号注音保留
+        assert _isolated_db.extract_author(
+            "YanYan (ヤンヤン) - Columbina – Genshin Impact"
+        ) == "YanYan (ヤンヤン)"
+
+    def test_dash_not_used_for_page_ranges_and_compound_names(self, _isolated_db):
+        # 两侧贴字的连字符是页码区间/复合词，不是作者分隔符
+        assert _isolated_db.extract_author("迷夜少女 14-元之章2") == ""
+        assert _isolated_db.extract_author("黑猫 司幼幽-牧神记 178P") == ""
+        assert _isolated_db.extract_author(
+            "AWE-SOME-Ryan 欲望飞行第三季 Protocol Ep6（中文版）"
+        ) == ""
+        # 括号内的破折号（年份区间）不算分隔符
+        assert _isolated_db.extract_author("Collection (2022 - 2025)") == ""
+        # 破折号在开头没有前段作者
+        assert _isolated_db.extract_author("- 作品名") == ""
+
+    def test_bracket_author_wins_over_dash(self, _isolated_db):
+        assert _isolated_db.extract_author("[もつあき] -りんごママのえろほん") == "もつあき"
+        # 只有标签方括号时，不把「作品 - 副标题」误当作者
+        assert _isolated_db.extract_author("[漢化] 作品 - 副标题") == ""
+
 
 class TestFavorites:
     def test_search_result_can_be_favorited_and_survives_refresh(self, _isolated_db):

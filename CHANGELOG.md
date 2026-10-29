@@ -5,6 +5,55 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.17] - 2026-10-30
+
+### 优化
+
+- **作者名提取兼容「作者 - 作品名」格式**：部分作品标题没有 `[社团/作者]` 方括号，而是写作 `Umeko J - Yoruichi Cat Form「Bleach」`。此前这类标题的作者按钮不显示，现在会在方括号提取不到作者时兜底取破折号前的一段作为作者（`ui/database.py::extract_author` / `_author_from_dash_title`）
+  - 分隔符识别 `-` `–` `—` `－`，**至少一侧有空白**才算分隔：`A - B`、`A- B`、`A -B` 都切分，而 `1-12`、`AWE-SOME-Ryan`、`邂逅-KAIKOU` 这类两侧贴字的连字符不切
+  - 括号内的破折号跳过：`Collection (2022 - 2025)` 的年份区间不会被当成作者分隔
+  - 前段需 2-40 字、最多 5 个词，排除纯数字/日期、带方括号的标签块、翻译竖线分隔与展会代号；破折号在开头（前段为空）或后方无作品名时不提取
+  - 名字里的注音括号保留：`YanYan (ヤンヤン) - Columbina – Genshin Impact` → `YanYan (ヤンヤン)`
+  - 方括号路径优先，行为不变：`[もつあき] -りんごママのえろほん` 仍取 `もつあき`，`[漢化] 作品 - 副标题` 仍返回空
+  - 数据库 `author` 列的开机回填会按新规则补齐历史记录（仅填空值），卡片作者按钮即时生效
+
+### 测试
+
+- `tests/test_database.py::TestExtractAuthor` 新增 3 组用例：破折号分隔（含单侧空白、注音括号）、不误判（页码区间/复合连字符名/括号内区间/以破折号开头）、方括号优先
+- 全量离线测试：423 → **426 passed**（ruff 全通过）
+
+## [1.3.16] - 2026-10-26
+
+### 修复
+
+- **打包版启动即崩溃**（`AttributeError: module 'backports.zstd' has no attribute 'ZstdError'`，源码运行正常、只在冻结包复现）：urllib3 2.5+ 按「`backports.zstd` 能否 import」决定是否启用 zstd 解压，随后在 `class BaseHTTPResponse` 的**类体**里直接取 `zstd.ZstdError`。打包机装过该可选依赖时，PyInstaller 可能只收进一半（包目录/命名空间在、编译扩展不在）：import 成功但属性缺失 → `import requests` 抛异常 → 程序一启动就退出
+  - `漫画浏览器.spec` 整体排除 `backports` / `backports.zstd`，让 urllib3 走正常的「不支持 zstd」分支（也不会在 `Accept-Encoding` 里声明 zstd）
+  - 新增 `src/compat.py::ensure_zstd_compat()`，由 `src/__init__.py` 在**任何 `import requests` 之前**调用：发现「能 import 但缺 `ZstdError` / `ZstdDecompressor`」就把 `backports.zstd` 标记为不可用（`sys.modules` 置 `None` + 摘掉父包属性），让 urllib3 拿到干净的 `ImportError`；连 import 都抛非 `ImportError`（如缺 DLL）时同样降级，不让启动跟着挂
+  - 代价：打包版不再支持 zstd 响应解压（本项目抓取站点不使用该编码），换来的是程序能启动
+
+### 测试
+
+- 新增 `tests/test_compat.py`（9 项）：残缺 / 部分残缺 / 完好 / 未安装 / import 抛非 ImportError / 幂等；两条子进程用例复刻真实故障——「不装守卫时崩出同一个 `AttributeError`」与「`import src` 后同一场景安然通过且 `HAS_ZSTD=False`」；另加一条读 spec 的静态守卫，防止排除项被删
+- 三项注入验证：去掉降级动作、拆掉 `src/__init__.py` 接线、删掉 spec 排除项，均精准失败后恢复
+- 全量离线测试：414 → **423 passed**（ruff 全通过）
+
+## [1.3.15] - 2026-10-26
+
+### 优化
+
+- **阅读器预取「后两页」+ 有界内存窗口缓存**：每页显示完成后，后台补拉**当前页之后的 2 页**并在预取线程内解码，存入「当前页 + 后两页」的内存窗口——翻到下一页直接命中显示，不再读盘解码。从**第 1 张**起就会提前准备第 2、3 张（`ui/reader/image_cache.py`、`ui/reader/prefetch_worker.py`、`ui/reader/reader_window.py`）
+  - **窗口滑动淘汰**：窗口随当前页移动，离开窗口的解码图立即释放；迟到的预取结果若已滑出窗口直接拒收，内存占用恒定为窗口大小（默认约 3 张），不随阅读时长增长
+  - **同页只下载一次**：`ReaderSession.fetch_page` 增加在途请求登记——前台翻页与后台预取同时要同一页时，后来者等先到者落盘后直接命中本地，不再重复请求；领跑者失败时等待者接管重试（网络抖动可自愈），并有 90 秒失联接管兜底
+  - **缓存命中不读盘**：`load_page` 命中内存缓存时同步显示（不起线程、不读盘、不联网）；加载完成与缓存命中共用同一个显示出口，窗口尺寸/拖拽路径/缓存进度/播放计时行为完全一致
+  - **当前页显示与预取彻底解耦**：预取全程在后台线程，单页失败只记日志；本地已完整、或窗口内页全部已缓存时直接跳过，不起线程也不发请求
+- **默认设置变更**：`reader_prefetch_enabled` 默认开启、`reader_prefetch_ahead=2`（此前为「关闭 / 0 / 0」，即纯按需）；设置页文案同步说明内存窗口行为
+
+### 测试
+
+- 新增守卫：窗口滑动淘汰与硬上限、窗外结果拒收、缓存命中不发起取页、同页并发只下载一次（含领跑者失败后跟随者接管）、预取失败不影响当前页、默认窗口为「开启 / 后 2 页」、设置迁移只生效一次、以及**端到端**跑真实 `PrefetchWorker` 线程验证「下载 → 线程内解码 → 入窗口缓存 → 翻页零取页」
+- 每项都做过注入式验证（关掉淘汰 / 关掉去重 / 摘掉命中快路径 / 摘掉预取调度 / 改回旧默认值），确认对应用例精准失败后再恢复
+- 全量离线测试：398 → **414 passed**（ruff 全通过）
+
 ## [1.3.14] - 2026-10-14
 
 ### 新功能

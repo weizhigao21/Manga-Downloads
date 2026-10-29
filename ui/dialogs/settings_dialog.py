@@ -162,13 +162,14 @@ class SettingsDialog(QDialog):
         reader_heading.setStyleSheet("font-size: 15px; font-weight: 600; margin-top: 8px;")
         v.addWidget(reader_heading)
 
-        self.reader_prefetch_checkbox = QCheckBox("阅读时后台预取相邻页（默认关闭）")
+        self.reader_prefetch_checkbox = QCheckBox("阅读时后台预取当前页之后的图片（默认开启）")
         self.reader_prefetch_checkbox.setChecked(self._settings.reader_prefetch_enabled)
         v.addWidget(self.reader_prefetch_checkbox)
 
         prefetch_hint = QLabel(
-            "默认关闭：只在点「下一页/上一页」时获取当前这一页，最省请求。"
-            "开启后会提前缓存前后几页，翻页更顺滑，但请求更密。"
+            "默认预取后 2 页：翻页基本不用等，页面只解析一次；内存里也只保留"
+            "「当前页 + 后两页」这一小段窗口，翻过即释放，不会越看越占内存。"
+            "关掉则回到纯按需——只取当前页。"
         )
         prefetch_hint.setStyleSheet(
             f"color: {PALETTE['text_secondary']}; font-size: 12px;"

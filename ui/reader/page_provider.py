@@ -8,6 +8,10 @@
 预取：请求第 N 页后，后台按 [N-behind, N+ahead] 窗口补拉缺失页；
 窗口外任务取消，避免用户快速翻页时请求堆积。
 
+同页去重：前台加载与后台预取可能同时要同一页（用户翻到的正是刚预取到一半
+的那页），``fetch_page`` 用「在途登记」让后来者等待先到者落盘、再直接命中
+本地文件，同一页不会被下载两次。
+
 本模块**不导入任何 Qt**：耗时操作由调用方（reader 窗口）放进线程执行，
 通过回调汇报结果，便于离线单测。
 """
@@ -44,6 +48,11 @@ logger = logging.getLogger(__name__)
 
 # 阅读页 URL 中的「总页数-aid」片段
 _PAGE_AID_RE = re.compile(r"page-(\d+)-aid-(\d+)")
+
+# 等待「同一页的在途下载」的上限（秒）。正常下载远小于该值；超过说明领跑
+# 线程已失联（例如窗口关闭时被 terminate 强杀，finally 没跑到），此时由
+# 等待者接管重试，宁可多下一次也不要永久卡住。
+_INFLIGHT_WAIT_SECONDS = 90.0
 
 
 class PageFetchError(RuntimeError):
@@ -92,6 +101,10 @@ class ReaderSession:
         self._list_page_locks: dict[int, threading.Lock] = {}
         # 阅读页 URL 缓存（详情页解析结果）：避免每页都联网拉详情页
         self._reading_url_cache: str | None = None
+        # 在途下载登记：{页码: Event}。同一页被前台加载与后台预取同时要求时，
+        # 只有一个线程真正下载（leader），其余线程等它落盘后直接命中本地，
+        # 避免重复请求（站点对同一页重复请求既不必要也容易触发限流）。
+        self._inflight: dict[int, threading.Event] = {}
         # 本地目录的轻量变更指示（目录项数 + 最新 mtime）：翻页是高频操作，
         # 全目录扫描要 10ms+，因此用便宜得多的判据决定"是否需要真正重扫"。
         self._dir_revision_cache: tuple[int, float] | None = None
@@ -276,23 +289,62 @@ class ReaderSession:
         顺序：内存/磁盘本地命中 → 直链索引下载 → 联网解析后下载。
         任何阶段失败抛 PageFetchError，由界面显示「重试」。
 
+        **同页去重**：前台翻页线程与后台预取线程可能同时要同一页。这里用
+        「在途登记」区分领跑者与跟随者——领跑者真正下载，跟随者等它结束
+        后重新查本地（已落盘就直接返回），不会为同一页发第二次请求。
+        领跑者失败时，跟随者会接管重试（失败原因常是网络抖动），这样
+        「当前页加载失败、但预取刚好补上」也能自愈。
+
         Returns:
             该页图片的磁盘路径。
         """
         page_no = max(1, int(page_no))
-        with self._lock:
-            local = self._local_by_page(page_no)
-            if local is not None:
-                return local
-            # 本地已覆盖全部页：缺页说明确实没有该页（而非"需要联网"），
-            # 直接失败，避免为一部已下载完整的作品平白发起网络请求。
-            # 注意判据是 local_count >= 总页数，且总页数可信（来自
-            # image_count 或本地推断），否则会把"本地不全"误判成"已完整"。
-            if self._local_is_complete():
-                raise PageFetchError(
-                    page_no, f"第 {page_no} 页本地缺失（该作品已缓存完整）"
-                )
+        my_event: threading.Event | None = None
+        while True:
+            with self._lock:
+                local = self._local_by_page(page_no)
+                if local is not None:
+                    return local
+                # 本地已覆盖全部页：缺页说明确实没有该页（而非"需要联网"），
+                # 直接失败，避免为一部已下载完整的作品平白发起网络请求。
+                # 注意判据是 local_count >= 总页数，且总页数可信（来自
+                # image_count 或本地推断），否则会把"本地不全"误判成"已完整"。
+                if self._local_is_complete():
+                    raise PageFetchError(
+                        page_no, f"第 {page_no} 页本地缺失（该作品已缓存完整）"
+                    )
+                pending = self._inflight.get(page_no)
+                if pending is None:
+                    my_event = threading.Event()
+                    self._inflight[page_no] = my_event
+                    break  # 由本线程负责真正下载
+            # 同一页已有线程在下载：**不持锁**等待（持锁等会把其他页的取图
+            # 一起堵住），醒来后回到循环重新查本地或接管。
+            if not pending.wait(timeout=_INFLIGHT_WAIT_SECONDS):
+                with self._lock:
+                    if self._inflight.get(page_no) is pending:
+                        # 超时且登记还在：领跑线程大概率被强杀（terminate），
+                        # 摘掉登记让本线程接管，避免永久等待。
+                        logger.warning("第 %d 页在途下载超时，接管重试", page_no)
+                        self._inflight.pop(page_no, None)
 
+        try:
+            return self._download_page(page_no)
+        finally:
+            # 无论成功/失败/异常都要撤销登记并唤醒跟随者：失败时跟随者会
+            # 接管重试，绝不能让等待者永远挂住。
+            # 只摘**自己的**登记：若等待超时后已被别的线程接管，那条登记
+            # 属于新领跑者，误摘会让两个线程同时下载同一页。
+            with self._lock:
+                if self._inflight.get(page_no) is my_event:
+                    del self._inflight[page_no]
+            my_event.set()
+
+    def _download_page(self, page_no: int) -> Path:
+        """真正执行「直链索引 → 联网解析 → 下载落盘」的慢路径。
+
+        只允许 ``fetch_page`` 的领跑线程调用：这里会发起网络请求并写盘。
+        """
         # 直链索引命中：直接下载该页图片。
         # 文件名必须沿用真实「页名」（网页 <span class="name"> / 压缩包内名），
         # 不能用 page_no 顶替：否则「第 2 页」会被写成 2.jpg，与本地既有的
@@ -584,15 +636,20 @@ class ReaderSession:
         ahead: int = 3,
         behind: int = 1,
         cancel_check: Callable[[], bool] | None = None,
-        on_progress: Callable[[int], None] | None = None,
+        on_progress: Callable[[int, Path], None] | None = None,
     ) -> None:
         """预取 [page_no-behind, page_no+ahead] 窗口内缺失的页。
+
+        逐页串行处理（站点有请求节流，并发补拉更容易被限流）：每页之间
+        检查一次取消，用户已翻页/关窗时立即停手。单页失败只记日志并继续
+        下一页——预取是「锦上添花」，绝不能因为某一页坏了就拖累其他页，
+        更不能影响当前页的显示。
 
         Args:
             page_no: 当前页（1-based）。
             ahead / behind: 前后预取页数。
             cancel_check: 返回 True 时中止（用户已翻页/关闭窗口）。
-            on_progress: 每成功补拉一页回调一次（参数为该页码）。
+            on_progress: 每成功补拉一页回调一次，参数为 (页码, 落盘路径)。
         """
         total = self.resolve_total_pages()
         start = max(1, page_no - max(0, behind))
@@ -604,11 +661,18 @@ class ReaderSession:
                 if self._local_by_page(target) is not None:
                     continue
             try:
-                self.fetch_page(target)
-                if on_progress:
-                    on_progress(target)
+                path = self.fetch_page(target)
             except PageFetchError as exc:
                 logger.info("预取跳过第 %d 页: %s", exc.page_no, exc)
+                continue
+            except Exception as exc:  # noqa: BLE001 - 预取失败不得中断窗口
+                logger.warning("预取第 %d 页异常: %s", target, exc)
+                continue
+            if cancel_check and cancel_check():
+                # 下载期间用户可能已经翻页：此时不必再上报这一页
+                return
+            if on_progress:
+                on_progress(target, path)
 
     # ---- 离线快照（供测试与界面展示） ----
 

@@ -149,6 +149,15 @@ _NON_AUTHOR_BRACKETS = frozenset(
 # 展会/活动代号（如 C97 / FF34 / K20），非作者，提取作者时排除
 _EXPO_CODE_RE = re.compile(r"^[A-Za-z]{1,4}\s?\d{2,4}$")
 
+# 「作者 - 作品名」格式的分隔符：短横/全角连字符/破折号。
+# 要求**至少一侧有空白**（`A - B`、`A- B`、`A -B` 都算），避免把
+# `1-12`、`AWE-SOME`、`邂逅-KAIKOU` 这类两侧贴字的连字符误判为分隔。
+_AUTHOR_DASH_RE = re.compile(r"[-–—−－](?=\s)|(?<=\s)[-–—−－]")
+
+# 各类括号的配对关系：提取破折号作者时用于判断分隔符是否落在括号内
+# （`(2022 - 2025)`、`「A - B」` 内的破折号不是作者分隔）
+_BRACKET_PAIRS = {"[": "]", "【": "】", "（": "）", "(": ")", "「": "」", "『": "』"}
+
 
 def _extract_aid(detail_url: str) -> int | None:
     """从详情链接提取作品 ID（aid），无法提取时返回 None。"""
@@ -165,12 +174,67 @@ def cover_cache_path(detail_url: str) -> Path | None:
     return path if path.exists() else None
 
 
+def _inside_brackets(text: str, pos: int) -> bool:
+    """判断 text[pos] 之前是否存在未闭合的括号（即 pos 落在括号内）。"""
+    stack: list[str] = []
+    for ch in text[:pos]:
+        if ch in _BRACKET_PAIRS:
+            stack.append(_BRACKET_PAIRS[ch])
+        elif stack and stack[-1] == ch:
+            stack.pop()
+    return bool(stack)
+
+
+def _author_from_dash_title(title: str) -> str:
+    """从「作者 - 作品名」格式的标题中提取破折号前的作者名。
+
+    站点上不少作品没有 `[社团/作者]` 方括号，而是写成
+    `Umeko J - Yoruichi Cat Form「Bleach」`。此函数只在方括号路径
+    提取不到作者时兜底：
+
+    - 仅把**至少一侧有空白**的短横/破折号（`-` `–` `—` `－`）当分隔符，
+      因此 `1-12`、`AWE-SOME-Ryan` 这类两侧贴字的连字符不会被切开；
+    - 括号内的破折号跳过（`(2022 - 2025)` 是年份区间，不是作者分隔）；
+    - 破折号前必须是合理的名字长度与词数，且不能是标签/展会代号，
+      破折号后必须有作品名（标题以 `-` 开头时前段为空，直接放弃）。
+
+    Returns:
+        作者名；不符合上述格式时返回空串。
+    """
+    body = clean_title_markup(title)
+    for match in _AUTHOR_DASH_RE.finditer(body):
+        if _inside_brackets(body, match.start()):
+            continue
+        head = body[: match.start()].strip()
+        tail = body[match.end():].strip()
+        if not head or not tail:
+            continue
+        # 名字长度与词数：正常作者/社团名 2-40 字、最多 5 个词
+        if not 2 <= len(head) <= 40 or len(head.split()) > 5:
+            continue
+        # 纯数字/日期/序号（如 "8" "2022.05"）不是作者
+        if re.fullmatch(r"[\d\s.,/·:：%\-]+", head):
+            continue
+        # 已有翻译分隔（`日文｜中文`）的段落不是作者名
+        if "｜" in head or "|" in head:
+            continue
+        # 带方括号的段落是标签/作者块本身，不是破折号前的作者名
+        if any(ch in head for ch in "[]【】"):
+            continue
+        if head in _NON_AUTHOR_BRACKETS or _EXPO_CODE_RE.fullmatch(head):
+            continue
+        return head
+    return ""
+
+
 def extract_author(title: str) -> str:
-    """从标题方括号块中提取作者/社团名。
+    """从标题中提取作者/社团名。
 
     wnacg 标题惯例为 `[社团/作者] 作品名`（其后可能还有标签/展会等
     方括号块）。策略：收集全部方括号块，过滤掉常见标签/格式与展会
-    代号，取第一个剩余块作为作者；全部被过滤时返回空串。
+    代号，取第一个剩余块作为作者。
+
+    没有方括号时，兼容 `作者 - 作品名` 格式（见 `_author_from_dash_title`）。
 
     Returns:
         作者/社团名（已去除方括号）；无法识别时返回空串。
@@ -182,7 +246,7 @@ def extract_author(title: str) -> str:
         if _EXPO_CODE_RE.fullmatch(name):
             continue
         return name
-    return ""
+    return _author_from_dash_title(title)
 
 
 def normalize_for_dedup(text: str) -> str:
